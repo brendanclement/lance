@@ -8,10 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use arrow_schema::DataType;
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::FutureExt;
 use itertools::Itertools;
+use lance_core::ROW_ID;
 use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
@@ -35,6 +38,7 @@ use lance_index::scalar::expression::{
 };
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use lance_index::scalar::{CreatedIndex, ScalarIndex};
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -202,6 +206,67 @@ fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) 
     }
 
     Ok(())
+}
+
+fn segment_has_vector_details(segment: &IndexMetadata) -> bool {
+    segment.index_details.as_ref().map_or_else(
+        || {
+            segment
+                .files
+                .as_ref()
+                .is_some_and(|files| files.iter().any(|file| file.path == INDEX_FILE_NAME))
+        },
+        |details| details.type_url.ends_with("VectorIndexDetails"),
+    )
+}
+
+fn segment_has_inverted_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"))
+}
+
+fn empty_fts_merge_stream(dataset: &Dataset, field_id: i32) -> Result<SendableRecordBatchStream> {
+    let field = dataset.schema().field_by_id(field_id).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "merge_existing_index_segments: field id {} does not exist",
+            field_id
+        ))
+    })?;
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(VALUE_COLUMN_NAME, field.data_type(), true),
+        ArrowField::new(ROW_ID, DataType::UInt64, false),
+    ]));
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::empty(),
+    )))
+}
+
+async fn finalize_inverted_segment_if_needed(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+) -> Result<()> {
+    let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
+    let metadata_path = index_dir
+        .clone()
+        .join(lance_index::scalar::inverted::METADATA_FILE);
+    if dataset.object_store.as_ref().exists(&metadata_path).await? {
+        return Ok(());
+    }
+
+    let store = Arc::new(LanceIndexStore::from_dataset_for_new(
+        dataset,
+        &segment.uuid.to_string(),
+    )?);
+    lance_index::scalar::inverted::builder::merge_index_files(
+        dataset.object_store.as_ref(),
+        &index_dir,
+        store,
+        lance_index::progress::noop_progress(),
+    )
+    .await
 }
 
 // Cache keys for different index types
@@ -1035,28 +1100,72 @@ impl DatasetIndexExt for Dataset {
                 "merge_existing_index_segments requires segments with identical fields".to_string(),
             ));
         }
-        if !source_segments.iter().all(|segment| {
-            segment.index_details.as_ref().map_or_else(
-                || {
-                    segment
-                        .files
-                        .as_ref()
-                        .is_some_and(|files| files.iter().any(|file| file.path == INDEX_FILE_NAME))
-                },
-                |details| details.type_url.ends_with("VectorIndexDetails"),
-            )
-        }) {
+        let all_vector = source_segments.iter().all(segment_has_vector_details);
+        let all_inverted = source_segments.iter().all(segment_has_inverted_details);
+        if !all_vector && !all_inverted {
             return Err(Error::invalid_input(
-                "merge_existing_index_segments currently only supports vector segments".to_string(),
+                "merge_existing_index_segments requires all segments to have the same supported index type"
+                    .to_string(),
             ));
         }
 
-        let mut merged_segment = crate::index::vector::ivf::merge_segments(
-            self.object_store.as_ref(),
-            &self.indices_dir(),
-            source_segments,
-        )
-        .await?;
+        let mut merged_segment = if all_vector {
+            crate::index::vector::ivf::merge_segments(
+                self.object_store.as_ref(),
+                &self.indices_dir(),
+                source_segments,
+            )
+            .await?
+        } else {
+            let field_path = self.schema().field_path(field_id)?;
+            let mut source_indices = Vec::with_capacity(source_segments.len());
+            let mut fragment_bitmap = RoaringBitmap::new();
+            for segment in &source_segments {
+                finalize_inverted_segment_if_needed(self, segment).await?;
+                fragment_bitmap |= segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "CreateIndex: segment {} is missing fragment coverage",
+                        segment.uuid
+                    ))
+                })?;
+                let scalar_index =
+                    scalar::open_scalar_index(self, &field_path, segment, &NoOpMetricsCollector)
+                        .await?;
+                let inverted_index = scalar_index
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "merge_existing_index_segments: expected inverted segment {}, got {:?}",
+                            segment.uuid,
+                            scalar_index.index_type()
+                        ))
+                    })?;
+                source_indices.push(Arc::new(inverted_index.clone()));
+            }
+
+            let new_uuid = Uuid::new_v4();
+            let new_store = LanceIndexStore::from_dataset_for_new(self, &new_uuid.to_string())?;
+            let created_index = InvertedIndex::merge_segments(
+                &source_indices,
+                empty_fts_merge_stream(self, field_id)?,
+                &new_store,
+                None,
+                Arc::new(NoopIndexBuildProgress),
+            )
+            .await?;
+
+            IndexMetadata {
+                uuid: new_uuid,
+                fragment_bitmap: Some(fragment_bitmap),
+                index_details: Some(Arc::new(created_index.index_details)),
+                index_version: created_index.index_version as i32,
+                created_at: Some(chrono::Utc::now()),
+                base_id: None,
+                files: created_index.files,
+                ..source_segments[0].clone()
+            }
+        };
         merged_segment.dataset_version = self.manifest.version;
         merged_segment.fields = vec![field_id];
         Ok(merged_segment)
