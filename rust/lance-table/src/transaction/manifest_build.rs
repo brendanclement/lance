@@ -1496,9 +1496,9 @@ impl Transaction {
             manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
             manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
         }
-        // Derived the same way. A build that applies the fragment reuse index to
-        // every index would remap stable row ids as if they were row addresses;
-        // reading returns wrong rows and optimizing indices persists them.
+        // Derived the same way. Older readers and writers did not expect stable
+        // row ids and a fragment reuse index together and could corrupt such a
+        // table, so both words are fenced.
         if manifest.uses_stable_row_ids()
             && final_indices
                 .iter()

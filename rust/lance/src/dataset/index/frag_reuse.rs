@@ -44,10 +44,9 @@ impl Dataset {
     ///   stale, for example after every row of the destination fragment is deleted.
     /// * Not every compaction records an FRI: it requires `defer_index_remap`,
     ///   and fresh index-free tables do not receive one automatically.
-    /// * With stable row ids the FRI still describes physical addresses. It is
-    ///   applied only to indices that store row addresses, never to entries that
-    ///   are stable row ids, and such a table sets a reader feature flag that
-    ///   older Lance versions refuse.
+    /// * With stable row ids the FRI still describes physical addresses. A table
+    ///   version with both sets reader and writer feature flags that older Lance
+    ///   versions, which could corrupt such a table, refuse.
     /// * Says nothing about deletion files, source-value changes, or whether an
     ///   address belongs to this table or branch.
     ///
@@ -87,10 +86,11 @@ impl Dataset {
 /// 2. it is at or past the reuse version's dataset version and no old fragment
 ///    in the version is still in its bitmap. A missing bitmap counts as caught
 ///    up, else the version could never be cleaned up.
-/// 3. it stores stable row ids, which a rewrite does not move, and no old
-///    fragment in the version is still in its bitmap. Its data never needs the
-///    mapping; only coverage committed against fragments the version rewrote
-///    (an index created concurrently with the compaction) still does.
+/// 3. it stores stable row ids, as indices on stable-row-id tables do today,
+///    which a rewrite does not move, and no old fragment in the version is still
+///    in its bitmap. Its data never needs the mapping; only coverage committed
+///    against fragments the version rewrote (an index created concurrently with
+///    the compaction) still does.
 ///
 /// Note that there could be a race condition that an index is being added during the cleanup,
 /// This will make that specific index not efficient until the next reindex,

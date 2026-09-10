@@ -56,8 +56,9 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// The table uses stable row ids and carries a fragment reuse index.
 ///
-/// Set by `build_manifest` whenever both hold, and lifted when either stops
-/// holding. Supported since index loading honors the identifier domain; see
+/// Older readers and writers did not expect the combination and could corrupt
+/// such a table, so both feature words carry the bit. Set by `build_manifest`
+/// whenever both hold, and lifted when either stops holding; see
 /// `supported_flags_when`.
 pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
 /// Tagged FRI requires a reader that interprets its mappings and a writer that
@@ -198,11 +199,10 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 }
 
 /// The feature-flag bits this build understands, given whether overlay support
-/// is enabled and whether index loading honors the identifier domain of a
-/// fragment reuse index on a stable-row-id table. Split out from
-/// [`supported_flags`] so the policy is testable without toggling the build
-/// profile or environment, and so the compatibility test can show what a build
-/// without the domain-aware loading does with such a table.
+/// is enabled and whether a fragment reuse index on a stable-row-id table is
+/// supported. Split out from [`supported_flags`] so the policy is testable
+/// without toggling the build profile or environment, and so the compatibility
+/// test can show what a build without that support does with such a table.
 fn supported_flags_when(overlay_enabled: bool, frag_reuse_with_stable_row_ids: bool) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
     mark_supported(
@@ -320,9 +320,8 @@ mod tests {
     use super::*;
     use crate::format::BasePath;
 
-    /// A build without domain-aware index loading must refuse the table for
-    /// reading and writing, or it would remap stable row ids as if they were
-    /// row addresses; this build accepts it.
+    /// A build without support for the combination must refuse the table for
+    /// reading and writing, or it could corrupt it; this build accepts it.
     #[test]
     fn test_frag_reuse_with_stable_row_ids_flag_gating() {
         use crate::format::{DataStorageFormat, Manifest};

@@ -357,7 +357,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         RemapResult::Drop => return Ok(()),
         // Same files, new coverage: the composed remap emptied the index (every
         // row deleted) or the index stores stable row ids and only its coverage
-        // was stale.
+        // was stale. The files stay where they are, which on a shallow clone is
+        // the source dataset, so the base travels with them.
         RemapResult::Keep(new_id) => IndexMetadata {
             uuid: new_id,
             name: curr_index_meta.name.clone(),
@@ -368,7 +369,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             index_details: curr_index_meta.index_details.clone(),
             index_version: curr_index_meta.index_version,
             created_at: curr_index_meta.created_at,
-            base_id: None,
+            base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
