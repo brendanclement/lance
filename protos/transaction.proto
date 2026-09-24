@@ -36,6 +36,55 @@ message Transaction {
    */
   map<string, string> transaction_properties = 4;
 
+  /* UNSTABLE: changes to the cell flag registry and flag state that commit
+   * atomically with the operation. Absent when the transaction changes no
+   * cell flag.
+   */
+  CellFlagChanges cell_flag_changes = 5;
+
+  // UNSTABLE: see `cell_flag_changes`.
+  message CellFlagChanges {
+    /* Sets the flag to `value` for `rows`, a RowAddrTreeMap keyed by fragment
+     * id with physical row offsets, serialized as in CellFlagState.true_rows.
+     */
+    message Update {
+      uint32 flag_id = 1;
+      bool value = 2;
+      bytes rows = 3;
+    }
+    // Registers a flag. Its id is assigned at commit.
+    message Registration {
+      int32 field_id = 1;
+      string name = 2;
+      repeated int32 clear_on_write = 3;
+      bool mask_when_false = 4;
+    }
+    /* Flag state carried onto rows this transaction moved into a new
+     * fragment, which is named by the path of its first data file because
+     * fragment ids are assigned at commit. `offsets` is a portable
+     * RoaringBitmap of physical offsets in that fragment.
+     */
+    message Carried {
+      uint32 flag_id = 1;
+      string fragment_path = 2;
+      bytes offsets = 3;
+    }
+    // Caller-supplied updates.
+    repeated Update updates = 1;
+    repeated Registration registrations = 2;
+    // Ids of flags to drop.
+    repeated uint32 drops = 3;
+    /* The clears implied by this transaction's writes to the source or output
+     * fields of dependent flags, recomputed against the head at every commit
+     * attempt. Recorded even where the flag was already false. Every entry
+     * has value = false.
+     */
+    repeated Update derived_invalidations = 4;
+    repeated Carried carried = 5;
+    // Fragments whose moved rows carry their flag state through `carried`.
+    repeated uint64 carried_from_fragments = 6;
+  }
+
   // Add new rows to the dataset.
   message Append {
     /* The new fragments to append.

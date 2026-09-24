@@ -8,18 +8,21 @@
 //! module: a field added to an `Operation` is only durable once it round-trips
 //! here.
 
+use crate::format::cell_flag::serialize_row_addr_tree_map;
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::{
-    DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
-    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
+    CarriedCellFlags, CellFlagChanges, CellFlagRegistration, CellFlagUpdate, DataOverlayGroup,
+    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, UpdateMap,
+    UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
     translate_schema_metadata_updates,
 };
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_file::datatypes::Fields;
+use lance_select::RowAddrTreeMap;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,6 +79,126 @@ impl TryFrom<pb::transaction::DataOverlayGroup> for DataOverlayGroup {
                 .into_iter()
                 .map(DataOverlayFile::try_from)
                 .collect::<Result<Vec<_>>>()?,
+        })
+    }
+}
+
+impl From<&CellFlagUpdate> for pb::transaction::cell_flag_changes::Update {
+    fn from(update: &CellFlagUpdate) -> Self {
+        Self {
+            flag_id: update.flag_id,
+            value: update.value,
+            rows: serialize_row_addr_tree_map(&update.rows),
+        }
+    }
+}
+
+impl TryFrom<pb::transaction::cell_flag_changes::Update> for CellFlagUpdate {
+    type Error = Error;
+
+    fn try_from(message: pb::transaction::cell_flag_changes::Update) -> Result<Self> {
+        let rows = RowAddrTreeMap::deserialize_from(message.rows.as_slice()).map_err(|error| {
+            Error::invalid_input(format!(
+                "invalid rows in cell flag update for flag {}: {error}",
+                message.flag_id
+            ))
+        })?;
+        Ok(Self {
+            flag_id: message.flag_id,
+            value: message.value,
+            rows,
+        })
+    }
+}
+
+impl From<&CellFlagChanges> for pb::transaction::CellFlagChanges {
+    fn from(changes: &CellFlagChanges) -> Self {
+        Self {
+            updates: changes.updates.iter().map(Into::into).collect(),
+            registrations: changes
+                .registrations
+                .iter()
+                .map(
+                    |registration| pb::transaction::cell_flag_changes::Registration {
+                        field_id: registration.field_id,
+                        name: registration.name.clone(),
+                        clear_on_write: registration.clear_on_write.clone(),
+                        mask_when_false: registration.mask_when_false,
+                    },
+                )
+                .collect(),
+            drops: changes.drops.clone(),
+            derived_invalidations: changes
+                .derived_invalidations
+                .iter()
+                .map(Into::into)
+                .collect(),
+            carried: changes
+                .carried
+                .iter()
+                .map(|carried| {
+                    let mut offsets = Vec::with_capacity(carried.offsets.serialized_size());
+                    carried
+                        .offsets
+                        .serialize_into(&mut offsets)
+                        .expect("RoaringBitmap serialization cannot fail");
+                    pb::transaction::cell_flag_changes::Carried {
+                        flag_id: carried.flag_id,
+                        fragment_path: carried.fragment_path.clone(),
+                        offsets,
+                    }
+                })
+                .collect(),
+            carried_from_fragments: changes.carried_from_fragments.clone(),
+        }
+    }
+}
+
+impl TryFrom<pb::transaction::CellFlagChanges> for CellFlagChanges {
+    type Error = Error;
+
+    fn try_from(message: pb::transaction::CellFlagChanges) -> Result<Self> {
+        Ok(Self {
+            updates: message
+                .updates
+                .into_iter()
+                .map(CellFlagUpdate::try_from)
+                .collect::<Result<_>>()?,
+            registrations: message
+                .registrations
+                .into_iter()
+                .map(|registration| CellFlagRegistration {
+                    field_id: registration.field_id,
+                    name: registration.name,
+                    clear_on_write: registration.clear_on_write,
+                    mask_when_false: registration.mask_when_false,
+                })
+                .collect(),
+            drops: message.drops,
+            derived_invalidations: message
+                .derived_invalidations
+                .into_iter()
+                .map(CellFlagUpdate::try_from)
+                .collect::<Result<_>>()?,
+            carried: message
+                .carried
+                .into_iter()
+                .map(|carried| {
+                    let offsets = RoaringBitmap::deserialize_from(carried.offsets.as_slice())
+                        .map_err(|error| {
+                            Error::invalid_input(format!(
+                                "invalid carried offsets for cell flag {} on fragment {}: {error}",
+                                carried.flag_id, carried.fragment_path
+                            ))
+                        })?;
+                    Ok(CarriedCellFlags {
+                        flag_id: carried.flag_id,
+                        fragment_path: carried.fragment_path,
+                        offsets,
+                    })
+                })
+                .collect::<Result<_>>()?,
+            carried_from_fragments: message.carried_from_fragments,
         })
     }
 }
@@ -421,6 +544,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(message.transaction_properties))
             },
+            cell_flag_changes: message
+                .cell_flag_changes
+                .map(CellFlagChanges::try_from)
+                .transpose()?
+                .map(Arc::new),
         })
     }
 }
@@ -719,6 +847,10 @@ impl From<&Transaction> for pb::Transaction {
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
+            cell_flag_changes: value
+                .cell_flag_changes
+                .as_deref()
+                .map(pb::transaction::CellFlagChanges::from),
         }
     }
 }
@@ -810,6 +942,90 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use crate::transaction::TransactionBuilder;
+
+    #[test]
+    fn test_cell_flag_changes_roundtrip() {
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_fragment(0);
+        rows.insert_bitmap(3, RoaringBitmap::from_iter([1_u32, 5]));
+        let changes = CellFlagChanges {
+            updates: vec![CellFlagUpdate {
+                flag_id: 2,
+                value: true,
+                rows: rows.clone(),
+            }],
+            registrations: vec![CellFlagRegistration {
+                field_id: 4,
+                name: "ready".to_string(),
+                clear_on_write: vec![1, 2],
+                mask_when_false: true,
+            }],
+            drops: vec![1],
+            derived_invalidations: vec![CellFlagUpdate {
+                flag_id: 3,
+                value: false,
+                rows,
+            }],
+            carried: vec![CarriedCellFlags {
+                flag_id: 5,
+                fragment_path: "data/new.lance".to_string(),
+                offsets: RoaringBitmap::from_iter([0_u32, 9]),
+            }],
+            carried_from_fragments: vec![3],
+        };
+        let operation = Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(
+                0,
+                DataFile::new_legacy_from_fields("f.lance", vec![4], None),
+            )],
+        };
+        let txn = TransactionBuilder::new(7, operation.clone())
+            .cell_flag_changes(changes)
+            .build();
+        let message = pb::Transaction::from(&txn);
+        assert!(message.cell_flag_changes.is_some());
+        assert_eq!(Transaction::try_from(message).unwrap(), txn);
+
+        // Without changes the field stays absent, so the encoding is unchanged.
+        let plain = TransactionBuilder::new(7, operation)
+            .cell_flag_changes(CellFlagChanges::default())
+            .build();
+        assert!(plain.cell_flag_changes.is_none());
+        let message = pb::Transaction::from(&plain);
+        assert!(message.cell_flag_changes.is_none());
+        assert_eq!(Transaction::try_from(message).unwrap(), plain);
+    }
+
+    #[test]
+    fn test_cell_flag_changes_rejects_corrupt_rows() {
+        let message = pb::Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Some(pb::transaction::Operation::DataReplacement(
+                pb::transaction::DataReplacement {
+                    replacements: vec![],
+                },
+            )),
+            cell_flag_changes: Some(pb::transaction::CellFlagChanges {
+                updates: vec![pb::transaction::cell_flag_changes::Update {
+                    flag_id: 6,
+                    value: true,
+                    rows: vec![1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = Transaction::try_from(message).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid rows in cell flag update for flag 6"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn test_data_overlay_operation_roundtrips() {

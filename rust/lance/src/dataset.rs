@@ -68,6 +68,7 @@ use tracing::{info, instrument, warn};
 pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
+pub mod cell_flag;
 pub mod cleanup;
 mod data_file;
 mod data_file_part;
@@ -104,8 +105,9 @@ mod take;
 /// [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 pub mod transaction {
     pub use lance_table::transaction::{
-        DataOverlayGroup, DataReplacementGroup, Operation, ReadVersionState, RewriteGroup,
-        RewrittenIndex, Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
+        CarriedCellFlags, CellFlagChanges, CellFlagRegistration, CellFlagUpdate, DataOverlayGroup,
+        DataReplacementGroup, Operation, ReadVersionState, RewriteGroup, RewrittenIndex,
+        Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
         UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,
         validate_operation,
     };

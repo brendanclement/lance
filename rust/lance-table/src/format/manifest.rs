@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{Fragment, InlineRowIds, RowIdMeta};
+use super::{CellFlagRegistry, Fragment, InlineRowIds, RowIdMeta};
 use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_PAIRED_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
@@ -105,6 +105,13 @@ pub struct Manifest {
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
+
+    /// Unstable: the cell flag registry and flag state.
+    ///
+    /// `None` when no cell flag was ever registered. Once `Some` it is carried
+    /// to every later version, even with no definitions left, so flag ids stay
+    /// monotonic.
+    pub cell_flags: Option<Arc<CellFlagRegistry>>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -200,6 +207,7 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            cell_flags: None,
         }
     }
 
@@ -231,6 +239,7 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            cell_flags: previous.cell_flags.clone(),
         }
     }
 
@@ -304,6 +313,8 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            // Flag state is keyed by fragment id and offset, which the clone keeps.
+            cell_flags: self.cell_flags.clone(),
         }
     }
 
@@ -1044,6 +1055,11 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
+            cell_flags: p
+                .cell_flags
+                .map(CellFlagRegistry::try_from)
+                .transpose()?
+                .map(Arc::new),
         })
     }
 }
@@ -1111,6 +1127,7 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            cell_flags: m.cell_flags.as_deref().map(pb::CellFlagRegistry::from),
         }
     }
 }

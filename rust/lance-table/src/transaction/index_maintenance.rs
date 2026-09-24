@@ -116,7 +116,7 @@ impl Transaction {
 
     /// Map each (non-tombstoned) field id in a fragment to the path of the data
     /// file that backs it.
-    fn fragment_field_paths(frag: &Fragment) -> HashMap<i32, &str> {
+    pub(super) fn fragment_field_paths(frag: &Fragment) -> HashMap<i32, &str> {
         let mut map = HashMap::new();
         for file in &frag.files {
             for &field_id in file.fields.iter() {

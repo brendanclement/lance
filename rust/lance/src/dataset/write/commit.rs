@@ -559,6 +559,11 @@ impl<'a> CommitBuilder<'a> {
                 "Only append transactions are supported in batch commits".into(),
             ));
         }
+        if transactions.iter().any(|t| t.cell_flag_changes.is_some()) {
+            return Err(Error::not_supported(
+                "batch commits cannot carry cell flag changes",
+            ));
+        }
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
 
@@ -576,6 +581,7 @@ impl<'a> CommitBuilder<'a> {
             read_version,
             tag: None,
             transaction_properties: None,
+            cell_flag_changes: None,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
@@ -645,6 +651,7 @@ mod tests {
             read_version,
             tag: None,
             transaction_properties: None,
+            cell_flag_changes: None,
         }
     }
 
@@ -1120,6 +1127,7 @@ mod tests {
             read_version: 1,
             tag: None,
             transaction_properties: None,
+            cell_flag_changes: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])

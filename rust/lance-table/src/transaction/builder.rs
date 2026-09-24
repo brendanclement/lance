@@ -3,7 +3,7 @@
 
 //! The transaction itself: an operation plus the version it was based on.
 
-use crate::transaction::Operation;
+use crate::transaction::{CellFlagChanges, Operation};
 use lance_core::deepsize::DeepSizeOf;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +22,9 @@ pub struct Transaction {
     pub operation: Operation,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Unstable: cell flag changes committed atomically with `operation`.
+    /// `None` when the transaction changes no cell flag.
+    pub cell_flag_changes: Option<Arc<CellFlagChanges>>,
 }
 
 /// Add TransactionBuilder for flexibly setting option without using `mut`
@@ -32,6 +35,7 @@ pub struct TransactionBuilder {
     operation: Operation,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    cell_flag_changes: Option<Arc<CellFlagChanges>>,
 }
 
 impl TransactionBuilder {
@@ -42,6 +46,7 @@ impl TransactionBuilder {
             operation,
             tag: None,
             transaction_properties: None,
+            cell_flag_changes: None,
         }
     }
 
@@ -63,6 +68,14 @@ impl TransactionBuilder {
         self
     }
 
+    /// Unstable: commit these cell flag changes with the operation. Empty
+    /// changes leave the transaction without any, so it encodes as before.
+    pub fn cell_flag_changes(mut self, cell_flag_changes: CellFlagChanges) -> Self {
+        self.cell_flag_changes =
+            (!cell_flag_changes.is_empty()).then(|| Arc::new(cell_flag_changes));
+        self
+    }
+
     pub fn build(self) -> Transaction {
         let uuid = self
             .uuid
@@ -73,6 +86,7 @@ impl TransactionBuilder {
             operation: self.operation,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
+            cell_flag_changes: self.cell_flag_changes,
         }
     }
 }

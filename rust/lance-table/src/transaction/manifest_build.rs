@@ -190,6 +190,13 @@ impl Transaction {
             .max(current_manifest.max_fragment_id);
         // Row ids are a high-water mark like fragment ids: rewinding hands old ids to new rows.
         manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
+        // So are cell flag ids: a reused id would let a transaction staged
+        // against a dropped flag publish into whichever flag took its id.
+        if let Some(current) = current_manifest.cell_flags.as_deref() {
+            let mut restored = manifest.cell_flags.as_deref().cloned().unwrap_or_default();
+            restored.raise_next_flag_id(current.next_flag_id());
+            manifest.cell_flags = Some(Arc::new(restored));
+        }
         // Turning stable row ids off would revert `_rowid` to row addresses, whose
         // namespace overlaps the ids this table has already handed out.
         if current_manifest.uses_stable_row_ids() && !manifest.uses_stable_row_ids() {
@@ -1476,6 +1483,9 @@ impl Transaction {
 
         manifest.tag.clone_from(&self.tag);
 
+        // Before the feature flags: the registry's presence decides its bit.
+        self.apply_cell_flag_changes(&mut manifest, &final_indices, current_manifest)?;
+
         if config.auto_set_feature_flags {
             // Internal operations (e.g. CreateIndex) build with the default config,
             // which has use_stable_row_ids = false. Without inheriting from the previous
@@ -2374,6 +2384,7 @@ mod tests {
             uuid: "test".to_string(),
             tag: String::new(),
             transaction_properties: HashMap::new(),
+            cell_flag_changes: None,
             operation: Some(pb::transaction::Operation::Update(
                 pb::transaction::Update {
                     removed_fragment_ids: vec![],
@@ -2423,6 +2434,7 @@ mod tests {
             uuid: "test".to_string(),
             tag: String::new(),
             transaction_properties: HashMap::new(),
+            cell_flag_changes: None,
             operation: Some(pb::transaction::Operation::Update(
                 pb::transaction::Update {
                     removed_fragment_ids: vec![],

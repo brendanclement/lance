@@ -43,6 +43,9 @@ use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::read_manifest;
+use lance_table::transaction::{
+    CellFlagChanges, derive_cell_flag_invalidations, ensure_operation_allowed_with_cell_flags,
+};
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
 
@@ -394,6 +397,13 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    if transaction.cell_flag_changes.is_some() {
+        return Err(Error::not_supported(format!(
+            "cell flag changes cannot be committed with {}, which creates the dataset; \
+             register cell flags once the dataset exists",
+            transaction.operation.name()
+        )));
+    }
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
@@ -809,6 +819,16 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     {
         old_field_id_mapping.insert(field_id, field_id_seed);
     }
+    if let Some(field_id) = manifest.cell_flags.as_deref().and_then(|registry| {
+        registry
+            .referenced_field_ids()
+            .find(|field_id| old_field_id_mapping.contains_key(field_id))
+    }) {
+        return Err(Error::not_supported(format!(
+            "cannot repair the duplicate field id {field_id}: a cell flag refers to it, and \
+             giving the field a new id would detach the flag from it"
+        )));
+    }
 
     let mut fragments = manifest.fragments.as_ref().clone();
 
@@ -1174,6 +1194,14 @@ pub(crate) async fn do_commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
+    // A detached version is never rebased onto the head, so the invalidations
+    // of concurrent writes could not be checked or recorded against it.
+    if transaction.cell_flag_changes.is_some() || dataset.manifest.cell_flags.is_some() {
+        return Err(Error::not_supported(
+            "detached commits are not supported on datasets with cell flags, nor with cell \
+             flag changes",
+        ));
+    }
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
@@ -1439,6 +1467,62 @@ async fn record_successful_commit(
     }
 }
 
+/// Replace the transaction's derived cell flag clears with the ones its writes
+/// imply against `head`, so the transaction file records them for this
+/// attempt.
+fn record_derived_cell_flag_invalidations(
+    head: &Manifest,
+    transaction: &mut Transaction,
+) -> Result<()> {
+    let derived = derive_cell_flag_invalidations(head, transaction)?;
+    let Some(changes) = transaction.cell_flag_changes.as_mut() else {
+        if !derived.is_empty() {
+            transaction.cell_flag_changes = Some(Arc::new(CellFlagChanges {
+                derived_invalidations: derived,
+                ..Default::default()
+            }));
+        }
+        return Ok(());
+    };
+    if changes.derived_invalidations != derived {
+        Arc::make_mut(changes).derived_invalidations = derived;
+    }
+    if changes.is_empty() {
+        transaction.cell_flag_changes = None;
+    }
+    Ok(())
+}
+
+/// A transaction that sets cell flags true is checked against every version
+/// since it read. One missing from that range, for example removed by cleanup,
+/// could hide a write that invalidated what it publishes.
+fn ensure_saw_every_version_since_read(
+    read_version: u64,
+    head_version: u64,
+    seen_versions: &[u64],
+) -> Result<()> {
+    if seen_versions
+        .iter()
+        .copied()
+        .eq(read_version + 1..=head_version)
+    {
+        return Ok(());
+    }
+    let seen: HashSet<u64> = seen_versions.iter().copied().collect();
+    let missing: Vec<u64> = (read_version + 1..=head_version)
+        .filter(|version| !seen.contains(version))
+        .take(16)
+        .collect();
+    Err(Error::incompatible_transaction_source(
+        format!(
+            "cannot set cell flags read at version {read_version}: the versions between it and \
+             the head version {head_version} could not all be loaded (missing: {missing:?}), \
+             so writes that invalidate the published rows cannot be ruled out"
+        )
+        .into(),
+    ))
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
@@ -1489,6 +1573,19 @@ pub(crate) async fn commit_transaction(
 
     let mut transaction = transaction.clone();
 
+    let sets_cell_flags = transaction
+        .cell_flag_changes
+        .as_deref()
+        .is_some_and(CellFlagChanges::sets_any_flag);
+    if sets_cell_flags && read_version == 0 {
+        return Err(Error::invalid_input(
+            "a transaction that sets cell flags must name the version its values were read \
+             at, but its read_version is 0",
+        ));
+    }
+    // Every concurrent version checked across attempts, in order.
+    let mut seen_versions: Vec<u64> = Vec::new();
+
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     let mut backoff = SlotBackoff::default();
     let start = Instant::now();
@@ -1512,6 +1609,8 @@ pub(crate) async fn commit_transaction(
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
             ensure_can_write_manifest(&dataset.manifest)?;
+            ensure_operation_allowed_with_cell_flags(&dataset.manifest, &transaction)?;
+            seen_versions.extend(other_transactions.iter().map(|(version, _)| *version));
 
             // See if we can retry the commit. Try to account for all
             // transactions that have been committed since the read_version.
@@ -1528,7 +1627,17 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
+            ensure_operation_allowed_with_cell_flags(&dataset.manifest, &transaction)?;
         }
+        if sets_cell_flags {
+            ensure_saw_every_version_since_read(
+                read_version,
+                dataset.manifest.version,
+                &seen_versions,
+            )?;
+        }
+        // Before encoding, so the transaction file records the clears.
+        record_derived_cell_flag_invalidations(&dataset.manifest, &mut transaction)?;
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.

@@ -17,6 +17,8 @@
 //! ```text
 //! builder            Transaction: an operation plus the version it was based on
 //! operation          the vocabulary of changes an operation can describe
+//! cell_flag          cell flag changes committed with an operation (unstable)
+//! cell_flag_commit   which operations flags allow, what writes clear, applying
 //! update_map         incremental edits to the manifest's string maps
 //! validate           pre-commit checks against the manifest being replaced
 //! manifest_build     applying an operation to produce the next manifest
@@ -27,6 +29,8 @@
 //! ```
 
 mod builder;
+mod cell_flag;
+mod cell_flag_commit;
 mod conflicts;
 mod index_maintenance;
 mod manifest_build;
@@ -40,6 +44,10 @@ mod validate;
 pub(crate) mod test_support;
 
 pub use builder::{Transaction, TransactionBuilder};
+pub use cell_flag::{CarriedCellFlags, CellFlagChanges, CellFlagRegistration, CellFlagUpdate};
+pub use cell_flag_commit::{
+    derive_cell_flag_invalidations, ensure_operation_allowed_with_cell_flags,
+};
 pub use manifest_build::RANGE_SEGMENTS_CONFIG_KEY;
 pub use operation::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, UpdateMode,

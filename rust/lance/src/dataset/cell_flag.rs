@@ -1,0 +1,303 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Cell flags: a named Boolean per cell of one top-level field.
+//!
+//! **Unstable prototype.** Datasets with cell flags set
+//! [`lance_table::feature_flags::FLAG_UNSTABLE_CELL_FLAGS`], which release
+//! builds refuse unless `LANCE_ENABLE_UNSTABLE_CELL_FLAGS` is set. The format
+//! and these APIs may change without migration.
+//!
+//! A flag registered with `clear_on_write` sources is *dependent*: any write to
+//! a source, or to the flag's own field, clears the flag for the written rows
+//! in the same commit. Such a flag becomes true only through a
+//! `DataReplacement` that writes its field and carries a
+//! [`CellFlagUpdate`](crate::dataset::transaction::CellFlagUpdate) setting it,
+//! committed through [`CommitBuilder`]. A flag without sources is *ordinary*:
+//! only explicit updates change it.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use lance_select::RowAddrTreeMap;
+use lance_table::format::CellFlagDefinition;
+
+use crate::dataset::transaction::{
+    CellFlagChanges, CellFlagRegistration, Operation, TransactionBuilder,
+};
+use crate::dataset::write::CommitBuilder;
+use crate::{Dataset, Error, Result};
+
+/// How a cell flag reacts to writes and reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CellFlagOptions {
+    /// Top-level source fields, by name. A write to any of them, or to the
+    /// flag's own field, clears the flag for the written rows. Empty makes an
+    /// ordinary flag.
+    pub clear_on_write: Vec<String>,
+    /// Reads return NULL for the flag's field wherever the flag is false. The
+    /// field must be a nullable scalar and must not be indexed.
+    pub mask_when_false: bool,
+}
+
+impl CellFlagOptions {
+    pub fn with_clear_on_write(
+        mut self,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.clear_on_write = fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_mask_when_false(mut self, mask_when_false: bool) -> Self {
+        self.mask_when_false = mask_when_false;
+        self
+    }
+}
+
+impl Dataset {
+    /// Register a cell flag named `name` on the top-level field `field`.
+    ///
+    /// The flag starts false for every row. Field names are resolved to stable
+    /// field ids now, so later renames keep the flag. The flag id is assigned
+    /// at commit and never reused; staged transactions refer to flags by id.
+    /// Returns the committed definition.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::cell_flag::CellFlagOptions;
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let ready = dataset
+    ///     .register_cell_flag(
+    ///         "summary",
+    ///         "ready",
+    ///         CellFlagOptions::default()
+    ///             .with_clear_on_write(["title", "body"])
+    ///             .with_mask_when_false(true),
+    ///     )
+    ///     .await?;
+    /// assert!(ready.is_dependent());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn register_cell_flag(
+        &mut self,
+        field: &str,
+        name: &str,
+        options: CellFlagOptions,
+    ) -> Result<CellFlagDefinition> {
+        let registration = self.cell_flag_registration(field, name, options)?;
+        let field_id = registration.field_id;
+        self.commit_cell_flag_changes(CellFlagChanges {
+            registrations: vec![registration],
+            ..Default::default()
+        })
+        .await?;
+        self.committed_cell_flag(field_id, name)
+    }
+
+    /// Atomically drop the flag `name` on `field` and register a new one with
+    /// the same name and `options`.
+    ///
+    /// The new flag has a new id and starts false everywhere, so transactions
+    /// staged against the old id fail to commit instead of publishing values
+    /// computed under the old registration.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::cell_flag::CellFlagOptions;
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let old_id = dataset.cell_flag("summary", "ready").map(|flag| flag.flag_id);
+    /// let ready = dataset
+    ///     .replace_cell_flag(
+    ///         "summary",
+    ///         "ready",
+    ///         CellFlagOptions::default().with_clear_on_write(["body"]),
+    ///     )
+    ///     .await?;
+    /// assert_ne!(Some(ready.flag_id), old_id);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn replace_cell_flag(
+        &mut self,
+        field: &str,
+        name: &str,
+        options: CellFlagOptions,
+    ) -> Result<CellFlagDefinition> {
+        let registration = self.cell_flag_registration(field, name, options)?;
+        let field_id = registration.field_id;
+        let existing = self.registered_cell_flag(field, name)?;
+        self.commit_cell_flag_changes(CellFlagChanges {
+            drops: vec![existing],
+            registrations: vec![registration],
+            ..Default::default()
+        })
+        .await?;
+        self.committed_cell_flag(field_id, name)
+    }
+
+    /// Drop the flag `name` on `field` and its state.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// dataset.drop_cell_flag("summary", "ready").await?;
+    /// assert!(dataset.cell_flag("summary", "ready").is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn drop_cell_flag(&mut self, field: &str, name: &str) -> Result<()> {
+        let existing = self.registered_cell_flag(field, name)?;
+        self.commit_cell_flag_changes(CellFlagChanges {
+            drops: vec![existing],
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Every cell flag registered at this version, sorted by flag id.
+    ///
+    /// ```
+    /// # use lance::Dataset;
+    /// # fn example(dataset: &Dataset) -> Vec<&str> {
+    /// dataset
+    ///     .cell_flags()
+    ///     .iter()
+    ///     .map(|flag| flag.name.as_str())
+    ///     .collect()
+    /// # }
+    /// ```
+    pub fn cell_flags(&self) -> &[CellFlagDefinition] {
+        self.manifest
+            .cell_flags
+            .as_deref()
+            .map(|registry| registry.definitions())
+            .unwrap_or_default()
+    }
+
+    /// The flag `name` on the field `field`, if registered at this version.
+    ///
+    /// ```
+    /// # use lance::Dataset;
+    /// # fn example(dataset: &Dataset) -> Option<u32> {
+    /// dataset.cell_flag("summary", "ready").map(|flag| flag.flag_id)
+    /// # }
+    /// ```
+    pub fn cell_flag(&self, field: &str, name: &str) -> Option<&CellFlagDefinition> {
+        let field_id = self.schema().field(field)?.id;
+        self.manifest.cell_flags.as_deref()?.find(field_id, name)
+    }
+
+    /// The rows where flag `flag_id` is true at this version, keyed by fragment
+    /// id with physical row offsets. A `Full` fragment means every physical row
+    /// of it, deleted rows included.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance_select::RowAddrSelection;
+    /// # fn example(dataset: &Dataset, flag_id: u32) -> Result<bool> {
+    /// let true_rows = dataset.cell_flag_true_rows(flag_id)?;
+    /// let first_fragment_all_true = matches!(true_rows.get(&0), Some(RowAddrSelection::Full));
+    /// # Ok(first_fragment_all_true)
+    /// # }
+    /// ```
+    pub fn cell_flag_true_rows(&self, flag_id: u32) -> Result<RowAddrTreeMap> {
+        let registry = self
+            .manifest
+            .cell_flags
+            .as_deref()
+            .filter(|registry| registry.definition(flag_id).is_some())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "cell flag {flag_id} is not registered at version {}",
+                    self.manifest.version
+                ))
+            })?;
+        Ok(registry
+            .states()
+            .get(&flag_id)
+            .map(|state| state.as_ref().clone())
+            .unwrap_or_default())
+    }
+
+    fn cell_flag_field_id(&self, field: &str) -> Result<i32> {
+        self.schema()
+            .field(field)
+            .map(|field| field.id)
+            .ok_or_else(|| {
+                Error::field_not_found(
+                    field,
+                    self.schema()
+                        .fields
+                        .iter()
+                        .map(|field| field.name.clone())
+                        .collect(),
+                )
+            })
+    }
+
+    fn cell_flag_registration(
+        &self,
+        field: &str,
+        name: &str,
+        options: CellFlagOptions,
+    ) -> Result<CellFlagRegistration> {
+        Ok(CellFlagRegistration {
+            field_id: self.cell_flag_field_id(field)?,
+            name: name.to_string(),
+            clear_on_write: options
+                .clear_on_write
+                .iter()
+                .map(|source| self.cell_flag_field_id(source))
+                .collect::<Result<_>>()?,
+            mask_when_false: options.mask_when_false,
+        })
+    }
+
+    fn registered_cell_flag(&self, field: &str, name: &str) -> Result<u32> {
+        let field_id = self.cell_flag_field_id(field)?;
+        self.manifest
+            .cell_flags
+            .as_deref()
+            .and_then(|registry| registry.find(field_id, name))
+            .map(|definition| definition.flag_id)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "field '{field}' has no cell flag named '{name}' at version {}",
+                    self.manifest.version
+                ))
+            })
+    }
+
+    fn committed_cell_flag(&self, field_id: i32, name: &str) -> Result<CellFlagDefinition> {
+        self.manifest
+            .cell_flags
+            .as_deref()
+            .and_then(|registry| registry.find(field_id, name))
+            .cloned()
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "cell flag '{name}' on field id {field_id} is missing from version {} \
+                     that registered it",
+                    self.manifest.version
+                ))
+            })
+    }
+
+    async fn commit_cell_flag_changes(&mut self, changes: CellFlagChanges) -> Result<()> {
+        let operation = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        };
+        let transaction = TransactionBuilder::new(self.manifest.version, operation)
+            .cell_flag_changes(changes)
+            .build();
+        *self = CommitBuilder::new(Arc::new(self.clone()))
+            .execute(transaction)
+            .await?;
+        Ok(())
+    }
+}

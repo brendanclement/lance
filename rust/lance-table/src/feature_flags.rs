@@ -80,8 +80,19 @@ pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
 /// in debug builds or when [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set,
 /// mirroring [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`].
 pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
+/// The manifest carries a cell flag registry (`Manifest::cell_flags`).
+///
+/// A reader without this bit would return the stale values a masking flag
+/// hides, and a writer without it would write a dependent flag's sources
+/// without clearing the flag. Both must refuse the table. Set whenever the
+/// registry exists, which is sticky once the first flag is registered.
+///
+/// Cell flags are an unstable prototype: this build understands the bit only in
+/// debug builds or when [`ENABLE_UNSTABLE_CELL_FLAGS_ENV`] is set, mirroring
+/// [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`].
+pub const FLAG_UNSTABLE_CELL_FLAGS: u64 = 1 << 12;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 12;
+pub const FLAG_UNKNOWN: u64 = 1 << 13;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -94,6 +105,10 @@ const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE < FLAG_UNKNOWN);
+// Every earlier build has its unknown boundary at or below bit 12, so each
+// refuses a dataset with cell flags without a change of its own.
+const _: () = assert!(FLAG_UNSTABLE_CELL_FLAGS >= 1 << 12);
+const _: () = assert!(FLAG_UNSTABLE_CELL_FLAGS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 =
     FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_FRAGMENT_REUSE_INDEX;
@@ -107,6 +122,10 @@ pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_
 /// generally released.
 pub const ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV: &str =
     "LANCE_ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE";
+
+/// Environment variable that opts a release build into reading and writing
+/// datasets with cell flags before the feature is generally released.
+pub const ENABLE_UNSTABLE_CELL_FLAGS_ENV: &str = "LANCE_ENABLE_UNSTABLE_CELL_FLAGS";
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -186,6 +205,11 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
     }
 
+    if manifest.cell_flags.is_some() {
+        manifest.reader_feature_flags |= FLAG_UNSTABLE_CELL_FLAGS;
+        manifest.writer_feature_flags |= FLAG_UNSTABLE_CELL_FLAGS;
+    }
+
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
@@ -228,6 +252,12 @@ pub fn spilled_row_lineage_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV).is_some()
 }
 
+/// Whether this build understands cell flags: always in debug builds, and in
+/// release builds only when [`ENABLE_UNSTABLE_CELL_FLAGS_ENV`] is set.
+pub fn cell_flags_enabled() -> bool {
+    cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_CELL_FLAGS_ENV).is_some()
+}
+
 /// Clear `flag` from `flags` when its gating feature is not enabled in this
 /// build; leave it set otherwise. One call per unstable flag, so support for
 /// several unstable features chains cleanly.
@@ -240,7 +270,11 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// The feature-flag bits this build understands, given whether overlay support
 /// is enabled. Split out from [`supported_flags`] so the policy is testable
 /// without toggling the build profile or environment.
-fn supported_flags_when(overlay_enabled: bool, spilled_row_lineage_enabled: bool) -> u64 {
+fn supported_flags_when(
+    overlay_enabled: bool,
+    spilled_row_lineage_enabled: bool,
+    cell_flags_enabled: bool,
+) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
     mark_supported(
         &mut supported,
@@ -254,11 +288,16 @@ fn supported_flags_when(overlay_enabled: bool, spilled_row_lineage_enabled: bool
         FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
         spilled_row_lineage_enabled,
     );
+    mark_supported(&mut supported, FLAG_UNSTABLE_CELL_FLAGS, cell_flags_enabled);
     supported
 }
 
 fn supported_flags() -> u64 {
-    supported_flags_when(data_overlay_files_enabled(), spilled_row_lineage_enabled())
+    supported_flags_when(
+        data_overlay_files_enabled(),
+        spilled_row_lineage_enabled(),
+        cell_flags_enabled(),
+    )
 }
 
 pub fn can_read_dataset(reader_flags: u64) -> bool {
@@ -443,12 +482,12 @@ mod tests {
     fn test_data_overlay_flag_release_gating() {
         // Release default (overlays disabled): the overlay flag is treated as
         // unknown so the dataset is refused, while other known flags still pass.
-        let supported = supported_flags_when(false, false);
+        let supported = supported_flags_when(false, false, true);
         assert_eq!(supported & FLAG_UNSTABLE_DATA_OVERLAY_FILES, 0);
         assert_eq!(FLAG_DELETION_FILES & !supported, 0);
         assert_ne!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
         // Enabled (debug or env opt-in): the overlay flag is understood.
-        let supported = supported_flags_when(true, false);
+        let supported = supported_flags_when(true, false, true);
         assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
     }
 
@@ -461,11 +500,44 @@ mod tests {
         assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE, 2048);
         // A build that has not opted in refuses the dataset; one that has
         // understands it, and either way the other known flags still pass.
-        let supported = supported_flags_when(true, false);
+        let supported = supported_flags_when(true, false, true);
         assert_ne!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE & !supported, 0);
         assert_eq!(FLAG_MIXED_DATA_FILE_VERSIONS & !supported, 0);
-        let supported = supported_flags_when(true, true);
+        let supported = supported_flags_when(true, true, true);
         assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE & !supported, 0);
+    }
+
+    #[test]
+    fn test_cell_flags_flag_release_gating() {
+        // Every earlier build has its unknown boundary at or below this bit
+        // (4096 on main before this flag), so each refuses the dataset.
+        assert_eq!(FLAG_UNSTABLE_CELL_FLAGS, 4096);
+        let supported = supported_flags_when(true, true, false);
+        assert_ne!(FLAG_UNSTABLE_CELL_FLAGS & !supported, 0);
+        assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE & !supported, 0);
+        let supported = supported_flags_when(true, true, true);
+        assert_eq!(FLAG_UNSTABLE_CELL_FLAGS & !supported, 0);
+        assert_eq!(FLAG_UNKNOWN & !supported, FLAG_UNKNOWN);
+    }
+
+    #[test]
+    fn test_apply_feature_flags_sets_cell_flags_flag_on_both_words() {
+        use crate::format::CellFlagRegistry;
+        use std::sync::Arc;
+
+        let mut manifest = empty_manifest();
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags & FLAG_UNSTABLE_CELL_FLAGS, 0);
+
+        // An empty registry still fences: its allocator must not be lost.
+        manifest.cell_flags = Some(Arc::new(CellFlagRegistry::default()));
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.reader_feature_flags & FLAG_UNSTABLE_CELL_FLAGS, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_UNSTABLE_CELL_FLAGS, 0);
+        assert_eq!(
+            can_read_dataset(manifest.reader_feature_flags),
+            cell_flags_enabled()
+        );
     }
 
     #[test]

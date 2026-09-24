@@ -4,6 +4,7 @@
 mod data_file_part;
 #[cfg(feature = "substrait")]
 mod dataset_aggregate;
+mod dataset_cell_flags;
 mod dataset_common;
 mod dataset_concurrency_store;
 #[cfg(feature = "geo")]

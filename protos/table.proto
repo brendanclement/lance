@@ -135,6 +135,10 @@ message Manifest {
    *   instead of treating data_format.version as a snapshot-wide identity.
    *   This bit is paired in the reader and writer feature words and is one-way.
    * * 1 << 9: the table uses stable row ids and carries a fragment reuse index.
+   * * 1 << 12: UNSTABLE. The manifest carries a cell flag registry (see
+   *   CellFlagRegistry). Readers must refuse the dataset, since masking flags
+   *   hide stale values; writers must refuse it, since dependent flags must be
+   *   cleared by every write to their source fields.
    */
   uint64 reader_feature_flags = 9;
 
@@ -243,7 +247,60 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  /* UNSTABLE: the cell flag registry and the state of every registered flag.
+   *
+   * Absent when no cell flag was ever registered. Once present it is carried
+   * forward to every later version, even after the last flag is dropped, so
+   * flag ids are never reused. Gated by feature flag 1 << 12.
+   */
+  optional CellFlagRegistry cell_flags = 22;
 } // Manifest
+
+/* UNSTABLE: a named Boolean flag scoped to one top-level field.
+ *
+ * A definition is immutable once registered. Replacing a flag drops it and
+ * registers a new one with a fresh id, which fences transactions that were
+ * staged against the old id.
+ */
+message CellFlagDefinition {
+  // Dataset-unique id, assigned at commit and never reused.
+  uint32 flag_id = 1;
+  // Id of the top-level field the flag is scoped to (its output field).
+  int32 field_id = 2;
+  // Name, unique among the flags of one field.
+  string name = 3;
+  /* Ids of top-level source fields, sorted and without duplicates. A non-empty
+   * list makes the flag dependent: a write to any of these fields, or to the
+   * output field itself, clears the flag for the written rows.
+   */
+  repeated int32 clear_on_write = 4;
+  // Reads return NULL for the output field wherever the flag is false.
+  bool mask_when_false = 5;
+}
+
+/* UNSTABLE: the rows whose flag is true.
+ *
+ * `true_rows` is a RowAddrTreeMap keyed by fragment id with physical row
+ * offsets, in its serialized form (little-endian u32 entry count, then per
+ * entry a u32 fragment id, a u32 bitmap size and a portable RoaringBitmap; a
+ * zero size means every physical row of the fragment). A flag or fragment
+ * that is absent is false everywhere.
+ */
+message CellFlagState {
+  uint32 flag_id = 1;
+  bytes true_rows = 2;
+}
+
+// UNSTABLE: every registered cell flag and its state.
+message CellFlagRegistry {
+  // Sorted by flag_id.
+  repeated CellFlagDefinition definitions = 1;
+  // The id the next registration receives. Starts at 1 and only grows.
+  uint32 next_flag_id = 2;
+  // At most one entry per flag; flags without true rows are omitted.
+  repeated CellFlagState states = 3;
+}
 
 // external dataset base path
 message BasePath {

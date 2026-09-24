@@ -918,6 +918,7 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
             operation,
             tag: None,
             transaction_properties,
+            cell_flag_changes: None,
         }))
     }
 }
