@@ -57,7 +57,9 @@ pub struct CellFlagOptions {
     /// ordinary flag.
     pub clear_on_write: Vec<String>,
     /// Reads return NULL for the flag's field wherever the flag is false. The
-    /// field must be a nullable scalar and must not be indexed.
+    /// field must be a nullable scalar and must not be indexed. While such a
+    /// flag is registered, MemWAL (LSM) reads over the dataset fail: MemWAL
+    /// rows carry no flag state to mask them with.
     pub mask_when_false: bool,
 }
 

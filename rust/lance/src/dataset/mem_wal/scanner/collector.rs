@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
-use lance_core::Result;
+use lance_core::{Error, Result};
 use uuid::Uuid;
 
 use super::data_source::{LsmDataSource, LsmGeneration, ShardSnapshot};
@@ -167,6 +167,33 @@ impl LsmDataSourceCollector {
         self
     }
 
+    /// Refuse to read MemWAL rows over a base table in which a cell flag masks
+    /// a field: memtable and SSTable rows carry no flag state, so their cells
+    /// cannot be masked the way the base table's are.
+    pub(crate) fn ensure_base_table_unmasked(&self) -> Result<()> {
+        let Some(base_table) = &self.base_table else {
+            return Ok(());
+        };
+        let Some(flag) = base_table
+            .cell_flags()
+            .iter()
+            .find(|flag| flag.mask_when_false)
+        else {
+            return Ok(());
+        };
+        let field = match base_table.schema().field_path(flag.field_id) {
+            Ok(path) => format!("field '{path}' (field id {})", flag.field_id),
+            Err(_) => format!("field id {}", flag.field_id),
+        };
+        Err(Error::not_supported(format!(
+            "LSM read: {field} of the base table at version {} is masked by cell flag '{}' \
+             (flag id {}), and MemWAL rows carry no cell flag state to mask it with",
+            base_table.version().version,
+            flag.name,
+            flag.flag_id
+        )))
+    }
+
     /// Get the base table, if any.
     pub fn base_table(&self) -> Option<&Arc<Dataset>> {
         self.base_table.as_ref()
@@ -279,7 +306,11 @@ impl LsmDataSourceCollector {
     /// 1. Base table (gen=0), if configured
     /// 2. SSTables per shard, ordered by generation
     /// 3. In-memory memtables per shard (active + frozen-awaiting-flush)
+    ///
+    /// Fails with `NotSupported` when a cell flag masks a field of the base
+    /// table, since MemWAL rows cannot be masked.
     pub fn collect(&self) -> Result<Vec<LsmDataSource>> {
+        self.ensure_base_table_unmasked()?;
         let mut sources = Vec::new();
 
         if let Some(base) = &self.base_table {
@@ -316,7 +347,11 @@ impl LsmDataSourceCollector {
     ///
     /// The base table (when configured) is always included since it may
     /// contain data from any shard (after merging).
+    ///
+    /// Fails like [`Self::collect`] when a cell flag masks a field of the base
+    /// table.
     pub fn collect_for_shards(&self, shard_ids: &HashSet<Uuid>) -> Result<Vec<LsmDataSource>> {
+        self.ensure_base_table_unmasked()?;
         let mut sources = Vec::new();
 
         if let Some(base) = &self.base_table {

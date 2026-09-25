@@ -9,7 +9,7 @@ use crate::{
     },
     index::{
         DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments, load_all_indices,
+        build_index_metadata_from_segments, ensure_unmasked_index_field, load_all_indices,
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
@@ -222,6 +222,9 @@ impl<'a> CreateIndexBuilder<'a> {
                 "CreateIndex: column '{column_input}' does not exist"
             )));
         };
+        for path_field in &field_path {
+            ensure_unmasked_index_field(self.dataset, path_field.id, column_input)?;
+        }
         let field = if let Some(resolved) = &resolved_fts_field {
             self.dataset
                 .schema()
@@ -737,6 +740,9 @@ impl<'a> CreateIndexBuilder<'a> {
                 "CreateIndex: column '{column_input}' does not exist"
             )));
         };
+        for path_field in &field_path {
+            ensure_unmasked_index_field(self.dataset, path_field.id, column_input)?;
+        }
         let field = *field_path.last().unwrap();
         let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
         let column = format_field_path(&names);

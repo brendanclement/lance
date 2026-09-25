@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Read-time masking for cell flags registered with `mask_when_false`: the
+//! flag's field reads as NULL wherever the flag is false.
+//!
+//! [`FragmentReader`](super::FragmentReader) masks physical rows right after
+//! merging overlays, before deletions, filters, aggregates or projections see
+//! a value. Internal writers that re-read rows through it (`UpdateJob`,
+//! `merge_insert` rewriting unmatched rows, `add_columns`, copy-through with
+//! `read_physical_slice`) therefore write masked cells back as NULL. That is
+//! intended: a false flag means the cell has no value.
+
+use std::sync::Arc;
+
+use arrow_array::{Array, BooleanArray, RecordBatch, new_null_array};
+use arrow_buffer::BooleanBuffer;
+use arrow_select::nullif::nullif;
+use futures::{FutureExt, StreamExt};
+use lance_core::datatypes::Schema;
+use lance_core::{Error, Result};
+use lance_file::version::ConcreteFileVersion;
+use lance_select::{RowAddrSelection, RowAddrTreeMap};
+use lance_table::utils::stream::{ReadBatchTask, ReadBatchTaskStream};
+
+use crate::Dataset;
+
+#[derive(Debug)]
+enum ColumnMask {
+    /// The flag is false on every row of the fragment.
+    AllMasked,
+    /// The flag's true rows, which include some but not all of this fragment's.
+    /// Shared with the manifest rather than copied on every open.
+    Partial(Arc<RowAddrTreeMap>),
+}
+
+#[derive(Debug)]
+struct MaskedColumn {
+    name: String,
+    mask: ColumnMask,
+}
+
+/// The projected fields of one fragment that a masking cell flag hides on at
+/// least one row. A field whose flag is true on every row is left out.
+#[derive(Debug)]
+pub(super) struct CellFlagMasks {
+    fragment_id: u32,
+    columns: Vec<MaskedColumn>,
+}
+
+impl CellFlagMasks {
+    /// The masks `fragment_id` needs for the top-level fields of `projection`,
+    /// or `None` when every projected cell reads its stored value.
+    pub(super) fn resolve(
+        dataset: &Dataset,
+        fragment_id: u64,
+        projection: &Schema,
+    ) -> Result<Option<Arc<Self>>> {
+        let Some(registry) = dataset.manifest.cell_flags.as_deref() else {
+            return Ok(None);
+        };
+        reject_masked_v1_read(dataset, fragment_id, projection)?;
+        let fragment_id = u32::try_from(fragment_id).map_err(|_| {
+            Error::internal(format!(
+                "fragment id {fragment_id} exceeds the u32 range cell flag state is keyed by"
+            ))
+        })?;
+        let mut columns = Vec::new();
+        for field in &projection.fields {
+            let Some(flag) = registry.masking_flag(field.id) else {
+                continue;
+            };
+            let state = registry.states().get(&flag.flag_id);
+            let mask = match state.and_then(|state| Some((state, state.get(&fragment_id)?))) {
+                Some((_, RowAddrSelection::Full)) => continue,
+                Some((state, RowAddrSelection::Partial(_))) => ColumnMask::Partial(state.clone()),
+                None => ColumnMask::AllMasked,
+            };
+            columns.push(MaskedColumn {
+                name: field.name.clone(),
+                mask,
+            });
+        }
+        Ok((!columns.is_empty()).then(|| {
+            Arc::new(Self {
+                fragment_id,
+                columns,
+            })
+        }))
+    }
+
+    /// Only a partially masked field needs each row's physical offset.
+    pub(super) fn needs_offsets(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|column| matches!(column.mask, ColumnMask::Partial(_)))
+    }
+
+    /// Null the masked cells of every batch of `stream`, which yields physical
+    /// rows in the order of `offsets_in_frag`. The offsets are required when
+    /// [`Self::needs_offsets`].
+    pub(super) fn apply(
+        self: Arc<Self>,
+        stream: ReadBatchTaskStream,
+        offsets_in_frag: Option<Arc<Vec<u32>>>,
+    ) -> ReadBatchTaskStream {
+        let mut rows_seen = 0usize;
+        stream
+            .map(move |task| {
+                let num_rows = task.num_rows as usize;
+                let start = rows_seen;
+                rows_seen += num_rows;
+                let masks = self.clone();
+                let offsets_in_frag = offsets_in_frag.clone();
+                let inner = task.task;
+                ReadBatchTask {
+                    num_rows: task.num_rows,
+                    task: async move {
+                        let batch = inner.await?;
+                        let batch_offsets = offsets_in_frag
+                            .as_deref()
+                            .map(|offsets| {
+                                offsets.get(start..start + num_rows).ok_or_else(|| {
+                                    Error::internal(format!(
+                                        "fragment {} read yielded rows {start}..{} but planned \
+                                         only {} physical offsets",
+                                        masks.fragment_id,
+                                        start + num_rows,
+                                        offsets.len()
+                                    ))
+                                })
+                            })
+                            .transpose()?;
+                        masks.mask_batch(batch, batch_offsets)
+                    }
+                    .boxed(),
+                }
+            })
+            .boxed()
+    }
+
+    fn mask_batch(&self, batch: RecordBatch, batch_offsets: Option<&[u32]>) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let num_rows = batch.num_rows();
+        let mut columns = batch.columns().to_vec();
+        for masked in &self.columns {
+            let index = schema.index_of(&masked.name).map_err(|_| {
+                Error::internal(format!(
+                    "cannot mask field '{}' of fragment {}: the batch read has no such column \
+                     (it has {:?})",
+                    masked.name,
+                    self.fragment_id,
+                    schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+                ))
+            })?;
+            columns[index] = match &masked.mask {
+                ColumnMask::AllMasked => new_null_array(columns[index].data_type(), num_rows),
+                ColumnMask::Partial(state) => {
+                    let Some(RowAddrSelection::Partial(true_rows)) = state.get(&self.fragment_id)
+                    else {
+                        return Err(Error::internal(format!(
+                            "cannot mask field '{}' of fragment {}: its cell flag state no \
+                             longer holds a partial selection for the fragment",
+                            masked.name, self.fragment_id
+                        )));
+                    };
+                    let offsets = batch_offsets
+                        .filter(|offsets| offsets.len() == num_rows)
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "cannot mask field '{}' of fragment {}: a batch of {num_rows} \
+                                 rows came with {:?} physical offsets",
+                                masked.name,
+                                self.fragment_id,
+                                batch_offsets.map(<[u32]>::len)
+                            ))
+                        })?;
+                    // Flags change in runs of rows, so most batches fall
+                    // entirely inside a run and skip the per-row lookups.
+                    let (Some(&first), Some(&last)) = (offsets.iter().min(), offsets.iter().max())
+                    else {
+                        continue;
+                    };
+                    let true_in_span = true_rows.range_cardinality(first..=last);
+                    if true_in_span == u64::from(last - first) + 1 {
+                        continue;
+                    }
+                    if true_in_span == 0 {
+                        new_null_array(columns[index].data_type(), num_rows)
+                    } else {
+                        let is_masked = BooleanBuffer::collect_bool(num_rows, |row| {
+                            !true_rows.contains(offsets[row])
+                        });
+                        if is_masked.count_set_bits() == 0 {
+                            continue;
+                        }
+                        nullif(columns[index].as_ref(), &BooleanArray::new(is_masked, None))?
+                    }
+                }
+            };
+        }
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+}
+
+/// Registration refuses masking on legacy (v1) storage, whose pushdown scan
+/// answers filters from page statistics of the stored values. Refuse reads of
+/// a masked field there too, should one ever appear.
+pub(super) fn reject_masked_v1_read(
+    dataset: &Dataset,
+    fragment_id: u64,
+    projection: &Schema,
+) -> Result<()> {
+    if dataset.manifest.data_storage_format.lance_file_format() != ConcreteFileVersion::V1 {
+        return Ok(());
+    }
+    let Some(registry) = dataset.manifest.cell_flags.as_deref() else {
+        return Ok(());
+    };
+    let Some((field, flag)) = projection.fields.iter().find_map(|field| {
+        registry
+            .masking_flag(field.id)
+            .map(|flag| (field.name.as_str(), flag))
+    }) else {
+        return Ok(());
+    };
+    Err(Error::not_supported(format!(
+        "cannot read field '{field}' of fragment {fragment_id}: cell flag '{}' (flag id {}) \
+         masks it, and the legacy (v1) storage format cannot mask cells",
+        flag.name, flag.flag_id
+    )))
+}

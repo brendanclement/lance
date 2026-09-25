@@ -535,6 +535,10 @@ impl LsmScanner {
     }
 
     /// Create the execution plan.
+    ///
+    /// Fails with `NotSupported` when a cell flag masks a field of the base
+    /// table, since MemWAL rows cannot be masked (see
+    /// [`LsmDataSourceCollector::collect`]).
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // Dispatch by builder state, mirroring `Scanner::create_plan` and
         // `MemTableScanner::create_plan`: vector search, then full-text search,
