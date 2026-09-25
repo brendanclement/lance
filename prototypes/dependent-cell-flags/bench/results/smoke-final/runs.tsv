@@ -1,0 +1,4 @@
+round	build	started	finished	loadavg_before
+1	baseline	2026-09-25T06:46:48Z	2026-09-25T06:46:59Z	25.78 21.47 13.67
+1	prototype	2026-09-25T06:46:59Z	2026-09-25T06:47:11Z	22.64 20.95 13.57
+1	prototype-flags	2026-09-25T06:47:11Z	2026-09-25T06:48:10Z	18.25 20.06 13.39

@@ -1,0 +1,47 @@
+cell_flags_regression build=baseline git_sha=e3671b2f5730eea927a088a42cbf30e273edc43c scale_rows=100000 rows_per_fragment=10000 fragments=10 samples=3 read_samples=3 warmup=1 stable_row_ids=false data=/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/bench-data/cell_flags_regression-baseline
+udf iterations=16 summary=1467 ns/row translation=1101 ns/row
+
+workload                           variant                  cache          n    wall_ms    udf_ms  stage_ms commit_ms  r_iops     r_KiB w_iops      w_KiB  manif_B   txn_B  outcome
+append                             default                  warm           3       4.67         -      3.86      0.82       1         0      4        709     1475     134  
+update_sparse                      default                  warm           3       5.61         -         -         -     161      1209     14         16     2702    1191  
+update_dense                       default                  warm           3       7.73         -         -         -      35      6991     14        240     2724    1202  
+update_unrelated_sparse            default                  warm           3       5.61         -         -         -     161      1209     14         23     2702    1191  
+merge_insert_partial_sparse        default                  warm           3      13.98         -     13.10      0.89      31      5350     13       5193     4087    1888  
+refresh_permissive_clean           default                  warm           3     159.17    125.69     23.49      1.11      11      6699     13       1485     2821     822  committed
+refresh_permissive_conflicts_1     update_row_moving        warm           3     157.02    125.10     21.76      0.13      56      7226     19       1488        -       -  conflict:retryable
+refresh_permissive_conflicts_1     merge_insert_in_place    warm           3     164.13    124.97     21.94      0.92      33      9474     21       4099     3291     822  committed(stale=10)
+refresh_permissive_conflicts_4     update_row_moving        warm           3     168.65    124.26     21.63      0.18     237      8850     56       1523        -       -  conflict:retryable
+refresh_permissive_conflicts_4     merge_insert_in_place    warm           3     190.07    124.73     21.94      1.01     163     23085     55      17091     3762     822  committed(stale=40)
+refresh_permissive_conflicts_16    update_row_moving        warm           3     227.19    124.77     22.10      0.38    1078     15542    219       1698        -       -  conflict:retryable
+refresh_permissive_conflicts_16    merge_insert_in_place    warm           3     339.94    124.19     21.86      1.21     765     85372    206      76825     3764     823  committed(stale=160)
+publish_after_k_commits            k=0                      warm           3       0.92         -         -      0.92       1         0      3          4     2824     823  committed
+publish_after_k_commits            k=1                      warm           3       0.94         -         -      0.94       2         1      3          4     2914     823  committed
+publish_after_k_commits            k=4                      warm           3       1.01         -         -      1.01       5         6      3          4     3188     823  committed
+publish_after_k_commits            k=16                     warm           3       1.22         -         -      1.22      17        34      3          5     4297     823  committed
+publish_after_k_commits            k=64                     warm           3       1.81         -         -      1.81      65       273      3          9     8713     823  committed
+scan_summary_full                  populated                warm           3       0.74         -         -         -      10      1433      0          0     2820     822  
+filter_summary_is_null_count       populated                warm           3       0.88         -         -         -      10      1433      0          0     2820     822  
+count_summary_vs_star              populated:aggregate      warm           3       0.73         -         -         -      10      1433      0          0     2820     822  
+count_summary_vs_star              populated:sql            warm           3       1.19         -         -         -      10      1433      0          0     2820     822  
+filter_id_range_project_summary    populated                warm           3       0.75         -         -         -      11       216      0          0     2820     822  
+take_random_1k                     populated                warm           3       1.31         -         -         -      13      1398      0          0     2820     822  
+scan_summary_full                  populated                fresh-session  3       0.91         -         -         -      30      1475      0          0     2820     822  
+filter_summary_is_null_count       populated                fresh-session  3       0.94         -         -         -      30      1475      0          0     2820     822  
+count_summary_vs_star              populated:aggregate      fresh-session  3       0.91         -         -         -      30      1475      0          0     2820     822  
+count_summary_vs_star              populated:sql            fresh-session  3       1.30         -         -         -      30      1475      0          0     2820     822  
+filter_id_range_project_summary    populated                fresh-session  3       1.07         -         -         -      43       262      0          0     2820     822  
+take_random_1k                     populated                fresh-session  3       1.40         -         -         -      33      1440      0          0     2820     822  
+scan_summary_full                  null_1pct                warm           3       0.80         -         -         -      10      1475      0          0     2819     822  
+filter_summary_is_null_count       null_1pct                warm           3       0.91         -         -         -      10      1475      0          0     2819     822  
+count_summary_vs_star              null_1pct:aggregate      warm           3       0.77         -         -         -      10      1475      0          0     2819     822  
+count_summary_vs_star              null_1pct:sql            warm           3       1.20         -         -         -      10      1475      0          0     2819     822  
+filter_id_range_project_summary    null_1pct                warm           3       0.80         -         -         -      11       216      0          0     2819     822  
+take_random_1k                     null_1pct                warm           3       1.32         -         -         -      13      1439      0          0     2819     822  
+scan_summary_full                  null_1pct                fresh-session  3       0.92         -         -         -      30      1516      0          0     2819     822  
+filter_summary_is_null_count       null_1pct                fresh-session  3       1.08         -         -         -      30      1516      0          0     2819     822  
+count_summary_vs_star              null_1pct:aggregate      fresh-session  3       0.95         -         -         -      30      1516      0          0     2819     822  
+count_summary_vs_star              null_1pct:sql            fresh-session  3       1.37         -         -         -      30      1516      0          0     2819     822  
+filter_id_range_project_summary    null_1pct                fresh-session  3       1.02         -         -         -      43       261      0          0     2819     822  
+take_random_1k                     null_1pct                fresh-session  3       1.53         -         -         -      33      1481      0          0     2819     822  
+
+records appended to prototypes/dependent-cell-flags/bench/results/smoke-final/round1-baseline.jsonl

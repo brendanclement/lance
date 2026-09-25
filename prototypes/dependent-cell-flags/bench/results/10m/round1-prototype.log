@@ -1,0 +1,38 @@
+cell_flags_regression build=prototype git_sha=21601f894547b101d8966953c4e158ecd7d97523 scale_rows=10000000 rows_per_fragment=100000 fragments=100 samples=3 read_samples=20 warmup=1 stable_row_ids=false data=/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/bench-data/cell_flags_regression-prototype
+udf iterations=16 summary=1311 ns/row translation=1012 ns/row
+
+workload                           variant                  cache          n    wall_ms    udf_ms  stage_ms commit_ms  r_iops     r_KiB w_iops      w_KiB  manif_B   txn_B  outcome
+update_sparse                      default                  warm           3      66.60         -         -         -     494     52913     66         72    17373    6798  
+update_unrelated_sparse            default                  warm           3      67.92         -         -         -     494     52913     66         78    17374    6798  
+refresh_permissive_clean           default                  warm           3   12576.37  11831.28    582.48      1.25     201    677432    103     147108    24801    7842  committed
+publish_after_k_commits            k=0                      warm           3       1.23         -         -      1.23       1         0      3         32    24801    7842  committed
+publish_after_k_commits            k=1                      warm           3       1.11         -         -      1.11       2         9      3         32    24892    7842  committed
+publish_after_k_commits            k=4                      warm           3       1.20         -         -      1.20       5        38      3         32    25165    7842  committed
+publish_after_k_commits            k=16                     warm           3       1.39         -         -      1.39      17       162      3         33    26275    7842  committed
+publish_after_k_commits            k=64                     warm           3       2.04         -         -      2.04      65       787      3         38    30693    7843  committed
+scan_summary_full                  populated                warm          20      24.17         -         -         -     100    145996      0          0    24800    7842  
+filter_summary_is_null_count       populated                warm          20      26.05         -         -         -     100    145996      0          0    24800    7842  
+count_summary_vs_star              populated:aggregate      warm          20      24.50         -         -         -     100    145996      0          0    24800    7842  
+count_summary_vs_star              populated:sql            warm          20      33.99         -         -         -     100    145996      0          0    24800    7842  
+filter_id_range_project_summary    populated                warm          20      12.34         -         -         -     113     28994      0          0    24800    7842  
+take_random_1k                     populated                warm          20      10.58         -         -         -     932      3752      0          0    24800    7842  
+scan_summary_full                  populated                fresh-session 20      24.70         -         -         -     300    146549      0          0    24800    7842  
+filter_summary_is_null_count       populated                fresh-session 20      27.04         -         -         -     300    146549      0          0    24800    7842  
+count_summary_vs_star              populated:aggregate      fresh-session 20      25.08         -         -         -     300    146549      0          0    24800    7842  
+count_summary_vs_star              populated:sql            fresh-session 20      33.99         -         -         -     300    146549      0          0    24800    7842  
+filter_id_range_project_summary    populated                fresh-session 20      13.00         -         -         -     418     29454      0          0    24800    7842  
+take_random_1k                     populated                fresh-session 20      12.41         -         -         -    1132      4304      0          0    24800    7842  
+scan_summary_full                  null_1pct                warm          20      25.88         -         -         -     100    145838      0          0    24800    7842  
+filter_summary_is_null_count       null_1pct                warm          20      28.88         -         -         -     100    145838      0          0    24800    7842  
+count_summary_vs_star              null_1pct:aggregate      warm          20      25.95         -         -         -     100    145838      0          0    24800    7842  
+count_summary_vs_star              null_1pct:sql            warm          20      36.19         -         -         -     100    145838      0          0    24800    7842  
+filter_id_range_project_summary    null_1pct                warm          20      12.23         -         -         -     113     28989      0          0    24800    7842  
+take_random_1k                     null_1pct                warm          20      10.95         -         -         -     932      3748      0          0    24800    7842  
+scan_summary_full                  null_1pct                fresh-session 20      26.15         -         -         -     300    146391      0          0    24800    7842  
+filter_summary_is_null_count       null_1pct                fresh-session 20      30.28         -         -         -     300    146391      0          0    24800    7842  
+count_summary_vs_star              null_1pct:aggregate      fresh-session 20      27.61         -         -         -     300    146391      0          0    24800    7842  
+count_summary_vs_star              null_1pct:sql            fresh-session 20      36.38         -         -         -     300    146391      0          0    24800    7842  
+filter_id_range_project_summary    null_1pct                fresh-session 20      13.09         -         -         -     418     29449      0          0    24800    7842  
+take_random_1k                     null_1pct                fresh-session 20      13.05         -         -         -    1132      4301      0          0    24800    7842  
+
+records appended to /Users/brendan/code/lance/.claude/worktrees/dependency-aware-cell-flags-43fc32/prototypes/dependent-cell-flags/bench/results/10m/round1-prototype.jsonl
