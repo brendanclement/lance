@@ -48,6 +48,11 @@ producing wrong results:
   `Update` operations) on fragments where an *ordinary* flag is true. Dependent flags on moved rows
   fall back to unassigned, which is safe but loses completed work.
 - Masked outputs that are non-nullable, nested, list/struct, blob, or on legacy (v1) storage.
+- MemWAL (LSM) reads over a base table with a masking flag: `LsmScanner`, the point-lookup,
+  vector and full-text planners, and `contains_pks`. MemWAL rows carry no flag state, so every
+  such read fails, even with no shards or no masked column projected. Known gap: a fresh-tier-only
+  reader (`LsmScanner::without_base_table`) has no manifest to consult, so it is not refused and
+  serves MemWAL rows unmasked.
 - Assigning a dependent flag true outside a `DataReplacement` that writes its output.
 - `Skip` through `CommitBuilder::execute` (it cannot return the report); use
   `execute_with_report`.

@@ -10,14 +10,18 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
 use arrow_array::{
-    ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array, record_batch,
+    ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+    StringArray, UInt64Array, record_batch,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
-use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::physical_plan::collect;
+use datafusion::prelude::{DataFrame, SessionContext, col};
+use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt, stream};
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::Error;
-use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY_POSITION, Schema as LanceSchema};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_file::version::LanceFileVersion;
@@ -25,18 +29,24 @@ use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery, ScalarIndexParams};
 use lance_index::{IndexParams, IndexType};
+use lance_linalg::distance::DistanceType;
 use lance_select::{RowAddrSelection, RowSetOps};
 use lance_table::format::{CellFlagRegistry, pb};
 use lance_table::utils::stream::ReadBatchFutStream;
 use roaring::RoaringBitmap;
 use rstest::rstest;
+use uuid::Uuid;
 
 use super::dataset_cell_flags::{commit_replacement, full, register_ready, set_true};
 use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::cell_flag::CellFlagOptions;
 use crate::dataset::fragment::FragReadConfig;
-use crate::dataset::mem_wal::scanner::LsmScanner;
+use crate::dataset::mem_wal::scanner::{
+    LsmDataSourceCollector, LsmFtsSearchPlanner, LsmPointLookupPlanner, LsmScanner,
+    LsmVectorSearchPlanner,
+};
+use crate::dataset::mem_wal::{DatasetMemWalExt, ShardWriter, ShardWriterConfig};
 use crate::dataset::scanner::{AggregateExpr, ColumnOrdering, MaterializationStyle};
 use crate::dataset::schema_evolution::NewColumnTransform;
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
@@ -179,6 +189,32 @@ fn id_summaries(batch: &RecordBatch) -> Vec<(i32, Option<String>)> {
         .collect();
     pairs.sort();
     pairs
+}
+
+/// The live ids whose rows `flag_id` is true on, sorted.
+async fn flagged_ids(dataset: &Dataset, flag_id: u32) -> Vec<i32> {
+    let true_rows = dataset.cell_flag_true_rows(flag_id).unwrap();
+    let mut scan = dataset.scan();
+    scan.with_row_address().project(&["id"]).unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut ids: Vec<i32> = batch["id"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .zip(batch["_rowaddr"].as_primitive::<UInt64Type>().values())
+        .filter(|(_, row_addr)| true_rows.contains(**row_addr))
+        .map(|(id, _)| *id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The latest version in storage. A failed call leaves the handle as it was
+/// even if it committed first, so only storage shows whether it did.
+async fn latest(dataset: &Dataset) -> Dataset {
+    let mut latest = dataset.clone();
+    latest.checkout_latest().await.unwrap();
+    latest
 }
 
 async fn scan_id_summaries(dataset: &Dataset) -> Vec<(i32, Option<String>)> {
@@ -383,24 +419,198 @@ async fn test_full_text_search_sees_masked_values(
     assert_eq!(id_summaries(&batch), expected(expected_ids), "{token}");
 }
 
-#[tokio::test]
-async fn test_lsm_scan_of_a_masked_dataset_is_refused() {
-    let (dataset, flag_id) = masked_articles(false).await;
-    let summary_id = dataset.schema().field("summary").unwrap().id;
-    let error = LsmScanner::new(Arc::new(dataset), vec![], vec!["id".to_string()])
-        .project(&["id", "summary"])
+/// [`masked_articles`] with a `vector` column, MemWAL keyed on `id`, and a
+/// shard whose active memtable rewrites id 4's body next to the summary
+/// published for its old body: the pair masking exists to hide.
+async fn masked_articles_with_fresh_row() -> (Arc<Dataset>, ShardWriter, u32) {
+    let (mut dataset, flag_id) = masked_articles(false).await;
+    let item = Arc::new(ArrowField::new("item", DataType::Float32, true));
+    let vector = ArrowSchema::new(vec![ArrowField::new(
+        "vector",
+        DataType::FixedSizeList(item, 2),
+        true,
+    )]);
+    dataset
+        .add_columns(NewColumnTransform::AllNulls(Arc::new(vector)), None, None)
+        .await
+        .unwrap();
+    dataset
+        .update_field_metadata()
+        .update("id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")])
         .unwrap()
-        .try_into_batch()
+        .await
+        .unwrap();
+    dataset
+        .initialize_mem_wal()
+        .unsharded()
+        .execute()
+        .await
+        .unwrap();
+    let writer = dataset
+        .mem_wal_writer(Uuid::new_v4(), ShardWriterConfig::default())
+        .await
+        .unwrap();
+    let vectors =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 0.0]), 2).unwrap();
+    let fresh = RecordBatch::try_new(
+        Arc::new(ArrowSchema::from(dataset.schema())),
+        vec![
+            Arc::new(Int32Array::from(vec![4])),
+            Arc::new(StringArray::from(vec!["t4"])),
+            Arc::new(StringArray::from(vec!["rewritten"])),
+            Arc::new(StringArray::from(vec!["s4"])),
+            Arc::new(vectors),
+        ],
+    )
+    .unwrap();
+    writer.put(vec![fresh]).await.unwrap();
+    (Arc::new(dataset), writer, flag_id)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LsmRead {
+    Scan,
+    PointLookup,
+    VectorSearch,
+    FullTextSearch,
+    FreshTierMembership,
+}
+
+/// Run `read` over `base`, plus the memtables of `writer` when given, to the
+/// end of its output.
+async fn run_lsm_read(
+    read: LsmRead,
+    base: &Arc<Dataset>,
+    writer: Option<&ShardWriter>,
+) -> lance_core::Result<()> {
+    let pk = vec!["id".to_string()];
+    let schema = Arc::new(ArrowSchema::from(base.schema()));
+    let projection = ["id".to_string(), "summary".to_string()];
+    let mut collector = LsmDataSourceCollector::new(base.clone(), vec![]);
+    let mut scanner = LsmScanner::new(base.clone(), vec![], pk.clone());
+    if let Some(writer) = writer {
+        let memtables = writer.in_memory_memtable_refs().await?;
+        collector = collector.with_in_memory_memtables(writer.shard_id(), memtables.clone());
+        scanner = scanner.with_in_memory_memtables(writer.shard_id(), memtables);
+    }
+    let task_ctx = SessionContext::new().task_ctx();
+    match read {
+        LsmRead::Scan => {
+            scanner.project(&projection)?.try_into_batch().await?;
+        }
+        LsmRead::PointLookup => {
+            LsmPointLookupPlanner::new(collector, pk, schema)?
+                .lookup(&[ScalarValue::Int32(Some(4))], Some(projection.as_slice()))
+                .await?;
+        }
+        LsmRead::VectorSearch => {
+            let query =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 0.0]), 2)?;
+            let plan = LsmVectorSearchPlanner::new(
+                collector,
+                pk,
+                schema,
+                "vector".to_string(),
+                DistanceType::L2,
+            )
+            .with_filter(Some(col("summary").is_null()))
+            .plan_search(&query, 1, 1, Some(projection.as_slice()), false, 1.0)
+            .await?;
+            collect(plan, task_ctx).await?;
+        }
+        LsmRead::FullTextSearch => {
+            let query =
+                FullTextSearchQuery::new("s4".to_string()).with_column("summary".to_string())?;
+            let plan = LsmFtsSearchPlanner::new(collector, pk, schema)
+                .plan_search(query, Some(1), Some(projection.as_slice()))
+                .await?;
+            collect(plan, task_ctx).await?;
+        }
+        LsmRead::FreshTierMembership => {
+            scanner
+                .contains_pks(&record_batch!(("id", Int32, [4, 5]))?)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Memtable and SSTable rows carry no cell flag state, so every LSM reader
+/// over a base table with a masking flag refuses, whether or not a shard or
+/// the masked column is involved.
+#[rstest]
+#[case::scan_without_shards(LsmRead::Scan, false)]
+#[case::scan(LsmRead::Scan, true)]
+#[case::point_lookup(LsmRead::PointLookup, true)]
+#[case::vector_search(LsmRead::VectorSearch, true)]
+#[case::full_text_search(LsmRead::FullTextSearch, true)]
+#[case::fresh_tier_membership(LsmRead::FreshTierMembership, true)]
+#[tokio::test]
+async fn test_lsm_reads_of_a_masked_dataset_are_refused(
+    #[case] read: LsmRead,
+    #[case] has_fresh_row: bool,
+) {
+    let (dataset, writer, flag_id) = masked_articles_with_fresh_row().await;
+    let summary_id = dataset.schema().field("summary").unwrap().id;
+    let error = run_lsm_read(read, &dataset, has_fresh_row.then_some(&writer))
         .await
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }), "{error}");
     assert!(
         error.to_string().contains(&format!(
-            "LSM scan: field 'summary' (field id {summary_id}) is masked by cell flag 'ready' \
-             (flag id {flag_id}), and MemWAL rows carry no cell flag state"
+            "LSM read: field 'summary' (field id {summary_id}) of the base table at version {} \
+             is masked by cell flag 'ready' (flag id {flag_id}), and MemWAL rows carry no cell \
+             flag state",
+            dataset.version().version
         )),
         "{error}"
     );
+}
+
+/// What the refusal prevents: without the flag, the LSM readers serve the
+/// memtable's new body next to the summary published for the old one.
+#[tokio::test]
+async fn test_lsm_reads_serve_fresh_rows_unmasked() {
+    let (dataset, writer, _) = masked_articles_with_fresh_row().await;
+    let mut unmasked = dataset.as_ref().clone();
+    unmasked.drop_cell_flag("summary", "ready").await.unwrap();
+    let unmasked = Arc::new(unmasked);
+    let memtables = writer.in_memory_memtable_refs().await.unwrap();
+    let projection = ["id", "body", "summary"].map(str::to_string);
+    // The `(body, summary)` of id 4.
+    let fresh = |batch: &RecordBatch| -> Vec<(String, Option<String>)> {
+        batch["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .zip(batch["body"].as_string::<i32>().iter())
+            .zip(batch["summary"].as_string::<i32>().iter())
+            .filter(|((id, _), _)| **id == 4)
+            .map(|((_, body), summary)| (body.unwrap().to_string(), summary.map(str::to_string)))
+            .collect()
+    };
+    let stale = vec![("rewritten".to_string(), Some("s4".to_string()))];
+
+    let scanned = LsmScanner::new(unmasked.clone(), vec![], vec!["id".to_string()])
+        .with_in_memory_memtables(writer.shard_id(), memtables.clone())
+        .project(&projection)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(fresh(&scanned), stale);
+    let looked_up = LsmPointLookupPlanner::new(
+        LsmDataSourceCollector::new(unmasked.clone(), vec![])
+            .with_in_memory_memtables(writer.shard_id(), memtables),
+        vec!["id".to_string()],
+        Arc::new(ArrowSchema::from(unmasked.schema())),
+    )
+    .unwrap()
+    .lookup(&[ScalarValue::Int32(Some(4))], Some(projection.as_slice()))
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(fresh(&looked_up), stale);
 }
 
 #[tokio::test]
@@ -555,7 +765,7 @@ async fn test_takes_and_late_materialization_mask(#[values(false, true)] stable_
 #[rstest]
 #[tokio::test]
 async fn test_write_predicates_see_masked_values(#[values(false, true)] stable_row_ids: bool) {
-    let (dataset, _) = masked_articles(stable_row_ids).await;
+    let (dataset, flag_id) = masked_articles(stable_row_ids).await;
     let update = |predicate: &str| {
         UpdateBuilder::new(Arc::new(dataset.clone()))
             .update_where(predicate)
@@ -582,6 +792,12 @@ async fn test_write_predicates_see_masked_values(#[values(false, true)] stable_r
     let mut edited = batch["id"].as_primitive::<Int32Type>().values().to_vec();
     edited.sort();
     assert_eq!(edited, [0, 2, 4]);
+    // Editing `title` clears the flag on exactly the edited rows, so their
+    // summaries read NULL like every other row's.
+    let all_null: Vec<(i32, Option<String>)> = LIVE_IDS.iter().map(|id| (*id, None)).collect();
+    assert_eq!(scan_id_summaries(&updated.new_dataset).await, all_null);
+    assert_eq!(flagged_ids(&updated.new_dataset, flag_id).await, [1]);
+    assert_eq!(flagged_ids(&dataset, flag_id).await, [0, 1, 2, 4]);
 
     // Deletes commit to the same store as the update above, so they start
     // from a fresh copy of the fixture.
@@ -603,18 +819,25 @@ async fn test_write_predicates_see_masked_values(#[values(false, true)] stable_r
         6
     );
     assert_eq!(scan_id_summaries(&deleting).await, expected(&[0, 2, 4]));
+    assert_eq!(flagged_ids(&deleting, flag_id).await, [0, 2, 4]);
 }
 
-/// The version that writes a source is the version that masks the output.
+/// The version that writes a source is the version that masks the output,
+/// and it clears the flag on the written row only. Id 0 is in the fragment
+/// whose flag is true on every row, id 4 in the one where it is partial.
 #[rstest]
 #[case::merge_insert_in_place(true)]
 #[case::update_moving_rows(false)]
 #[tokio::test]
-async fn test_source_write_masks_output_in_its_own_version(#[case] is_in_place: bool) {
-    let (dataset, _) = masked_articles(false).await;
+async fn test_source_write_masks_output_in_its_own_version(
+    #[case] is_in_place: bool,
+    #[values(0, 4)] written_id: i32,
+) {
+    let (dataset, flag_id) = masked_articles(false).await;
     let previous = dataset.version().version;
     let written = if is_in_place {
-        let source = record_batch!(("id", Int32, [4]), ("body", Utf8, ["rewritten"])).unwrap();
+        let source =
+            record_batch!(("id", Int32, [written_id]), ("body", Utf8, ["rewritten"])).unwrap();
         MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
@@ -628,7 +851,7 @@ async fn test_source_write_masks_output_in_its_own_version(#[case] is_in_place: 
             .0
     } else {
         UpdateBuilder::new(Arc::new(dataset))
-            .update_where("id = 4")
+            .update_where(&format!("id = {written_id}"))
             .unwrap()
             .set("body", "'rewritten'")
             .unwrap()
@@ -647,7 +870,7 @@ async fn test_source_write_masks_output_in_its_own_version(#[case] is_in_place: 
             .scan()
             .project(&["id", "body", "summary"])
             .unwrap()
-            .filter("id IN (0, 4)")
+            .filter("id IN (0, 2, 4)")
             .unwrap()
             .try_into_batch()
             .await
@@ -666,16 +889,30 @@ async fn test_source_write_masks_output_in_its_own_version(#[case] is_in_place: 
             .collect();
         (bodies, id_summaries(&batch))
     };
-    let (bodies, summaries) = read(written.checkout_version(version).await.unwrap()).await;
-    assert_eq!(bodies[&4], "rewritten");
+    let current = written.checkout_version(version).await.unwrap();
+    let (bodies, summaries) = read(current.clone()).await;
+    assert_eq!(bodies[&written_id], "rewritten");
+    let mut masked = expected(&[0, 2, 4]);
+    for (id, summary) in &mut masked {
+        if *id == written_id {
+            *summary = None;
+        }
+    }
     assert_eq!(
-        summaries,
-        vec![(0, Some("s0".to_string())), (4, None)],
+        summaries, masked,
         "the new body must never be visible with the old summary"
     );
-    let (bodies, summaries) = read(written.checkout_version(previous).await.unwrap()).await;
-    assert_eq!(bodies[&4], "b4");
-    assert_eq!(summaries, expected(&[0, 4]));
+    let untouched: Vec<i32> = [0, 1, 2, 4]
+        .into_iter()
+        .filter(|id| *id != written_id)
+        .collect();
+    assert_eq!(flagged_ids(&current, flag_id).await, untouched);
+
+    let before = written.checkout_version(previous).await.unwrap();
+    let (bodies, summaries) = read(before.clone()).await;
+    assert_eq!(bodies[&written_id], format!("b{written_id}"));
+    assert_eq!(summaries, expected(&[0, 2, 4]));
+    assert_eq!(flagged_ids(&before, flag_id).await, [0, 1, 2, 4]);
 }
 
 #[tokio::test]
@@ -735,11 +972,16 @@ async fn test_overlay_on_another_field_keeps_masking() {
     assert_eq!(id_summaries(&taken), overlaid);
 }
 
+/// Every index build path refuses a masked column before reading it: the
+/// builder, the multi-segment FM-index build that `create_index` takes for
+/// `num_segments > 1`, and committing a segment built before the flag was
+/// registered, as a distributed build that raced the registration would.
 #[rstest]
 #[case::btree(IndexType::BTree)]
 #[case::bitmap(IndexType::Bitmap)]
 #[case::zone_map(IndexType::ZoneMap)]
 #[case::inverted(IndexType::Inverted)]
+#[case::fm_multi_segment(IndexType::Fm)]
 #[tokio::test]
 async fn test_indexing_a_masked_field_fails_before_building(#[case] index_type: IndexType) {
     let (mut dataset, flag_id) = masked_articles(false).await;
@@ -748,6 +990,10 @@ async fn test_indexing_a_masked_field_fails_before_building(#[case] index_type: 
     let scalar = match index_type {
         IndexType::Bitmap => ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
         IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+        IndexType::Fm => ScalarIndexParams {
+            index_type: "fm".to_string(),
+            params: Some(r#"{"num_segments": 2}"#.to_string()),
+        },
         _ => ScalarIndexParams::default(),
     };
     let params: &dyn IndexParams = if index_type == IndexType::Inverted {
@@ -761,6 +1007,17 @@ async fn test_indexing_a_masked_field_fails_before_building(#[case] index_type: 
          (flag id {flag_id})"
     );
 
+    // Version 2 added `summary` and version 3 registered the flag. The
+    // segment is left untrained: the refusal comes before it is read.
+    let mut unregistered = dataset.checkout_version(2).await.unwrap();
+    assert!(unregistered.cell_flags().is_empty());
+    let segment = unregistered
+        .create_index_builder(&["summary"], index_type, params)
+        .train(false)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
     let uncommitted = dataset
         .create_index_builder(&["summary"], index_type, params)
         .execute_uncommitted()
@@ -770,12 +1027,18 @@ async fn test_indexing_a_masked_field_fails_before_building(#[case] index_type: 
         .create_index(&["summary"], index_type, None, params, false)
         .await
         .unwrap_err();
-    for error in [uncommitted, committed] {
+    let segment_name = segment.name.clone();
+    let prebuilt = dataset
+        .commit_existing_index_segments(&segment_name, "summary", vec![segment])
+        .await
+        .unwrap_err();
+    for error in [uncommitted, committed, prebuilt] {
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(error.to_string().contains(&expected), "{error}");
     }
-    assert_eq!(dataset.version().version, version);
-    assert!(dataset.load_indices().await.unwrap().is_empty());
+    let latest = latest(&dataset).await;
+    assert_eq!(latest.version().version, version);
+    assert!(latest.load_indices().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -815,8 +1078,9 @@ async fn test_masking_an_indexed_field_is_refused() {
             .contains("would serve the values the flag masks"),
         "{error}"
     );
-    assert_eq!(dataset.version().version, version);
-    assert!(dataset.cell_flags().is_empty());
+    let latest = latest(&dataset).await;
+    assert_eq!(latest.version().version, version);
+    assert!(latest.cell_flags().is_empty());
 }
 
 /// `dataset` with a masking flag on `field` that is false on every row, set

@@ -119,11 +119,16 @@ impl LsmPointLookupPlanner {
     /// * `collector` - Data source collector
     /// * `pk_columns` - Primary key column names
     /// * `base_schema` - Schema of the base table
+    ///
+    /// Fails with `NotSupported` when a cell flag masks a field of the
+    /// collector's base table: the in-memory fast paths read memtables without
+    /// [`LsmDataSourceCollector::collect`], and MemWAL rows cannot be masked.
     pub fn new(
         collector: LsmDataSourceCollector,
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
     ) -> Result<Self> {
+        collector.ensure_base_table_unmasked()?;
         let none_target = canonical_output_schema(None, &base_schema, &pk_columns, false)?;
         Ok(Self {
             collector,
