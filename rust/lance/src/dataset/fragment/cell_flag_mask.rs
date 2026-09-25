@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch, new_null_array};
-use arrow_buffer::BooleanBuffer;
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_select::nullif::nullif;
 use futures::{FutureExt, StreamExt};
 use lance_core::datatypes::Schema;
@@ -23,6 +23,7 @@ use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::utils::stream::{ReadBatchTask, ReadBatchTaskStream};
+use roaring::RoaringBitmap;
 
 use crate::Dataset;
 
@@ -189,9 +190,13 @@ impl CellFlagMasks {
                     if true_in_span == 0 {
                         new_null_array(columns[index].data_type(), num_rows)
                     } else {
-                        let is_masked = BooleanBuffer::collect_bool(num_rows, |row| {
-                            !true_rows.contains(offsets[row])
-                        });
+                        let is_masked = if is_contiguous(offsets) {
+                            masked_in_span(true_rows, first, last)
+                        } else {
+                            BooleanBuffer::collect_bool(num_rows, |row| {
+                                !true_rows.contains(offsets[row])
+                            })
+                        };
                         if is_masked.count_set_bits() == 0 {
                             continue;
                         }
@@ -202,6 +207,32 @@ impl CellFlagMasks {
         }
         Ok(RecordBatch::try_new(schema, columns)?)
     }
+}
+
+fn is_contiguous(offsets: &[u32]) -> bool {
+    offsets
+        .windows(2)
+        .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+}
+
+/// Which rows of `first..=last` are masked, built from the runs of true rows
+/// in the span: a per-row `contains` probe dominated scans of partly true
+/// fragments.
+fn masked_in_span(true_rows: &RoaringBitmap, first: u32, last: u32) -> BooleanBuffer {
+    let mut masked = BooleanBufferBuilder::new((last - first) as usize + 1);
+    // The run of true rows not yet appended: `run_start..run_end`.
+    let (mut run_start, mut run_end) = (first, first);
+    for row in true_rows.range(first..=last) {
+        if row != run_end {
+            masked.append_n((run_end - run_start) as usize, false);
+            masked.append_n((row - run_end) as usize, true);
+            run_start = row;
+        }
+        run_end = row + 1;
+    }
+    masked.append_n((run_end - run_start) as usize, false);
+    masked.append_n((last + 1 - run_end) as usize, true);
+    masked.finish()
 }
 
 /// Registration refuses masking on legacy (v1) storage, whose pushdown scan
@@ -230,4 +261,44 @@ pub(super) fn reject_masked_v1_read(
          masks it, and the legacy (v1) storage format cannot mask cells",
         flag.name, flag.flag_id
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::all_true(0..100, 0, 99)]
+    #[case::leading_and_trailing_gaps(10..20, 0, 30)]
+    #[case::span_inside_a_run(0..100, 40, 60)]
+    #[case::single_true_row(200..300, 0, 99)]
+    fn masked_in_span_matches_per_row_probe(
+        #[case] true_range: std::ops::Range<u32>,
+        #[case] first: u32,
+        #[case] last: u32,
+    ) {
+        let mut true_rows: RoaringBitmap = true_range.collect();
+        // Scattered holes and isolated true rows, so runs start and end
+        // inside the span.
+        for row in (3..300).step_by(7) {
+            true_rows.remove(row);
+        }
+        true_rows.insert(first + 1);
+        let expected = BooleanBuffer::collect_bool((last - first + 1) as usize, |row| {
+            !true_rows.contains(first + row as u32)
+        });
+        assert_eq!(masked_in_span(&true_rows, first, last), expected);
+    }
+
+    #[test]
+    fn contiguity_needs_consecutive_ascending_offsets() {
+        assert!(is_contiguous(&[]));
+        assert!(is_contiguous(&[5]));
+        assert!(is_contiguous(&[5, 6, 7]));
+        assert!(!is_contiguous(&[5, 7, 8]));
+        assert!(!is_contiguous(&[6, 5]));
+        assert!(!is_contiguous(&[5, 5]));
+    }
 }
