@@ -120,6 +120,23 @@ PROTO_LIST=$(build_benches "$PROTO" cell_flags_regression dependent_cell_flags)
 PROTO_REGRESSION=$(bench_binary "$PROTO_LIST" cell_flags_regression "$PROTO")
 PROTO_FLAGS=$(bench_binary "$PROTO_LIST" dependent_cell_flags "$PROTO")
 
+# Cargo merges the .cargo/config.toml of every directory above a worktree, so
+# one nested under another checkout gets its rustflags twice. That changes the
+# crates' metadata hashes and with them codegen, which would show up as a
+# difference between the builds, so refuse to compare them.
+rustflags_of() {
+  local binary=$1 dir=$2
+  python3 -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["rustflags"]))' \
+    "$dir/target/$PROFILE/.fingerprint/lance-${binary##*-}/test-bench-cell_flags_regression.json"
+}
+BASE_RUSTFLAGS=$(rustflags_of "$BASE_REGRESSION" "$BASELINE")
+PROTO_RUSTFLAGS=$(rustflags_of "$PROTO_REGRESSION" "$PROTO")
+if [[ "$BASE_RUSTFLAGS" != "$PROTO_RUSTFLAGS" ]]; then
+  echo "the builds used different rustflags (baseline $BASE_RUSTFLAGS, prototype" \
+    "$PROTO_RUSTFLAGS); build both worktrees outside any other checkout" >&2
+  exit 2
+fi
+
 BASE_SHA=$(git -C "$BASELINE" rev-parse HEAD)
 PROTO_SHA=$(git -C "$PROTO" rev-parse HEAD)
 
@@ -157,6 +174,7 @@ env = {
     "flag_every_round": "$FLAG_EVERY_ROUND" == "1",
     "run_nice": int("$BENCH_RUN_NICE"),
     "order": "$ORDER",
+    "rustflags": $BASE_RUSTFLAGS,
     "config": {
         key: value
         for key, value in {
