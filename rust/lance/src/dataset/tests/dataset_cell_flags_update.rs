@@ -105,7 +105,7 @@ async fn flagged_articles(stable_row_ids: bool) -> (Dataset, Flags) {
 /// stays pending, `translation` published on every row, and `reviewed` set on
 /// `reviewed_ids`. Published values are `{s|t}-{fragment}-{offset}`.
 async fn published_articles(stable_row_ids: bool, reviewed_ids: &[i32]) -> (Dataset, Flags) {
-    let (dataset, flags) = flagged_articles(stable_row_ids).await;
+    let (dataset, flags) = Box::pin(flagged_articles(stable_row_ids)).await;
     let mut all_but_id_3 = full(&[0, 2]);
     all_but_id_3.insert_bitmap(1, RoaringBitmap::from_iter([1_u32]));
     let groups = stage_all(&dataset, "summary", "s").await;
