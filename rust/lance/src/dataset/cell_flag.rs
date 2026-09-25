@@ -20,17 +20,26 @@
 //! setting it, committed through [`CommitBuilder`] with the version the
 //! values were computed from as its read version; the flag must already be
 //! registered there. A flag without sources is *ordinary*: only explicit
-//! updates change it, and a row-moving update keeps its state only for the
-//! rows it lists in `moved_rows`.
+//! updates change it.
+//!
+//! A row-moving update gives the rows it writes new addresses, so their state
+//! moves with them only for the rows it lists in `moved_rows`.
+//! [`UpdateBuilder`](crate::dataset::UpdateBuilder) lists every row it moves
+//! and the fields it sets: ordinary flags move, and so does each dependent flag
+//! unless the update sets a field it watches, directly or through a dependent
+//! flag upstream of it. Other row-moving writes, such as a `merge_insert` that
+//! rewrites whole rows, are refused where an ordinary flag is true, and leave
+//! the moved rows unassigned for dependent flags.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance_select::RowAddrTreeMap;
-use lance_table::format::CellFlagDefinition;
+use lance_table::format::{CellFlagDefinition, Fragment};
+use roaring::RoaringBitmap;
 
 use crate::dataset::transaction::{
-    CellFlagChanges, CellFlagRegistration, Operation, TransactionBuilder,
+    CellFlagChanges, CellFlagMovedRows, CellFlagRegistration, Operation, TransactionBuilder,
 };
 use crate::dataset::write::CommitBuilder;
 use crate::{Dataset, Error, Result};
@@ -307,4 +316,64 @@ impl Dataset {
             .await?;
         Ok(())
     }
+}
+
+/// Pair every row a row-moving update wrote into `new_fragments` with the
+/// address it was read from, for the commit to move its flag state.
+///
+/// `source_row_addrs` lists the read addresses in write order: the new
+/// fragments in order, each from its first offset, hold exactly the rows the
+/// update read.
+pub(crate) fn moved_cell_flag_rows(
+    new_fragments: &[Fragment],
+    source_row_addrs: Vec<u64>,
+) -> Result<Vec<CellFlagMovedRows>> {
+    // Ids are assigned at commit, so fragments are named by position here.
+    let mut row_counts = Vec::with_capacity(new_fragments.len());
+    for (position, fragment) in new_fragments.iter().enumerate() {
+        let physical_rows = fragment.physical_rows.ok_or_else(|| {
+            Error::internal(format!(
+                "new fragment {position} written by the update has no physical row count"
+            ))
+        })?;
+        let physical_rows = u32::try_from(physical_rows).map_err(|_| {
+            Error::internal(format!(
+                "new fragment {position} written by the update has {physical_rows} physical \
+                 rows, more than a row address holds"
+            ))
+        })?;
+        row_counts.push(physical_rows);
+    }
+    let written_rows: u64 = row_counts.iter().copied().map(u64::from).sum();
+    if written_rows != source_row_addrs.len() as u64 {
+        return Err(Error::internal(format!(
+            "the update wrote {written_rows} rows into {} new fragments but read {} rows, so the \
+             moved rows cannot be matched to the addresses they were read from",
+            new_fragments.len(),
+            source_row_addrs.len()
+        )));
+    }
+    let mut source_row_addrs = source_row_addrs.into_iter();
+    new_fragments
+        .iter()
+        .zip(row_counts)
+        .enumerate()
+        .map(|(position, (fragment, physical_rows))| {
+            let first_file = fragment.files.first().ok_or_else(|| {
+                Error::internal(format!(
+                    "new fragment {position} written by the update has no data file"
+                ))
+            })?;
+            let mut offsets = RoaringBitmap::new();
+            offsets.insert_range(0..physical_rows);
+            Ok(CellFlagMovedRows {
+                fragment_path: first_file.path.clone(),
+                offsets,
+                source_row_addrs: source_row_addrs
+                    .by_ref()
+                    .take(physical_rows as usize)
+                    .collect(),
+            })
+        })
+        .collect()
 }

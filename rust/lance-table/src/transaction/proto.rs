@@ -149,6 +149,11 @@ impl From<&CellFlagChanges> for pb::transaction::CellFlagChanges {
                     }
                 })
                 .collect(),
+            moved_rows_written_fields: changes.moved_rows_written_fields.as_ref().map(
+                |field_ids| pb::transaction::cell_flag_changes::WrittenFields {
+                    field_ids: field_ids.clone(),
+                },
+            ),
         }
     }
 }
@@ -197,6 +202,9 @@ impl TryFrom<pb::transaction::CellFlagChanges> for CellFlagChanges {
                     })
                 })
                 .collect::<Result<_>>()?,
+            moved_rows_written_fields: message
+                .moved_rows_written_fields
+                .map(|written| written.field_ids),
         })
     }
 }
@@ -974,6 +982,7 @@ mod tests {
                     RowAddress::new_from_parts(3, 4).into(),
                 ],
             }],
+            moved_rows_written_fields: Some(vec![2, 5]),
         };
         let operation = Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(
@@ -982,11 +991,27 @@ mod tests {
             )],
         };
         let txn = TransactionBuilder::new(7, operation.clone())
-            .cell_flag_changes(changes)
+            .cell_flag_changes(changes.clone())
             .build();
         let message = pb::Transaction::from(&txn);
         assert!(message.cell_flag_changes.is_some());
         assert_eq!(Transaction::try_from(message).unwrap(), txn);
+
+        // Writing no field and not knowing which were written stay distinct.
+        for written in [Some(vec![]), None] {
+            let changes = CellFlagChanges {
+                moved_rows_written_fields: written.clone(),
+                ..changes.clone()
+            };
+            let txn = TransactionBuilder::new(7, operation.clone())
+                .cell_flag_changes(changes)
+                .build();
+            let decoded = Transaction::try_from(pb::Transaction::from(&txn)).unwrap();
+            assert_eq!(
+                decoded.cell_flag_changes.unwrap().moved_rows_written_fields,
+                written
+            );
+        }
 
         // Without changes the field stays absent, so the encoding is unchanged.
         let plain = TransactionBuilder::new(7, operation)

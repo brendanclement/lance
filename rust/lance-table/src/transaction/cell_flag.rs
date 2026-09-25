@@ -38,8 +38,11 @@ pub struct CellFlagRegistration {
 ///
 /// This maps addresses rather than carrying flag values: the commit copies the
 /// state each source row has at the head, so a flag changed by a transaction
-/// that committed after this update was staged still follows the row. Only
-/// ordinary flags are copied; dependent flags start false on moved rows.
+/// that committed after this update was staged still follows the row. Ordinary
+/// flags are always copied. A dependent flag is copied only when
+/// [`CellFlagChanges::moved_rows_written_fields`] is known and names none of
+/// its watched fields, and every dependent flag upstream of it is copied too;
+/// otherwise it starts false on the moved rows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellFlagMovedRows {
     /// Path of the first data file of the new fragment, which names it until
@@ -83,6 +86,12 @@ pub struct CellFlagChanges {
     /// is refused on a fragment where an ordinary flag has true rows unless
     /// some entry here moves rows out of that fragment.
     pub moved_rows: Vec<CellFlagMovedRows>,
+    /// Ids of the top-level fields the update wrote new values into on the
+    /// rows of `moved_rows`; the other fields were copied unchanged. `None`
+    /// means unknown, so every dependent flag starts false on the moved rows;
+    /// an empty list means the update wrote no field there. Only valid with
+    /// `moved_rows`.
+    pub moved_rows_written_fields: Option<Vec<i32>>,
 }
 
 impl CellFlagChanges {
@@ -92,6 +101,7 @@ impl CellFlagChanges {
             && self.drops.is_empty()
             && self.derived_invalidations.is_empty()
             && self.moved_rows.is_empty()
+            && self.moved_rows_written_fields.is_none()
     }
 
     /// Whether any explicit update sets a flag to true. Moved rows do not

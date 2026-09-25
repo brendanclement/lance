@@ -78,7 +78,7 @@ async fn register_ready(dataset: &mut Dataset) -> u32 {
 }
 
 /// Stage a full-fragment file for `column` holding `{prefix}-{fragment}-{offset}`.
-async fn stage(
+pub(super) async fn stage(
     dataset: &Dataset,
     fragment_id: u64,
     column: &str,
@@ -108,7 +108,11 @@ async fn stage(
         .unwrap()
 }
 
-async fn stage_all(dataset: &Dataset, column: &str, prefix: &str) -> Vec<DataReplacementGroup> {
+pub(super) async fn stage_all(
+    dataset: &Dataset,
+    column: &str,
+    prefix: &str,
+) -> Vec<DataReplacementGroup> {
     let mut groups = Vec::new();
     for fragment in dataset.get_fragments() {
         groups.push(stage(dataset, fragment.id() as u64, column, prefix).await);
@@ -116,7 +120,7 @@ async fn stage_all(dataset: &Dataset, column: &str, prefix: &str) -> Vec<DataRep
     groups
 }
 
-fn full(fragment_ids: &[u32]) -> RowAddrTreeMap {
+pub(super) fn full(fragment_ids: &[u32]) -> RowAddrTreeMap {
     let mut rows = RowAddrTreeMap::new();
     for fragment_id in fragment_ids {
         rows.insert_fragment(*fragment_id);
@@ -124,7 +128,7 @@ fn full(fragment_ids: &[u32]) -> RowAddrTreeMap {
     rows
 }
 
-fn set_true(flag_id: u32, rows: RowAddrTreeMap) -> Vec<CellFlagUpdate> {
+pub(super) fn set_true(flag_id: u32, rows: RowAddrTreeMap) -> Vec<CellFlagUpdate> {
     vec![CellFlagUpdate {
         flag_id,
         value: true,
@@ -146,7 +150,7 @@ fn replacement_txn(
 }
 
 /// Commit `replacements` staged against `dataset`'s version.
-async fn commit_replacement(
+pub(super) async fn commit_replacement(
     dataset: &Dataset,
     replacements: Vec<DataReplacementGroup>,
     updates: Vec<CellFlagUpdate>,
@@ -160,7 +164,7 @@ async fn commit_replacement(
         .await
 }
 
-fn update_config() -> Operation {
+pub(super) fn update_config() -> Operation {
     Operation::UpdateConfig {
         config_updates: None,
         table_metadata_updates: None,

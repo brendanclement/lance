@@ -64,12 +64,18 @@ message Transaction {
      * commit. `offsets` is a portable RoaringBitmap of physical offsets in
      * that fragment; `source_row_addrs` holds the row address each of those
      * rows had before the move, in ascending offset order. The commit copies
-     * the head's state of every ordinary flag from each source row.
+     * the head's state of every ordinary flag from each source row, and of
+     * every dependent flag whose watched fields `moved_rows_written_fields`
+     * does not name.
      */
     message MovedRows {
       string fragment_path = 1;
       bytes offsets = 2;
       repeated uint64 source_row_addrs = 3;
+    }
+    // Top-level field ids, wrapped so that an empty list differs from none.
+    message WrittenFields {
+      repeated int32 field_ids = 1;
     }
     // Caller-supplied updates.
     repeated Update updates = 1;
@@ -84,6 +90,11 @@ message Transaction {
      */
     repeated Update derived_invalidations = 4;
     repeated MovedRows moved_rows = 5;
+    /* The top-level fields the row-moving update wrote on the rows of
+     * `moved_rows`. Absent when unknown, which starts every dependent flag
+     * false on the moved rows.
+     */
+    WrittenFields moved_rows_written_fields = 6;
   }
 
   // Add new rows to the dataset.
