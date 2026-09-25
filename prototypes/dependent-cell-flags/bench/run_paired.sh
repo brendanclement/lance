@@ -41,6 +41,11 @@ esac
 : "${BENCH_WARMUP:=1}"
 : "${BENCH_RUN_NICE:=0}"
 : "${FLAG_EVERY_ROUND:=1}"
+: "${ORDER:=baseline-first}"
+if [[ "$ORDER" != baseline-first && "$ORDER" != prototype-first ]]; then
+  echo "ORDER must be baseline-first or prototype-first, not '$ORDER'" >&2
+  exit 2
+fi
 export BENCH_SCALE_ROWS BENCH_ROWS_PER_FRAGMENT BENCH_SAMPLES BENCH_READ_SAMPLES BENCH_WARMUP
 if [[ -n "${BENCH_WORKLOADS:-}" ]]; then export BENCH_WORKLOADS; fi
 
@@ -151,6 +156,7 @@ env = {
     "rounds": int("$ROUNDS"),
     "flag_every_round": "$FLAG_EVERY_ROUND" == "1",
     "run_nice": int("$BENCH_RUN_NICE"),
+    "order": "$ORDER",
     "config": {
         key: value
         for key, value in {
@@ -193,8 +199,15 @@ run() {
 }
 
 for round in $(seq 1 "$ROUNDS"); do
-  run "$round" baseline "$BASE_SHA" "$BASE_REGRESSION"
-  run "$round" prototype "$PROTO_SHA" "$PROTO_REGRESSION"
+  # Reversing the order separates a build difference from an effect of
+  # running second (thermal state, page cache, allocator).
+  if [[ "$ORDER" == prototype-first ]]; then
+    run "$round" prototype "$PROTO_SHA" "$PROTO_REGRESSION"
+    run "$round" baseline "$BASE_SHA" "$BASE_REGRESSION"
+  else
+    run "$round" baseline "$BASE_SHA" "$BASE_REGRESSION"
+    run "$round" prototype "$PROTO_SHA" "$PROTO_REGRESSION"
+  fi
   if [[ "$FLAG_EVERY_ROUND" == 1 || "$round" == "$ROUNDS" ]]; then
     run "$round" prototype-flags "$PROTO_SHA" "$PROTO_FLAGS" LANCE_ENABLE_UNSTABLE_CELL_FLAGS=1
   fi
