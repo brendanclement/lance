@@ -49,11 +49,15 @@ cp rust/lance/benches/cell_flags_regression.rs /abs/lance-baseline/rust/lance/be
 # harness = false
 ```
 
-The prototype worktree is a checkout of this branch, whose code equals `26388225a` (`4aaa8280c`
-later changed only the `PublicationReport` rustdoc):
+The prototype worktree is a checkout of this branch. The benchmarked code is `26388225a`. The branch
+head differs from it only in `rust/lance`: rustdoc, tests, and `25d3cf3e5`, which changes only what
+a publication report says about a deferred file carrying chained outputs (no workload publishes
+one). For the exact benchmarked code, restore `rust/` from `26388225a` in the checkout; the driver
+stays the branch's, and `env.json` records the resulting `git status`:
 
 ```bash
 git worktree add --detach /abs/lance-proto brendan/dependency-aware-cell-flags
+git -C /abs/lance-proto checkout 26388225a -- rust/
 ```
 
 Each worktree must build into its **own** target directory, so leave `CARGO_TARGET_DIR` unset.
@@ -181,8 +185,9 @@ repeated only as clean builds.
 | `1m-clean` | same | `FLAG_EVERY_ROUND=0 ROUNDS=3 RESULTS_DIR=… run_paired.sh 1m` |
 | `10m-reads-layout-control` | none: the baseline plus `control.patch` (in the results), outside any checkout | `CONTROL_WORKTREE=/abs/lance-layout-control RESULTS_DIR=… run_layout_control.sh` (defaults 3 rounds per order and the 10M read settings) |
 
-A checkout of this branch has the clean runs' code and driver (their `env.json` has the
-`rustflags` field that `f1fb31606` added). Differences between the recorded runs and the scripts:
+A checkout of this branch with `rust/` restored from `26388225a` (see Setup) has the clean runs'
+code and driver (their `env.json` has the `rustflags` field that `f1fb31606` added). Differences
+between the recorded runs and the scripts:
 
 - `10m-reads-variant-fragment-reverted` ran with the driver of
   `3e8c36ba0672102ad005c6de20858e9a82b32231` minus the flag harness run, before the rustflags
@@ -268,7 +273,7 @@ Flag harness workloads:
 | `flagged_merge_insert_partial_sparse` | `groups=1,2` | published | In-place `merge_insert (id, body)` with `RewriteColumns` on 100 ids. `stage_ms`, `commit_ms`, and the derived clears. |
 | `flagged_refresh_clean` | `groups=1,2` | pending | One publication per output, run one after another. Each is read + UDF + assemble + stage + commit (`Reject`), with per-output times in `extra.per_output`. |
 | `flagged_refresh_conflicts_K` | `{update_row_moving, merge_insert_in_place, merge_insert_output_in_place}:{reject,skip}` | pending | Stage a full `summary` refresh at V, commit K source writes of 10 scattered ids each, then publish at V. Records the outcome, `rows_published`, `rows_deferred_by_reason`, `fragments_deferred(_by_reason)`, `valid_rows_in_deferred_groups`, `rows_reusable`, and `commit_ms`, the conflict-checked commit. `merge_insert_output_in_place` writes `summary` itself, as an output override. It is the only source write that defers whole groups, so it is the case where reusing staged values matters. |
-| `flagged_refresh_conflicts_K_followup` | `<conflict variant>:{recompute_all_pending, reuse_valid_staged}` | the conflicted publication's result | Refreshes to completion from the same post-publication state (tagged `followup`), once per strategy. Records `rows_recomputed`, `rows_reused`, `rows_copied_through`, `udf_ms`, `stage_ms` and `commit_ms`. `recompute_all_pending` ignores the report. `reuse_valid_staged` reuses `PublicationReport::reusable_rows`. `Reject` returns an error, so there is no report and nothing is known to be reusable. |
+| `flagged_refresh_conflicts_K_followup` | `<conflict variant>:{recompute_all_pending, reuse_valid_staged}` | the conflicted publication's result | Refreshes to completion from the same post-publication state (tagged `followup`), once per strategy. Records `rows_recomputed`, `rows_reused`, `rows_copied_through`, `udf_ms`, `stage_ms` and `commit_ms`. `recompute_all_pending` ignores the report. `reuse_valid_staged` reuses `PublicationReport::reusable_rows`. The rejected publication returns only an error, so there is no report and nothing is known to be reusable. |
 | `flagged_publish_after_k_commits` | `k=0,1,4,16,64` | pending | Stage at V, run K unrelated 100-row appends, then publish (`Reject`). `wall = commit_ms`, the conflict checks over K transactions. The appended rows stay pending. |
 | `scan_summary_full`, `filter_summary_is_null_count`, `count_summary_vs_star` (`:aggregate`, `:sql`), `filter_id_range_project_summary`, `take_random_1k` | `all_true`, `partial_1pct`, `all_pending` × warm / fresh-session | separate `groups=1` tables | The regression harness's queries, on the masked `summary`. `partial_1pct` is published and then has the regression's `null_1pct` ids invalidated by one in-place `body` write, so it compares directly with `null_1pct`: stored NULLs against masked values. `all_pending` is registered but never published, so it has no summary data file. |
 | `flag_state_size` | `groups=0,1,2` × `invalidated=0pct,0.1pct,1pct,10pct` | published | Manifest bytes, the invalidating write's txn bytes, the serialized true sets, and fresh-session open latency plus IO, after one in-place `body` write on that fraction of scattered rows. `groups=0` is an unflagged control with the same data files. |
@@ -346,7 +351,7 @@ p95 when n ≥ 20.
 - In the conflict workloads, `Skip` never defers whole groups for `update_row_moving` or
   `merge_insert_in_place`: rows are deferred and the group still installs. For those writes the
   two follow-up strategies recompute the same rows, and only `merge_insert_output_in_place` shows
-  what reuse saves. Under `Reject` there is no report, so reuse has nothing to work with.
+  what reuse saves. A rejected publication returns only an error, so reuse has nothing to work with.
 - `all_pending` has no summary data file, since it was never refreshed. It measures the
   fresh-column state, not a fully masked data file.
 - Flag state is persisted as the bitmaps the commit ends up with. The executor builds assignment
