@@ -1,0 +1,125 @@
+dependent_cell_flags build=prototype-flags git_sha=26388225a273052b3a1ff0ec705c53da1b68c7cb scale_rows=1000000 rows_per_fragment=100000 fragments=10 samples=5 read_samples=20 warmup=1 stable_row_ids=false data=/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/bench-data/dependent_cell_flags-prototype-flags
+udf iterations=16 summary=1408 ns/row translation=1054 ns/row
+
+workload                           variant                  cache          n    wall_ms    udf_ms  stage_ms commit_ms  r_iops     r_KiB w_iops      w_KiB  manif_B   txn_B  outcome
+flagged_update_sparse              groups=1                 warm           5      12.34         -         -         -     353      6017     14         24     5787    2739  
+flagged_update_dense               groups=1                 warm           5      54.01         -         -         -     109     84597     14       4218   336125  169609  
+flagged_update_unrelated_sparse    groups=1                 warm           5      11.88         -         -         -     353      6017     14         30     5795    2739  
+flagged_update_title_sparse        groups=1                 warm           5      11.99         -         -         -     353      6017     14         28     5786    2738  
+flagged_merge_insert_partial_sparse groups=1                 warm           5      59.32         -     58.28      1.03      31     54223     13      52016     7433    3691  
+flagged_refresh_clean              groups=1                 warm           5    1266.66   1176.85     57.88      1.03      21     67302     13      14596     3055     916  committed
+flagged_refresh_conflicts_1        update_row_moving:reject warm           5    1276.42   1179.75     59.40      0.14      73     72182     19      14810     2409     935  conflict:retryable
+flagged_refresh_conflicts_1_followup update_row_moving:reject:recompute_all_pending warm           5    1271.75   1174.04     62.92      1.04      22     67304     14      14883    85619   83047  committed
+flagged_refresh_conflicts_1_followup update_row_moving:reject:reuse_valid_staged warm           5    1273.92   1175.73     63.12      1.02      22     67304     14      14983    85619   83047  committed
+flagged_refresh_conflicts_1        update_row_moving:skip   warm           5    1276.09   1179.03     59.18      1.21      78     72186     22      14686     3566    1084  committed_partial
+flagged_refresh_conflicts_1_followup update_row_moving:skip:recompute_all_pending warm           5      16.05      0.17      0.36      0.95      17     40913      4          3     2715     142  committed
+flagged_refresh_conflicts_1_followup update_row_moving:skip:reuse_valid_staged warm           5      16.49      0.17      0.37      1.05      17     40913      4          3     2715     143  committed
+flagged_refresh_conflicts_1        merge_insert_in_place:reject warm           5    1299.70   1178.56     58.20      0.15      43     95573     18      40701     3096    1315  conflict:retryable
+flagged_refresh_conflicts_1_followup merge_insert_in_place:reject:recompute_all_pending warm           5    1265.70   1176.08     58.76      1.00      26     67304     13      14783     3533     917  committed
+flagged_refresh_conflicts_1_followup merge_insert_in_place:reject:reuse_valid_staged warm           5    1263.21   1174.42     57.39      1.06      26     67304     13      14487     3533     917  committed
+flagged_refresh_conflicts_1        merge_insert_in_place:skip warm           5    1298.99   1177.14     58.65      1.00      43     95573     21      40690     3869    1085  committed_partial
+flagged_refresh_conflicts_1_followup merge_insert_in_place:skip:recompute_all_pending warm           5      42.03      0.19     29.02      0.99      21     41003      8       7394     3230     614  committed
+flagged_refresh_conflicts_1_followup merge_insert_in_place:skip:reuse_valid_staged warm           5      42.86      0.17     29.52      0.98      21     41003      8       7406     3230     614  committed
+flagged_refresh_conflicts_1        merge_insert_output_in_place:reject warm           5    1270.98   1173.74     58.19      0.14      38     70800     18      17746     2996    1265  conflict:retryable
+flagged_refresh_conflicts_1_followup merge_insert_output_in_place:reject:recompute_all_pending warm           5    1268.87   1179.47     58.16      1.03      26     67294     13      14675     3528     917  committed
+flagged_refresh_conflicts_1_followup merge_insert_output_in_place:reject:reuse_valid_staged warm           5    1266.80   1175.91     57.59      1.03      26     67294     13      14569     3528     917  committed
+flagged_refresh_conflicts_1        merge_insert_output_in_place:skip warm           5    1274.23   1176.11     58.40      1.01      38     70800     21      17650     2645     489  committed_partial
+flagged_refresh_conflicts_1_followup merge_insert_output_in_place:skip:recompute_all_pending warm           5     631.78    586.27     28.90      1.01      16     33630      8       7393     3098     487  committed
+flagged_refresh_conflicts_1_followup merge_insert_output_in_place:skip:reuse_valid_staged warm           5      43.24      0.18     28.56      0.98      16     33630      8       7399     3098     487  committed
+flagged_refresh_conflicts_4        update_row_moving:reject warm           5    1307.04   1178.93     58.12      0.21     260     86854     59      14719     3131    1309  conflict:retryable
+flagged_refresh_conflicts_4_followup update_row_moving:reject:recompute_all_pending warm           5    1280.43   1175.78     67.14      1.03      25     67311     17      15045   152349  148935  committed
+flagged_refresh_conflicts_4_followup update_row_moving:reject:reuse_valid_staged warm           5    1284.80   1179.18     67.42      1.09      25     67311     17      15041   152349  148935  committed
+flagged_refresh_conflicts_4        update_row_moving:skip   warm           5    1309.19   1177.50     58.50      1.44     268     86860     62      14622     4357    1305  committed_partial
+flagged_refresh_conflicts_4_followup update_row_moving:skip:recompute_all_pending warm           5      29.86      0.33      1.02      0.94      32     73602      7          7     3815     399  committed
+flagged_refresh_conflicts_4_followup update_row_moving:skip:reuse_valid_staged warm           5      30.32      0.33      1.05      0.92      32     73602      7          7     3815     399  committed
+flagged_refresh_conflicts_4        merge_insert_in_place:reject warm           5    1425.60   1175.01     58.29      0.23     209    248195     55     186279     4907    2742  conflict:retryable
+flagged_refresh_conflicts_4_followup merge_insert_in_place:reject:recompute_all_pending warm           5    1268.58   1179.01     58.00      1.02      30     67271     13      14607     3913     917  committed
+flagged_refresh_conflicts_4_followup merge_insert_in_place:reject:reuse_valid_staged warm           5    1266.86   1177.45     57.95      1.05      30     67271     13      14694     3913     917  committed
+flagged_refresh_conflicts_4        merge_insert_in_place:skip warm           5    1428.19   1178.98     58.14      1.13     209    248186     58     186194     4688    1305  committed_partial
+flagged_refresh_conflicts_4_followup merge_insert_in_place:skip:recompute_all_pending warm           5      73.86      0.39     51.77      1.02      37     73679     12      13293     4110    1114  committed
+flagged_refresh_conflicts_4_followup merge_insert_in_place:skip:reuse_valid_staged warm           5      74.57      0.35     51.16      1.04      37     73679     12      13264     4110    1114  committed
+flagged_refresh_conflicts_4        merge_insert_output_in_place:reject warm           5    1306.44   1177.85     58.12      0.21     176     90182     55      30246     4729    2654  conflict:retryable
+flagged_refresh_conflicts_4_followup merge_insert_output_in_place:reject:recompute_all_pending warm           5    1263.44   1174.98     57.01      1.01      30     67288     13      14515     3904     917  committed
+flagged_refresh_conflicts_4_followup merge_insert_output_in_place:reject:reuse_valid_staged warm           5    1262.02   1174.23     57.83      1.02      30     67288     13      14677     3904     917  committed
+flagged_refresh_conflicts_4        merge_insert_output_in_place:skip warm           5    1307.97   1178.86     58.39      0.95     176     90182     58      30315     2311     144  committed_partial
+flagged_refresh_conflicts_4_followup merge_insert_output_in_place:skip:recompute_all_pending warm           5    1140.48   1059.20     52.93      1.04      28     60543     12      13401     3818     831  committed
+flagged_refresh_conflicts_4_followup merge_insert_output_in_place:skip:reuse_valid_staged warm           5      76.69      0.34     52.01      1.06      28     60543     12      13203     3818     831  committed
+flagged_refresh_conflicts_16       update_row_moving:reject warm           5    1464.00   1177.08     58.43      0.43    1111    145752    221      14884     4385    1437  conflict:retryable
+flagged_refresh_conflicts_16_followup update_row_moving:reject:recompute_all_pending warm           5    1290.85   1176.00     71.79      1.17      37     67336     29      15190   172517  166379  committed
+flagged_refresh_conflicts_16_followup update_row_moving:reject:reuse_valid_staged warm           5    1291.28   1176.28     71.81      1.18      37     67336     29      15095   172517  166379  committed
+flagged_refresh_conflicts_16       update_row_moving:skip   warm           5    1464.55   1177.54     58.45      1.81    1120    145759    224      14910     6493    1810  committed_partial
+flagged_refresh_conflicts_16_followup update_row_moving:skip:recompute_all_pending warm           5      42.16      0.53      3.77      1.05      47     81980     19         18     7576    1438  committed
+flagged_refresh_conflicts_16_followup update_row_moving:skip:reuse_valid_staged warm           5      42.08      0.52      3.63      1.07      47     81980     19         18     7577    1438  committed
+flagged_refresh_conflicts_16       merge_insert_in_place:reject warm           5    2130.52   1178.78     57.19      0.47     920    869415    205     779130     5331    3070  conflict:retryable
+flagged_refresh_conflicts_16_followup merge_insert_in_place:reject:recompute_all_pending warm           5    1264.45   1175.98     57.30      0.98      31     67302     13      14587     4009     917  committed
+flagged_refresh_conflicts_16_followup merge_insert_in_place:reject:reuse_valid_staged warm           5    1269.33   1178.34     58.17      1.06      31     67302     13      14694     4009     917  committed
+flagged_refresh_conflicts_16       merge_insert_in_place:skip warm           5    2125.72   1176.92     57.96      1.47     920    869351    208     779219     5795    1810  committed_partial
+flagged_refresh_conflicts_16_followup merge_insert_in_place:skip:recompute_all_pending warm           5      84.24      0.64     57.09      1.04      41     81886     13      14603     4572    1480  committed
+flagged_refresh_conflicts_16_followup merge_insert_in_place:skip:reuse_valid_staged warm           5      84.16      0.58     57.09      1.04      41     81886     13      14591     4573    1480  committed
+flagged_refresh_conflicts_16       merge_insert_output_in_place:reject warm           5    1456.20   1179.73     58.75      0.38     773    168969    205      80819     5134    2971  conflict:retryable
+flagged_refresh_conflicts_16_followup merge_insert_output_in_place:reject:recompute_all_pending warm           5    1263.54   1175.51     57.28      1.06      31     67286     13      14596     4000     917  committed
+flagged_refresh_conflicts_16_followup merge_insert_output_in_place:reject:reuse_valid_staged warm           5    1265.81   1177.26     57.82      1.03      31     67286     13      14675     4000     917  committed
+flagged_refresh_conflicts_16       merge_insert_output_in_place:skip warm           5    1447.70   1175.92     58.56      0.47     773    168969    205      80786     5134    2971  deferred_all
+flagged_refresh_conflicts_16_followup merge_insert_output_in_place:skip:recompute_all_pending warm           5    1267.50   1180.04     58.59      1.01      31     67286     13      14685     4000     917  committed
+flagged_refresh_conflicts_16_followup merge_insert_output_in_place:skip:reuse_valid_staged warm           5      83.85      0.55     56.66      1.00      31     67286     13      14791     4000     917  committed
+flagged_publish_after_k_commits    k=0                      warm           5       1.00         -         -      1.00       1         0      3          4     3060     917  committed
+flagged_publish_after_k_commits    k=1                      warm           5       0.95         -         -      0.95       2         2      3          4     3152     917  committed
+flagged_publish_after_k_commits    k=4                      warm           5       1.06         -         -      1.06       5         7      3          4     3428     917  committed
+flagged_publish_after_k_commits    k=16                     warm           5       1.23         -         -      1.23      17        35      3          5     4532     917  committed
+flagged_publish_after_k_commits    k=64                     warm           5       1.88         -         -      1.88      65       277      3         10     8948     917  committed
+flagged_update_sparse              groups=2                 warm           5      13.06         -         -         -     450      6387     14         29     8027    3478  
+flagged_update_dense               groups=2                 warm           5      53.38         -         -         -     131     98977     14       5776   501791  170346  
+flagged_update_unrelated_sparse    groups=2                 warm           5      13.41         -         -         -     450      6387     14         36     8044    3479  
+flagged_update_title_sparse        groups=2                 warm           5      12.69         -         -         -     450      6387     14         34     8035    3478  
+flagged_merge_insert_partial_sparse groups=2                 warm           5      56.65         -     55.51      1.08      31     54258     13      52056    10205    4963  
+flagged_refresh_clean              groups=2                 warm           5    2334.56   2158.55    117.28      2.00      42    119648     26      29112     3905     916  committed
+scan_summary_full                  all_true                 warm          20       2.56         -         -         -      10     14549      0          0     3054     916  
+filter_summary_is_null_count       all_true                 warm          20       2.92         -         -         -      10     14549      0          0     3054     916  
+count_summary_vs_star              all_true:aggregate       warm          20       2.62         -         -         -      10     14549      0          0     3054     916  
+count_summary_vs_star              all_true:sql             warm          20       3.54         -         -         -      10     14549      0          0     3054     916  
+filter_id_range_project_summary    all_true                 warm          20       1.43         -         -         -      11      2490      0          0     3054     916  
+take_random_1k                     all_true                 warm          20       5.67         -         -         -     513      3900      0          0     3054     916  
+scan_summary_full                  all_true                 fresh-session 20       2.76         -         -         -      30     14605      0          0     3054     916  
+filter_summary_is_null_count       all_true                 fresh-session 20       2.92         -         -         -      30     14605      0          0     3054     916  
+count_summary_vs_star              all_true:aggregate       fresh-session 20       2.71         -         -         -      30     14605      0          0     3054     916  
+count_summary_vs_star              all_true:sql             fresh-session 20       3.59         -         -         -      30     14605      0          0     3054     916  
+filter_id_range_project_summary    all_true                 fresh-session 20       1.72         -         -         -      43      2540      0          0     3054     916  
+take_random_1k                     all_true                 fresh-session 20       5.92         -         -         -     533      3955      0          0     3054     916  
+scan_summary_full                  partial_1pct             warm          20       5.29         -         -         -      10     14351      0          0    86283   43315  
+filter_summary_is_null_count       partial_1pct             warm          20       5.83         -         -         -      10     14351      0          0    86283   43315  
+count_summary_vs_star              partial_1pct:aggregate   warm          20       5.26         -         -         -      10     14351      0          0    86283   43315  
+count_summary_vs_star              partial_1pct:sql         warm          20       7.53         -         -         -      10     14351      0          0    86283   43315  
+filter_id_range_project_summary    partial_1pct             warm          20       1.43         -         -         -      11      2481      0          0    86283   43315  
+take_random_1k                     partial_1pct             warm          20       5.62         -         -         -     513      3842      0          0    86283   43315  
+scan_summary_full                  partial_1pct             fresh-session 20       5.30         -         -         -      30     14406      0          0    86283   43315  
+filter_summary_is_null_count       partial_1pct             fresh-session 20       5.96         -         -         -      30     14406      0          0    86283   43315  
+count_summary_vs_star              partial_1pct:aggregate   fresh-session 20       5.44         -         -         -      30     14406      0          0    86283   43315  
+count_summary_vs_star              partial_1pct:sql         fresh-session 20       7.59         -         -         -      30     14406      0          0    86283   43315  
+filter_id_range_project_summary    partial_1pct             fresh-session 20       1.61         -         -         -      33      2531      0          0    86283   43315  
+take_random_1k                     partial_1pct             fresh-session 20       6.04         -         -         -     533      3898      0          0    86283   43315  
+scan_summary_full                  all_pending              warm          20       0.29         -         -         -       0         0      0          0     1360      62  
+filter_summary_is_null_count       all_pending              warm          20       0.61         -         -         -       0         0      0          0     1360      62  
+count_summary_vs_star              all_pending:aggregate    warm          20       0.33         -         -         -       0         0      0          0     1360      62  
+count_summary_vs_star              all_pending:sql          warm          20       0.97         -         -         -       0         0      0          0     1360      62  
+filter_id_range_project_summary    all_pending              warm          20       1.43         -         -         -      10      2337      0          0     1360      62  
+take_random_1k                     all_pending              warm          20       0.08         -         -         -       0         0      0          0     1360      62  
+scan_summary_full                  all_pending              fresh-session 20       0.29         -         -         -       0         0      0          0     1360      62  
+filter_summary_is_null_count       all_pending              fresh-session 20       0.61         -         -         -       0         0      0          0     1360      62  
+count_summary_vs_star              all_pending:aggregate    fresh-session 20       0.33         -         -         -       0         0      0          0     1360      62  
+count_summary_vs_star              all_pending:sql          fresh-session 20       0.96         -         -         -       0         0      0          0     1360      62  
+filter_id_range_project_summary    all_pending              fresh-session 20       1.65         -         -         -      40      2382      0          0     1360      62  
+take_random_1k                     all_pending              fresh-session 20       0.09         -         -         -       0         0      0          0     1360      62  
+flag_state_size                    groups=0:invalidated=0pct fresh-session 20       0.08         -         -         -       1         3      0          0     2803       -  
+flag_state_size                    groups=0:invalidated=0.1pct fresh-session 20       0.08         -         -         -       1         4      0          0     7106    3398  
+flag_state_size                    groups=0:invalidated=1pct fresh-session 20       0.08         -         -         -       1         4      0          0     7106    3398  
+flag_state_size                    groups=0:invalidated=10pct fresh-session 20       0.08         -         -         -       1         4      0          0     7107    3398  
+flag_state_size                    groups=1:invalidated=0pct fresh-session 20       0.08         -         -         -       1         3      0          0     2923       -  
+flag_state_size                    groups=1:invalidated=0.1pct fresh-session 20       0.11         -         -         -       3        12      0          0    16124    8051  
+flag_state_size                    groups=1:invalidated=1pct fresh-session 20       0.12         -         -         -       3        47      0          0    87747   44055  
+flag_state_size                    groups=1:invalidated=10pct fresh-session 20       0.13         -         -         -       3       168      0          0   473434  305519  
+flag_state_size                    groups=2:invalidated=0pct fresh-session 20       0.09         -         -         -       1         3      0          0     3032       -  
+flag_state_size                    groups=2:invalidated=0.1pct fresh-session 20       0.11         -         -         -       3        16      0          0    22808   10383  
+flag_state_size                    groups=2:invalidated=1pct fresh-session 20       0.14         -         -         -       3        86      0          0   148053   64389  
+flag_state_size                    groups=2:invalidated=10pct fresh-session 20       0.15         -         -         -       3       328      0          0   788693  456585  
+
+records appended to prototypes/dependent-cell-flags/bench/results/1m-clean/round3-prototype-flags.jsonl

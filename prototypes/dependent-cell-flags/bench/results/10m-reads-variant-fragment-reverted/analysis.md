@@ -1,4 +1,4 @@
-## Results: 10m
+## Control: 10m reads, prototype with `fragment.rs` reverted to the baseline (read path unchanged), baseline first
 
 Source: `results/10m-reads-variant-fragment-reverted`
 

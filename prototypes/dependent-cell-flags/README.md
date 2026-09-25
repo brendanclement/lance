@@ -5,6 +5,24 @@
 > removed without migration. Release builds refuse flagged datasets unless
 > `LANCE_ENABLE_UNSTABLE_CELL_FLAGS` is set. It does not implement full option D.
 
+## Status
+
+| | |
+|---|---|
+| Worktree | `/Users/brendan/code/lance/.claude/worktrees/dependency-aware-cell-flags-43fc32` |
+| Branch | `brendan/dependency-aware-cell-flags` (not merged, no PR) |
+| Baseline | `e3671b2f5730eea927a088a42cbf30e273edc43c` (`origin/main` when the work started) |
+| Final implementation | `26388225a273052b3a1ff0ec705c53da1b68c7cb`, the last commit that changes code; later commits add benchmark results and docs only |
+| Benchmarked | full matrix at `21601f894`; reads re-run at `26388225a` (the only code change between them is the mask builder) |
+
+Checks on the final code (run at `f1fb31606`, whose Rust, proto, Python and Java sources equal
+`26388225a`): `cargo fmt --all -- --check`; `cargo clippy --all --tests --benches -- -D warnings`;
+`cargo check --workspace --tests --benches`; `cargo test -p lance-table` (564 passed, 2 doctests);
+`cargo test -p lance --lib` (4392 passed, 3 ignored); `cargo test -p lance --doc cell_flag` (8);
+`cargo check` and `cargo clippy --tests -- -D warnings` for `python/`; `cargo check` for
+`java/lance-jni/`. No lockfile changed. Python lint (`uv run make lint`) was not run: no Python
+source changed, only the Rust binding's struct literal. Java and Python tests were not run.
+
 ## Scope
 
 Lance tracks, per output field, a Boolean *cell flag* with a stable flag id. A registration may
@@ -299,3 +317,97 @@ read, and its whole-fragment clear keeps downstream flags safe. Compaction is re
 after it has reserved fragment ids and written its files; a plain delete leaves flag state on
 deleted rows, which still counts toward the ordinary-flag gate for row-moving writes;
 `DeferredGroup::valid_rows` can list rows deleted after the read version.
+
+## Benchmarks
+
+Harness, driver and analyzer: `bench/` (`bench/README.md` has the commands). Raw samples (JSONL),
+per-run logs, `env.json` (machine, rustc, both SHAs, git status) and `runs.tsv` (load average before
+each run) are under `bench/results/<run>/`; `bench/REPORT.md` has every table. Local APFS SSD on an
+Apple M5 Pro (18 cores, 48 GB), `release-with-debug`, same machine and profile for both builds,
+baseline and prototype alternating per round. A device-management daemon kept about one core busy
+during the runs. The OS page cache is not controlled: `fresh-session` means new Lance caches only,
+never a cold read. The simulated function (FNV rounds, about 1.2 µs/row) is timed separately
+(`udf_ms`). The permissive baseline refresh is **not** correctness-equivalent: without dependency
+tracking it publishes stale values after in-place writes (10·K stale rows) and main rejects it
+outright after row-moving writes.
+
+```sh
+BASELINE_WORKTREE=/abs/lance-baseline BENCH_DATA_DIR=/abs/bench-data \
+  prototypes/dependent-cell-flags/bench/run_paired.sh 1m    # also: smoke, 10m; ORDER=prototype-first
+```
+
+Results at 1M rows / 10 fragments (3 paired rounds; medians; flag costs from `bench/results/1m`,
+no-flag regression from `1m-clean`, masked reads from `1m-reads-maskfix`):
+
+| Question | Result |
+|---|---|
+| Tables without flags | Clean build (`1m-clean`): every workload 0.96–1.04× baseline — appends, sparse and dense `UpdateBuilder` updates (dense 1.04×), partial `merge_insert`, DataReplacement refresh, publication after K commits, scans, filters, counts, SQL, take. |
+| Source writes with flags | Sparse `UpdateBuilder` (100 rows): 1.11× (one output) / 1.15× (two sharing `body`); unrelated field: 1.16× / 1.20× (flags move with the rows). Dense (10% of rows): 1.53× / 1.48×, manifest 2.8 KB → 336 KB / 502 KB, transaction 1.2 KB → 170 KB. Partial `merge_insert`: 1.03× / 0.99×. |
+| Refresh publication | Clean refresh +0.8% (1.27 s, of which 1.18 s simulated UDF); publication commit after K = 0–64 unrelated commits: 1.00–1.08×, growing with K like the baseline. |
+| Masked reads | All flags true: 0.98–1.05×. 1% of rows invalidated (scattered): full scan / `IS NULL` / `COUNT` 3.0–3.3× at `21601f894`, **1.5–1.8×** after the mask fix (scan 3.0 → 5.4 ms); id-range filter and take unchanged. |
+| Refresh under K conflicting source commits (10 rows each), `Skip` | Publishes 999,990 / 999,960 / 999,840 of 1,000,000 rows for K = 1 / 4 / 16; deferred rows are exactly the written ones (`InputChanged` in place, `RowVacated` row-moving). A concurrent write to the output field defers whole fragments: 5 / 9 / 10 of 10. `Reject` fails every one (0 published). Publication commit 1.0–1.8 ms. |
+| Saved computation | Follow-up to completion: `Reject` recomputes everything (2.0 M UDF rows total, 1.28 s); `Skip` recomputes only the deferred rows (1,000,010–1,000,160 total, 16–85 ms). With whole-fragment deferral, reusing `reusable_rows` saves up to 999,840 recomputations (K = 16: 1.18 s → 0.6 ms of UDF). |
+| Flag state size | 1% of rows invalidated: manifest 7 KB (unflagged control) → 88 KB (one flag) / 148 KB (two); 10%: 473 KB / 789 KB (the manifest also inlines that transaction). Fresh-session open 0.08 → 0.13–0.15 ms locally. |
+
+At 10M rows / 100 fragments (`bench/results/10m`, one round; reads re-run with three rounds in
+`10m-reads-*`): sparse updates 1.15× / 1.19×, clean refresh +0.6%, publication after K commits
+1.00–1.08×, all-true masked reads 0.96–1.04×, partial masks 1.68–1.80× with the final mask builder
+(3.0–3.5× before), and 858 KB of manifest for the 1%-invalidated state.
+
+**Open regression: full-column reads of tables without flags are 6–9% slower at 10M rows**
+(geometric mean over both run orders, clean builds with rustflags identical to the baseline;
+selective reads 1.00–1.06×; no difference at 1M). A baseline plus one unused function moves the
+same reads by 1.01–1.04× (per-round ±7%), and the prototype with its read-path changes reverted
+measured 1.02–1.06×, so about 3–5% is beyond measured layout noise. The no-flag read path adds one
+`Option` check per fragment open, and a sampling profile shows the same hot decode frames in both
+builds with no cell flag frames; the cause is not identified.
+
+Method caveat: this worktree sits under another Lance checkout, and cargo merged both identical
+`.cargo/config.toml` files, so prototype binaries built here received their rustflags twice. The
+early baseline-vs-prototype runs (`1m`, `10m`, `*-maskfix`, `*-reversed`) mix that build difference
+with the code change; flags-vs-no-flags comparisons within one build are unaffected. The `*-clean`
+runs rebuilt the final commit outside the nested checkout, and `run_paired.sh` now refuses builds
+whose rustflags differ. `bench/REPORT.md` opens with a summary saying which run answers which
+question.
+
+These are prototype measurements on local disk, not a pass of #8655's benchmark acceptance criteria;
+S3 was not measured.
+
+## Remaining risks and bottlenecks
+
+Correctness risks:
+
+- **Trusted publication contents.** Lance cannot verify the copy-through contract (unassigned rows
+  copied unchanged) or the chained-output contract. A buggy executor that writes placeholders for
+  copied rows publishes them under true flags.
+- **Staged work retention.** Deferred groups' staged files are unreferenced, so
+  `cleanup_old_versions` may delete them once they age out; there is no lease.
+- **Unclassified future operations.** State is keyed by physical row address. Every operation must
+  either be handled or refused by the commit gate; a new `Operation` variant or row-moving writer
+  that bypasses it would misplace or drop flag state.
+- **Known gaps** listed above: base-table-less MemWAL readers, caller-staged replacements computed
+  from masked reads racing a mask drop, compaction refused only after it wrote its files, Python
+  bindings dropping cell flag changes on a round trip (the outcome is conservative), no Python/Java
+  API.
+- **Compatibility review needed** for a public `Transaction` field, the `CellFlagMovedRows` type, the
+  reader+writer feature bit and the `FLAG_UNKNOWN` bump; the format is unstable and gated.
+
+Performance bottlenecks:
+
+- **Unexplained no-flag read regression at 10M rows.** Full-column reads of tables without flags
+  measured 6–9% slower than the baseline (about 3–5% beyond the layout-noise control); not seen at
+  1M. Needs a hardware-counter profile before any claim of zero overhead.
+- **Manifest-inline state.** Fragmented true sets make every commit rewrite, and every open decode,
+  hundreds of KB (858 KB at 10M rows with 1% scattered invalidation). Spill per-fragment state to
+  external files, as deletion files or #8655's roots do.
+- **Row-moving updates fragment state.** `UpdateBuilder` clears the old addresses of moved rows, so
+  a dense update leaves a hole pattern no run compression helps; keeping dependent-flag bits on
+  deleted rows (they are unreadable) would keep those fragments `Full`. Its moved-rows payload
+  (`RoaringTreemap` of source addresses) adds 170 KB to the transaction at 100k moved rows.
+- **Masked scans over partial state** still cost 1.5–1.8× after the run-based mask; the remainder is
+  per-read offset materialization. A cached per-fragment validity buffer or masking in the decoder
+  would remove most of it.
+- **Full-fragment publication.** Republishing a few rows rewrites whole fragment files (7.5–15 MB to
+  republish 10–160 rows at 1M), and one output write defers a whole group. Row-subset or overlay
+  publication (with a rewritten value file, not a trimmed bitmap) would fix both.
+- **`Reject` wastes all work** under any conflict (2N UDF rows); it returns no report.
