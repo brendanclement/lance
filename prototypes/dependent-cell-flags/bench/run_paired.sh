@@ -5,9 +5,10 @@
 # Paired benchmark driver for the dependent cell flag prototype.
 #
 # Builds the regression harness in the baseline worktree and both harnesses in
-# this (prototype) worktree with the same profile, then for each round runs:
-# baseline regression, prototype regression, prototype flag harness. Results go
-# to results/<scale>/round<r>-<build>.jsonl next to this script, with the
+# this (prototype) worktree with the same profile, then for each round runs
+# baseline regression and prototype regression (in the order ORDER selects),
+# then the prototype flag harness. Results go to
+# results/<scale>/round<r>-<build>.jsonl next to this script (or RESULTS_DIR), with the
 # machine and toolchain in env.json and one line per run in runs.tsv. Finally
 # analyze.py writes results/<scale>/analysis.md and updates REPORT.md.
 #

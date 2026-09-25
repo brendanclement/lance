@@ -16,10 +16,10 @@ use crate::dataset::transaction::{CellFlagUpdate, Operation, Transaction};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DependencyConflictPolicy {
     /// Fail the commit, leaving the dataset as it was, when a concurrent
-    /// transaction changed the inputs of an assigned row, moved an assigned
-    /// row, or wrote, removed or rewrote a group's fragment. Assignments of
-    /// rows deleted since the read version are still dropped and the rest is
-    /// committed; [`CommitBuilder::execute_with_report`](crate::dataset::CommitBuilder::execute_with_report)
+    /// transaction changed the inputs of an assigned row, moved any row out of
+    /// a group's fragment, or wrote, removed or rewrote a group's fragment.
+    /// Assignments of rows deleted since the read version are still dropped and
+    /// the rest is committed; [`CommitBuilder::execute_with_report`](crate::dataset::CommitBuilder::execute_with_report)
     /// reports them as [`DeferralReason::RowVacated`].
     #[default]
     Reject,
