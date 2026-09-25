@@ -24,16 +24,17 @@ use roaring::RoaringBitmap;
 use rstest::rstest;
 
 use super::dataset_cell_flags::{
-    cleared, commit_replacement, full, recorded_invalidations, set_true, stage_all, update_config,
+    cleared, commit_replacement, full, recorded_invalidations, replacement_txn, set_true, stage,
+    stage_all, update_config,
 };
-use crate::dataset::cell_flag::CellFlagOptions;
+use crate::dataset::cell_flag::{CellFlagOptions, DependencyConflictPolicy};
 use crate::dataset::schema_evolution::NewColumnTransform;
 use crate::dataset::transaction::{
     CellFlagChanges, Operation, Transaction, TransactionBuilder, UpdateMode,
 };
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
-use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, UpdateBuilder};
+use crate::dataset::{MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, UpdateBuilder};
 use crate::{Dataset, Result};
 
 struct Flags {
@@ -905,4 +906,187 @@ async fn test_row_move_retries_over_flag_registered_after_its_read(
     let moved_to = addrs_by_id(&dataset).await[&2];
     assert_eq!(RowAddress::from(moved_to).fragment_id(), 3);
     assert_eq!(dataset.cell_flag_true_rows(reviewed).unwrap(), full(&[3]));
+}
+
+/// A write that rewrites `summary` from values it read through summary's mask.
+#[derive(Debug, Clone, Copy)]
+enum MaskedRewrite {
+    /// A partial-schema merge_insert of id 4's summary, which copies id 3's
+    /// masked summary back in place.
+    InPlaceMergeInsert,
+    /// An `UpdateBuilder` update of id 3's title, which moves its masked
+    /// summary to a new fragment.
+    RowMovingUpdate,
+}
+
+impl MaskedRewrite {
+    fn merge_insert(dataset: &Dataset) -> MergeInsertJob {
+        MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .write_mode(MergeInsertWriteMode::RewriteColumns)
+            .try_build()
+            .unwrap()
+    }
+
+    /// The error of committing the write once, without retrying.
+    async fn commit_once(self, dataset: &Dataset) -> Error {
+        match self {
+            Self::InPlaceMergeInsert => {
+                let staged = Self::merge_insert(dataset)
+                    .execute_uncommitted_batches(vec![self.source()])
+                    .await
+                    .unwrap()
+                    .transaction;
+                CommitBuilder::new(Arc::new(dataset.clone()))
+                    .execute(staged)
+                    .await
+                    .unwrap_err()
+            }
+            Self::RowMovingUpdate => update_builder(dataset, "id = 3", "title", "'retitled'")
+                .conflict_retries(0)
+                .build()
+                .unwrap()
+                .execute()
+                .await
+                .unwrap_err(),
+        }
+    }
+
+    async fn apply(self, dataset: &Dataset) -> Dataset {
+        match self {
+            Self::InPlaceMergeInsert => {
+                let (dataset, _) = Self::merge_insert(dataset)
+                    .execute_batches(vec![self.source()])
+                    .await
+                    .unwrap();
+                dataset.as_ref().clone()
+            }
+            Self::RowMovingUpdate => update(dataset, "id = 3", "title", "'retitled'").await,
+        }
+    }
+
+    fn source(self) -> RecordBatch {
+        RecordBatch::try_from_iter_with_nullable([
+            ("id", Arc::new(Int32Array::from(vec![4])) as ArrayRef, false),
+            (
+                "summary",
+                Arc::new(StringArray::from(vec!["edited"])) as ArrayRef,
+                true,
+            ),
+        ])
+        .unwrap()
+    }
+}
+
+/// A write that read `summary` through its mask writes the masked cells back
+/// as NULL. Dropping the mask exposes the stored values, so a write staged
+/// before the drop retries and reads them; otherwise it would overwrite id
+/// 3's exposed summary with NULL without clearing the translation a refresh
+/// computed from it.
+#[rstest]
+#[case::in_place_merge_insert(MaskedRewrite::InPlaceMergeInsert, &[3])]
+#[case::row_moving_update(MaskedRewrite::RowMovingUpdate, &[4])]
+#[tokio::test]
+async fn test_rewrite_retries_over_drop_of_the_mask_it_read_through(
+    #[case] write: MaskedRewrite,
+    #[case] translated_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = articles(stable_row_ids).await;
+    let masked_on = |sources: &[&str]| {
+        CellFlagOptions::default()
+            .with_clear_on_write(sources.iter().copied())
+            .with_mask_when_false(true)
+    };
+    let summary = dataset
+        .register_cell_flag("summary", "ready", masked_on(&["title", "body"]))
+        .await
+        .unwrap()
+        .flag_id;
+    let translation = dataset
+        .register_cell_flag("translation", "ready", masked_on(&["summary"]))
+        .await
+        .unwrap()
+        .flag_id;
+    // Id 3, at offset 0 of fragment 1, stores s-1-0 under a false flag.
+    let mut all_but_id_3 = full(&[0, 2]);
+    all_but_id_3.insert_bitmap(1, RoaringBitmap::from_iter([1_u32]));
+    let groups = stage_all(&dataset, "summary", "s").await;
+    let stale = commit_replacement(&dataset, groups, set_true(summary, all_but_id_3))
+        .await
+        .unwrap();
+
+    let mut dropped = stale.clone();
+    dropped.drop_cell_flag("summary", "ready").await.unwrap();
+    // A refresh reading the exposed summaries computes translations from them.
+    let refresh = stage(&dropped, 1, "translation", "tr-s").await;
+
+    let error = write.commit_once(&stale).await;
+    match write {
+        MaskedRewrite::InPlaceMergeInsert => {
+            let summary_id = stale.schema().field("summary").unwrap().id;
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains(&format!(
+                    "concurrent UpdateConfig at version {} dropped cell flag 'ready' (flag id \
+                     {summary}) on 'summary' (field id {summary_id}), which masked that field \
+                     at version {}, where this Update read the values it rewrites",
+                    dropped.version().version,
+                    stale.version().version
+                )),
+                "{error}"
+            );
+        }
+        MaskedRewrite::RowMovingUpdate => {
+            assert!(
+                matches!(error, Error::TooMuchWriteContention { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains("Attempted 0 retries"), "{error}");
+        }
+    }
+    let mut latest = stale.clone();
+    latest.checkout_latest().await.unwrap();
+    assert_eq!(latest.version().version, dropped.version().version);
+
+    let written = write.apply(&stale).await;
+    assert_eq!(written.version().version, dropped.version().version + 1);
+    let result = CommitBuilder::new(Arc::new(dropped.clone()))
+        .with_dependency_conflict_policy(DependencyConflictPolicy::Skip)
+        .execute_with_report(replacement_txn(
+            dropped.version().version,
+            vec![refresh],
+            set_true(translation, full(&[1])),
+        ))
+        .await
+        .unwrap();
+    let dataset = result.dataset;
+
+    let batch = scan_with_addrs(&dataset, &["id", "summary"]).await;
+    let summaries: BTreeMap<i32, Option<&str>> = batch["id"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(batch["summary"].as_string::<i32>().iter())
+        .collect();
+    assert_eq!(summaries[&3], Some("s-1-0"));
+    let translations = masked(&dataset, "translation", translation).await;
+    let expected: BTreeMap<i32, Option<String>> = (1..=6)
+        .map(|id| {
+            let is_translated = translated_ids.contains(&id);
+            let computed_from = summaries[&id].map(|value| format!("tr-{value}"));
+            (id, if is_translated { computed_from } else { None })
+        })
+        .collect();
+    assert_eq!(translations, expected);
+    assert_eq!(
+        true_ids(&dataset, translation).await,
+        translated_ids.iter().copied().collect::<BTreeSet<_>>()
+    );
 }

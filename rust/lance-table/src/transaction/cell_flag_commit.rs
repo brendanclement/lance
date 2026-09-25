@@ -6,6 +6,7 @@
 //! ```text
 //! ensure_operation_allowed_with_cell_flags      refuse what the head's registry cannot follow
 //! ensure_cell_flags_registered_at_read_version  refuse values read before their flag existed
+//! ensure_cell_flag_assignments_fit_read_version refuse assignments the read version cannot hold
 //! ensure_row_move_saw_flag_registrations        retry row moves staged before their flag existed
 //! derive_cell_flag_invalidations                which rows a transaction clears
 //! apply_cell_flag_changes                       the next manifest's registry and state
@@ -24,25 +25,13 @@ use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 
 use crate::feature_flags::{ENABLE_UNSTABLE_CELL_FLAGS_ENV, cell_flags_enabled};
+use crate::format::cell_flag::{field_label, fragment_key, top_level_ancestors};
 use crate::format::{CellFlagDefinition, CellFlagRegistry, Fragment, IndexMetadata, Manifest};
+use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use crate::transaction::{
     CellFlagChanges, CellFlagRegistration, CellFlagUpdate, DataReplacementGroup, Operation,
     Transaction, UpdateMode, UpdatedFragmentOffsets,
 };
-
-/// Every field id of `schema` mapped to the id of its top-level ancestor.
-/// Flags watch top-level fields while data files list leaf ids.
-fn top_level_ancestors(schema: &Schema) -> HashMap<i32, i32> {
-    let mut ancestors = HashMap::new();
-    for top in &schema.fields {
-        let mut stack = vec![top];
-        while let Some(field) = stack.pop() {
-            ancestors.insert(field.id, top.id);
-            stack.extend(field.children.iter());
-        }
-    }
-    ancestors
-}
 
 fn top_level_field(schema: &Schema, field_id: i32) -> Option<&Field> {
     schema.fields.iter().find(|field| field.id == field_id)
@@ -60,30 +49,6 @@ fn subtree_shape(field: &Field) -> Vec<(i32, &LogicalType)> {
     }
     shape.sort_unstable_by_key(|(field_id, _)| *field_id);
     shape
-}
-
-fn field_label(schema: &Schema, field_id: i32) -> String {
-    match schema.field_path(field_id) {
-        Ok(path) => format!("'{path}' (field id {field_id})"),
-        Err(_) => format!("field id {field_id}"),
-    }
-}
-
-fn flag_label(schema: &Schema, definition: &CellFlagDefinition) -> String {
-    format!(
-        "cell flag '{}' (flag id {}) on {}",
-        definition.name,
-        definition.flag_id,
-        field_label(schema, definition.field_id)
-    )
-}
-
-fn fragment_key(fragment_id: u64) -> Result<u32> {
-    u32::try_from(fragment_id).map_err(|_| {
-        Error::invalid_input(format!(
-            "fragment id {fragment_id} does not fit the 32 bits a cell flag row address holds"
-        ))
-    })
 }
 
 /// Whether an `Update` rewrites rows into new fragments, giving them new
@@ -535,6 +500,47 @@ pub fn ensure_cell_flags_registered_at_read_version(
     ))
 }
 
+/// Refuse a transaction whose true assignments of dependent flags do not fit
+/// the version it read: an offset beyond the physical rows of its fragment,
+/// or a fragment without a replacement group whose file writes the flag's
+/// output.
+///
+/// The manifest build checks the same, but only after the conflict resolver
+/// has trimmed the transaction. Under `Skip` that can defer the offending
+/// group first, which would commit the rest and report the invalid rows as
+/// reusable staged work.
+pub fn ensure_cell_flag_assignments_fit_read_version(
+    read_manifest: &Manifest,
+    txn: &Transaction,
+) -> Result<()> {
+    let Some(changes) = txn.cell_flag_changes.as_deref() else {
+        return Ok(());
+    };
+    let Some(registry) = read_manifest.cell_flags.as_deref() else {
+        return Ok(());
+    };
+    let fragments: HashMap<u32, &Fragment> = read_manifest
+        .fragments
+        .iter()
+        .filter_map(|fragment| {
+            u32::try_from(fragment.id)
+                .ok()
+                .map(|fragment_id| (fragment_id, fragment))
+        })
+        .collect();
+    for update in changes.updates.iter().filter(|update| update.value) {
+        let Some(definition) = registry
+            .definition(update.flag_id)
+            .filter(|definition| definition.is_dependent())
+        else {
+            continue;
+        };
+        validate_rows(&update.rows, true, update.flag_id, &fragments)?;
+        validate_publication(&read_manifest.schema, definition, update, &txn.operation)?;
+    }
+    Ok(())
+}
+
 fn ensure_changes_allowed(
     head: &Manifest,
     operation: &Operation,
@@ -586,7 +592,7 @@ fn ensure_changes_allowed(
     {
         return Err(Error::not_supported(format!(
             "{} is dependent, so only a DataReplacement that writes {} can set it true, not {name}",
-            flag_label(&head.schema, definition),
+            definition.label(&head.schema),
             field_label(&head.schema, definition.field_id),
         )));
     }
@@ -602,7 +608,7 @@ fn refuse(
     Error::not_supported(format!(
         "{} is not supported on a dataset with {}: {why}",
         operation.name(),
-        flag_label(&head.schema, definition)
+        definition.label(&head.schema)
     ))
 }
 
@@ -767,6 +773,22 @@ fn ensure_operation_allowed(
             ensure_flagged_fields_kept(head, registry, operation, schema)
         }
         Operation::CreateIndex { new_indices, .. } => {
+            if new_indices
+                .iter()
+                .any(|index| index.name == MEM_WAL_INDEX_NAME)
+                && let Some(definition) = registry
+                    .definitions()
+                    .iter()
+                    .find(|definition| definition.mask_when_false)
+            {
+                return Err(refuse(
+                    head,
+                    operation,
+                    definition,
+                    "MemWAL rows carry no cell flag state, so fresh-tier reads would serve the \
+                     masked field unmasked",
+                ));
+            }
             for index in new_indices {
                 if let Some(definition) = index
                     .fields
@@ -888,7 +910,7 @@ pub fn ensure_row_move_saw_flag_registrations(
              {} is true there but was registered after version {}, which the {} read; a retry \
              from the latest version can move that state",
             txn.operation.name(),
-            flag_label(&head.schema, definition),
+            definition.label(&head.schema),
             read_manifest.version,
             txn.operation.name(),
         )
@@ -1054,6 +1076,16 @@ fn validate_registration(
                 if output.is_blob() { " (blob)" } else { "" }
             )));
         }
+        if final_indices
+            .iter()
+            .any(|index| index.name == MEM_WAL_INDEX_NAME)
+        {
+            return Err(Error::not_supported(format!(
+                "cannot register masking cell flag '{name}' on {}: MemWAL is initialized on this \
+                 dataset, and MemWAL rows carry no cell flag state to mask it with",
+                field_label(schema, field_id)
+            )));
+        }
         if let Some(index) = final_indices
             .iter()
             .find(|index| index.fields.contains(&field_id))
@@ -1086,7 +1118,7 @@ fn validate_publication(
     let Operation::DataReplacement { replacements } = operation else {
         return Err(Error::not_supported(format!(
             "{} is dependent, so only a DataReplacement that writes {} can set it true, not {}",
-            flag_label(schema, definition),
+            definition.label(schema),
             field_label(schema, definition.field_id),
             operation.name()
         )));
@@ -1106,7 +1138,7 @@ fn validate_publication(
             return Err(Error::invalid_input(format!(
                 "{} is set true on fragment {fragment}, but the DataReplacement has no group for \
                  that fragment whose file writes {}",
-                flag_label(schema, definition),
+                definition.label(schema),
                 field_label(schema, definition.field_id)
             )));
         }
@@ -1501,7 +1533,7 @@ impl Transaction {
                                 "{} is set true on rows of fragments {:?} that this transaction \
                                  also invalidates for it: it writes a field the flag watches \
                                  there without publishing it, or clears a flag upstream of it",
-                                flag_label(&manifest.schema, definition),
+                                definition.label(&manifest.schema),
                                 overlap
                                     .iter()
                                     .map(|(fragment, _)| *fragment)
@@ -1550,6 +1582,7 @@ mod tests {
     use super::*;
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DataStorageFormat};
+    use crate::system_index::mem_wal::{MemWalIndexDetails, new_mem_wal_index_meta};
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{
         CellFlagMovedRows, DataOverlayGroup, RewriteGroup, TransactionBuilder,
@@ -2570,7 +2603,7 @@ mod tests {
     }
 
     #[test]
-    fn masking_registration_rejects_indexed_output_and_legacy_storage() {
+    fn masking_registration_rejects_indexed_output_mem_wal_and_legacy_storage() {
         let mut index = sample_index_metadata("summary_idx");
         index.fields = vec![SUMMARY];
         let error = commit_with_indices(
@@ -2581,6 +2614,28 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(error.to_string().contains("index 'summary_idx'"), "{error}");
+
+        let error = commit_with_indices(
+            &manifest(),
+            &register_txn(1, vec![registration_of(SUMMARY, "ready", &[BODY], true)]),
+            vec![mem_wal_index()],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error.to_string().contains(
+                "cannot register masking cell flag 'ready' on 'summary' (field id 3): MemWAL is \
+                 initialized on this dataset"
+            ),
+            "{error}"
+        );
+        // A dependent flag that does not mask needs no flag state in MemWAL rows.
+        commit_with_indices(
+            &manifest(),
+            &register_txn(1, vec![registration_of(SUMMARY, "ready", &[BODY], false)]),
+            vec![mem_wal_index()],
+        )
+        .unwrap();
 
         let mut legacy = manifest();
         legacy.data_storage_format = DataStorageFormat::new(ConcreteFileVersion::V1);
@@ -2734,6 +2789,17 @@ mod tests {
         }
     }
 
+    fn mem_wal_index() -> IndexMetadata {
+        new_mem_wal_index_meta(1, MemWalIndexDetails::default()).unwrap()
+    }
+
+    fn initialize_mem_wal() -> Operation {
+        Operation::CreateIndex {
+            new_indices: vec![mem_wal_index()],
+            removed_indices: vec![],
+        }
+    }
+
     fn row_moving_update(from: u64) -> Operation {
         let mut moved = fragment(0);
         moved.physical_rows = Some(1);
@@ -2764,6 +2830,7 @@ mod tests {
     #[case::project_tightens_mask(project_non_nullable(SUMMARY), Some("must stay nullable"))]
     #[case::index_on_masked(create_index_on(SUMMARY), Some("index 'idx' would serve"))]
     #[case::index_on_source(create_index_on(BODY), None)]
+    #[case::mem_wal_on_masked(initialize_mem_wal(), Some("MemWAL rows carry no cell flag state"))]
     #[case::moves_ordinary_flag(row_moving_update(0), Some("moves rows out of fragment 0"))]
     fn operation_gate(#[case] operation: Operation, #[case] refusal: Option<&str>) {
         let head = flagged_manifest();

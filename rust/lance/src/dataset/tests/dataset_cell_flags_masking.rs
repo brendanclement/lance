@@ -25,6 +25,7 @@ use lance_core::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY_POSITION, Schema as Lan
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_file::version::LanceFileVersion;
+use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery, ScalarIndexParams};
@@ -419,10 +420,8 @@ async fn test_full_text_search_sees_masked_values(
     assert_eq!(id_summaries(&batch), expected(expected_ids), "{token}");
 }
 
-/// [`masked_articles`] with a `vector` column, MemWAL keyed on `id`, and a
-/// shard whose active memtable rewrites id 4's body next to the summary
-/// published for its old body: the pair masking exists to hide.
-async fn masked_articles_with_fresh_row() -> (Arc<Dataset>, ShardWriter, u32) {
+/// [`masked_articles`] with a `vector` column and keyed on `id`.
+async fn keyed_masked_articles() -> (Dataset, u32) {
     let (mut dataset, flag_id) = masked_articles(false).await;
     let item = Arc::new(ArrowField::new("item", DataType::Float32, true));
     let vector = ArrowSchema::new(vec![ArrowField::new(
@@ -440,6 +439,18 @@ async fn masked_articles_with_fresh_row() -> (Arc<Dataset>, ShardWriter, u32) {
         .unwrap()
         .await
         .unwrap();
+    (dataset, flag_id)
+}
+
+/// [`keyed_masked_articles`], checked out where `summary.ready` masks it, and
+/// a shard whose active memtable rewrites id 4's body next to the summary
+/// published for its old body: the pair masking exists to hide. MemWAL cannot
+/// be initialized while a flag masks a field, so the head drops the flag
+/// first; the old version is read through time travel.
+async fn masked_articles_with_fresh_row() -> (Arc<Dataset>, ShardWriter, u32) {
+    let (mut dataset, flag_id) = keyed_masked_articles().await;
+    let masked = dataset.clone();
+    dataset.drop_cell_flag("summary", "ready").await.unwrap();
     dataset
         .initialize_mem_wal()
         .unsharded()
@@ -464,7 +475,7 @@ async fn masked_articles_with_fresh_row() -> (Arc<Dataset>, ShardWriter, u32) {
     )
     .unwrap();
     writer.put(vec![fresh]).await.unwrap();
-    (Arc::new(dataset), writer, flag_id)
+    (Arc::new(masked), writer, flag_id)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -550,7 +561,7 @@ async fn test_lsm_reads_of_a_masked_dataset_are_refused(
     #[case] read: LsmRead,
     #[case] has_fresh_row: bool,
 ) {
-    let (dataset, writer, flag_id) = masked_articles_with_fresh_row().await;
+    let (dataset, writer, flag_id) = Box::pin(masked_articles_with_fresh_row()).await;
     let summary_id = dataset.schema().field("summary").unwrap().id;
     let error = run_lsm_read(read, &dataset, has_fresh_row.then_some(&writer))
         .await
@@ -571,9 +582,10 @@ async fn test_lsm_reads_of_a_masked_dataset_are_refused(
 /// memtable's new body next to the summary published for the old one.
 #[tokio::test]
 async fn test_lsm_reads_serve_fresh_rows_unmasked() {
-    let (dataset, writer, _) = masked_articles_with_fresh_row().await;
+    let (dataset, writer, _) = Box::pin(masked_articles_with_fresh_row()).await;
     let mut unmasked = dataset.as_ref().clone();
-    unmasked.drop_cell_flag("summary", "ready").await.unwrap();
+    unmasked.checkout_latest().await.unwrap();
+    assert!(unmasked.cell_flags().is_empty());
     let unmasked = Arc::new(unmasked);
     let memtables = writer.in_memory_memtable_refs().await.unwrap();
     let projection = ["id", "body", "summary"].map(str::to_string);
@@ -611,6 +623,122 @@ async fn test_lsm_reads_serve_fresh_rows_unmasked() {
     .unwrap()
     .unwrap();
     assert_eq!(fresh(&looked_up), stale);
+}
+
+async fn initialized(dataset: &Dataset) -> lance_core::Result<Dataset> {
+    let mut dataset = dataset.clone();
+    dataset.initialize_mem_wal().unsharded().execute().await?;
+    Ok(dataset)
+}
+
+/// How a MemWAL and a masking flag would come to coexist.
+#[derive(Debug, Clone, Copy)]
+enum MemWalBesideMask {
+    /// Initialize MemWAL where a flag masks a field.
+    Initialize,
+    /// Initialize MemWAL from a version read before the flag was registered.
+    InitializeStagedBeforeMask,
+    /// Open a MemWAL writer where a flag masks a field.
+    OpenWriter,
+    /// Register a masking flag where MemWAL is initialized.
+    RegisterMask,
+    /// Register a masking flag from a version read before MemWAL was
+    /// initialized.
+    RegisterMaskStagedBeforeMemWal,
+}
+
+/// MemWAL rows carry no cell flag state, so fresh-tier reads, some of which
+/// never see the base table's manifest, could not mask them. MemWAL and a
+/// masking flag are therefore never both part of one version.
+#[rstest]
+#[case::initialize(MemWalBesideMask::Initialize)]
+#[case::initialize_staged_before_mask(MemWalBesideMask::InitializeStagedBeforeMask)]
+#[case::open_writer(MemWalBesideMask::OpenWriter)]
+#[case::register_mask(MemWalBesideMask::RegisterMask)]
+#[case::register_mask_staged_before_mem_wal(MemWalBesideMask::RegisterMaskStagedBeforeMemWal)]
+#[tokio::test]
+async fn test_mem_wal_and_masking_are_exclusive(#[case] path: MemWalBesideMask) {
+    let (mut dataset, flag_id) = keyed_masked_articles().await;
+    let summary_id = dataset.schema().field("summary").unwrap().id;
+    let flag =
+        format!("cell flag 'ready' (flag id {flag_id}) on 'summary' (field id {summary_id})");
+    let mask = || {
+        CellFlagOptions::default()
+            .with_clear_on_write(["title", "body"])
+            .with_mask_when_false(true)
+    };
+    let (error, expected) = match path {
+        MemWalBesideMask::Initialize | MemWalBesideMask::InitializeStagedBeforeMask => {
+            let mut staged = dataset.clone();
+            if matches!(path, MemWalBesideMask::InitializeStagedBeforeMask) {
+                dataset.drop_cell_flag("summary", "ready").await.unwrap();
+                staged = dataset.clone();
+                dataset
+                    .register_cell_flag("summary", "ready", mask())
+                    .await
+                    .unwrap();
+            }
+            let flag_id = dataset.cell_flag("summary", "ready").unwrap().flag_id;
+            let error = initialized(&staged).await.unwrap_err();
+            (
+                error,
+                format!(
+                    "CreateIndex is not supported on a dataset with cell flag 'ready' (flag id \
+                     {flag_id}) on 'summary' (field id {summary_id}): MemWAL rows carry no cell \
+                     flag state, so fresh-tier reads would serve the masked field unmasked"
+                ),
+            )
+        }
+        MemWalBesideMask::OpenWriter => {
+            let Err(error) = dataset
+                .mem_wal_writer(Uuid::new_v4(), ShardWriterConfig::default())
+                .await
+            else {
+                panic!("a MemWAL writer opened where a flag masks a field");
+            };
+            (
+                error,
+                format!(
+                    "cannot open a MemWAL writer: {flag} masks its field at version {}, and \
+                     MemWAL rows carry no cell flag state to mask it with",
+                    dataset.version().version
+                ),
+            )
+        }
+        MemWalBesideMask::RegisterMask | MemWalBesideMask::RegisterMaskStagedBeforeMemWal => {
+            dataset.drop_cell_flag("summary", "ready").await.unwrap();
+            let mut staged = dataset.clone();
+            dataset = initialized(&dataset).await.unwrap();
+            if matches!(path, MemWalBesideMask::RegisterMask) {
+                staged = dataset.clone();
+            }
+            let error = staged
+                .register_cell_flag("summary", "ready", mask())
+                .await
+                .unwrap_err();
+            (
+                error,
+                format!(
+                    "cannot register masking cell flag 'ready' on 'summary' (field id \
+                     {summary_id}): MemWAL is initialized on this dataset, and MemWAL rows \
+                     carry no cell flag state to mask it with"
+                ),
+            )
+        }
+    };
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(error.to_string().contains(&expected), "{error}");
+    let latest = latest(&dataset).await;
+    assert_eq!(latest.version().version, dataset.version().version);
+    assert_eq!(latest.cell_flags(), dataset.cell_flags());
+    let has_mem_wal = latest
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .any(|index| index.name == MEM_WAL_INDEX_NAME);
+    let has_mask = latest.cell_flags().iter().any(|flag| flag.mask_when_false);
+    assert!(has_mem_wal != has_mask, "exactly one of them is present");
 }
 
 #[tokio::test]

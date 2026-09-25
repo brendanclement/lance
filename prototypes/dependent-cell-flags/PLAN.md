@@ -35,10 +35,15 @@ UDF, compaction remap, or bindings.
   `DataReplacement` whose files carry the output field for the assigned fragments.
 - Only dependent flags may mask. Writers that re-read rows through the masked scan write masked
   cells back as NULL, which is harmless only when the flag can become true again solely through a
-  publication that writes new values.
-- A publication validates, for every assigned row, that no transaction in `(read_version, head]`
-  invalidated the row, and that no transaction wrote the group's output fields in that fragment
-  (the file's full physical footprint). Registration drop/replace fences publishers.
+  publication that writes new values, and while the mask stays: an `Update` that rewrote a field
+  it read through a mask retries over a concurrent drop of that mask. MemWAL rows carry no flag
+  state, so MemWAL and a masking flag are never part of one version.
+- A publication validates its assignments against the read version (offsets within the fragment,
+  a group writing the output), then, for every assigned row, that no transaction in
+  `(read_version, head]` invalidated the row, and that no transaction wrote the group's output
+  fields in that fragment (the file's full physical footprint). Registration drop/replace fences
+  publishers. A downstream flag published with its upstream must be computed from the upstream's
+  new values on the rows both assign.
 - Default policy `Reject`: any dependency conflict fails the commit. Policy `Skip` (publication
   transactions only): stale rows lose their assignment (their stale values stay masked), unsafe
   groups are deferred whole, safe groups publish, and the caller receives a `PublicationReport`.

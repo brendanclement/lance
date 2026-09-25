@@ -662,6 +662,17 @@ impl DatasetMemWalExt for Dataset {
     ) -> Result<ShardWriter> {
         use lance_index::metrics::NoOpMetricsCollector;
 
+        // Initializing MemWAL is refused while a flag masks a field, so this
+        // only names the reason instead of reporting MemWAL as uninitialized.
+        if let Some(flag) = self.cell_flags().iter().find(|flag| flag.mask_when_false) {
+            return Err(Error::not_supported(format!(
+                "cannot open a MemWAL writer: {} masks its field at version {}, and MemWAL \
+                 rows carry no cell flag state to mask it with",
+                flag.label(self.schema()),
+                self.version().version
+            )));
+        }
+
         // Load MemWalIndex to get maintained_indexes
         let mem_wal_index = self
             .open_mem_wal_index(&NoOpMetricsCollector)

@@ -1801,6 +1801,132 @@ async fn test_unmasked_stale_output_invalidates_downstream_flags() {
     );
 }
 
+/// A flag published together with a dependent flag upstream of it keeps the
+/// rows both assign: Lance takes it to be computed from the upstream values
+/// the same transaction publishes, not from the read snapshot. Published on
+/// its own, computed from the snapshot where the upstream output reads NULL,
+/// it is cleared once the upstream is published.
+#[rstest]
+#[tokio::test]
+async fn test_chained_outputs_published_together(#[values(false, true)] is_together: bool) {
+    let mut dataset = articles(false).await;
+    let translation = ArrowSchema::new(vec![ArrowField::new("translation", DataType::Utf8, true)]);
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(translation)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let masked_on = |sources: &[&str]| {
+        CellFlagOptions::default()
+            .with_clear_on_write(sources.iter().copied())
+            .with_mask_when_false(true)
+    };
+    let ready = dataset
+        .register_cell_flag("summary", "ready", masked_on(&["body"]))
+        .await
+        .unwrap()
+        .flag_id;
+    let translated = dataset
+        .register_cell_flag("translation", "ready", masked_on(&["summary"]))
+        .await
+        .unwrap()
+        .flag_id;
+    let summary_of = |fragment_id: u64, offset: u64| format!("s-{fragment_id}-{offset}");
+
+    let dataset = if is_together {
+        let mut staged = Vec::new();
+        for fragment_id in [0, 1] {
+            staged.push(
+                stage_rows(
+                    &dataset,
+                    fragment_id,
+                    &["summary", "translation"],
+                    |column, offset| {
+                        let summary = summary_of(fragment_id, offset);
+                        Some(match column {
+                            "summary" => summary,
+                            _ => format!("tr-{summary}"),
+                        })
+                    },
+                )
+                .await,
+            );
+        }
+        let updates = vec![
+            published(ready, full(&[0, 1])),
+            published(translated, full(&[0, 1])),
+        ];
+        let dataset = publish(&dataset, staged, updates, Reject)
+            .await
+            .unwrap()
+            .dataset;
+        assert!(recorded_invalidations(&dataset).await.is_empty());
+        dataset
+    } else {
+        let mut staged = Vec::new();
+        for fragment_id in [0, 1] {
+            staged.push(
+                stage_rows(&dataset, fragment_id, &["translation"], |_, _| {
+                    Some("tr-NULL".to_string())
+                })
+                .await,
+            );
+        }
+        let dataset = publish(
+            &dataset,
+            staged,
+            set_true(translated, full(&[0, 1])),
+            Reject,
+        )
+        .await
+        .unwrap()
+        .dataset;
+        let mut staged = Vec::new();
+        for fragment_id in [0, 1] {
+            staged.push(
+                stage_rows(&dataset, fragment_id, &["summary"], |_, offset| {
+                    Some(summary_of(fragment_id, offset))
+                })
+                .await,
+            );
+        }
+        let dataset = publish(&dataset, staged, set_true(ready, full(&[0, 1])), Reject)
+            .await
+            .unwrap()
+            .dataset;
+        assert_eq!(
+            recorded_invalidations(&dataset).await,
+            cleared(translated, full(&[0, 1]))
+        );
+        dataset
+    };
+
+    assert_eq!(dataset.cell_flag_true_rows(ready).unwrap(), full(&[0, 1]));
+    let translated_rows = if is_together {
+        full(&[0, 1])
+    } else {
+        RowAddrTreeMap::new()
+    };
+    assert_eq!(
+        dataset.cell_flag_true_rows(translated).unwrap(),
+        translated_rows
+    );
+    let expected: Vec<(i32, Option<String>)> = column_values(&dataset, "summary", None)
+        .await
+        .into_iter()
+        .map(|(id, summary)| {
+            let translation = summary
+                .filter(|_| is_together)
+                .map(|summary| format!("tr-{summary}"));
+            (id, translation)
+        })
+        .collect();
+    assert_eq!(column_values(&dataset, "translation", None).await, expected);
+}
+
 /// `summary` (from title and body) and `keywords` (from body) computed
 /// together: two dependent flags whose outputs share one file per fragment.
 async fn sibling_outputs() -> (Dataset, u32, u32, Vec<DataReplacementGroup>) {
@@ -1847,6 +1973,37 @@ fn both(summary: u32, keywords: u32, rows: RowAddrTreeMap) -> Vec<CellFlagUpdate
     vec![published(summary, rows.clone()), published(keywords, rows)]
 }
 
+/// A newer refresh of both sibling outputs on `fragment_ids`, committed
+/// before the one under test.
+async fn publish_newer(
+    dataset: &Dataset,
+    summary: u32,
+    keywords: u32,
+    fragment_ids: &[u32],
+) -> Dataset {
+    let mut staged = Vec::new();
+    for fragment_id in fragment_ids {
+        staged.push(
+            stage_rows(
+                dataset,
+                u64::from(*fragment_id),
+                &["summary", "keywords"],
+                |column, offset| Some(format!("newer-{column}-{fragment_id}-{offset}")),
+            )
+            .await,
+        );
+    }
+    publish(
+        dataset,
+        staged,
+        both(summary, keywords, full(fragment_ids)),
+        Reject,
+    )
+    .await
+    .unwrap()
+    .dataset
+}
+
 /// Why a publication of both sibling outputs fails.
 #[derive(Debug, Clone, Copy)]
 enum PublicationFailure {
@@ -1854,24 +2011,64 @@ enum PublicationFailure {
     InputChanged,
     /// The assignment names an offset fragment 1 does not have.
     RowOutOfRange,
+    /// As `RowOutOfRange`, under `Skip`, with a newer result on fragment 1
+    /// deferring the group that holds the bad offset.
+    DeferredRowOutOfRange,
+    /// Under `Skip`, summary is assigned on fragment 1, whose file writes only
+    /// keywords, and a newer result on fragment 1 defers that group.
+    DeferredMissingOutput,
+    /// As `RowOutOfRange`, under `Skip`, with newer results deferring every
+    /// group.
+    EveryGroupDeferred,
 }
 
+/// Invalid assignments fail the same way whether or not a concurrent commit
+/// would defer the group they are in.
 #[rstest]
 #[case::input_changed(PublicationFailure::InputChanged)]
 #[case::row_out_of_range(PublicationFailure::RowOutOfRange)]
+#[case::deferred_row_out_of_range(PublicationFailure::DeferredRowOutOfRange)]
+#[case::deferred_missing_output(PublicationFailure::DeferredMissingOutput)]
+#[case::every_group_deferred(PublicationFailure::EveryGroupDeferred)]
 #[tokio::test]
 async fn test_rejected_publication_exposes_nothing(#[case] failure: PublicationFailure) {
-    let (dataset, summary, keywords, staged) = sibling_outputs().await;
-    let (head, assigned) = match failure {
-        PublicationFailure::InputChanged => {
-            (merge_insert_body(&dataset, 3, "new").await, full(&[0, 1]))
+    let (dataset, summary, keywords, mut staged) = sibling_outputs().await;
+    let out_of_range = with_full(rows(&[(1, &[0, 1, 5])]), 0);
+    let (head, newer_fragments, policy, assigned): (_, &[u32], _, _) = match failure {
+        PublicationFailure::InputChanged => (
+            merge_insert_body(&dataset, 3, "new").await,
+            &[],
+            Reject,
+            full(&[0, 1]),
+        ),
+        PublicationFailure::RowOutOfRange => (dataset.clone(), &[], Reject, out_of_range),
+        PublicationFailure::DeferredRowOutOfRange => (
+            publish_newer(&dataset, summary, keywords, &[1]).await,
+            &[1],
+            Skip,
+            out_of_range,
+        ),
+        PublicationFailure::DeferredMissingOutput => {
+            staged[1] = stage_rows(&dataset, 1, &["keywords"], |column, offset| {
+                Some(format!("{column}-1-{offset}"))
+            })
+            .await;
+            (
+                publish_newer(&dataset, summary, keywords, &[1]).await,
+                &[1],
+                Skip,
+                full(&[0, 1]),
+            )
         }
-        PublicationFailure::RowOutOfRange => {
-            (dataset.clone(), with_full(rows(&[(1, &[0, 1, 5])]), 0))
-        }
+        PublicationFailure::EveryGroupDeferred => (
+            publish_newer(&dataset, summary, keywords, &[0, 1]).await,
+            &[0, 1],
+            Skip,
+            out_of_range,
+        ),
     };
 
-    let error = publish(&dataset, staged, both(summary, keywords, assigned), Reject)
+    let error = publish(&dataset, staged, both(summary, keywords, assigned), policy)
         .await
         .unwrap_err();
     match failure {
@@ -1887,12 +2084,26 @@ async fn test_rejected_publication_exposes_nothing(#[case] failure: PublicationF
                 "{error}"
             );
         }
-        PublicationFailure::RowOutOfRange => {
+        PublicationFailure::RowOutOfRange
+        | PublicationFailure::DeferredRowOutOfRange
+        | PublicationFailure::EveryGroupDeferred => {
             assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
             assert!(
                 error.to_string().contains(&format!(
                     "cell flag {summary} update names offset 5 of fragment 1, which has 2 \
                      physical rows"
+                )),
+                "{error}"
+            );
+        }
+        PublicationFailure::DeferredMissingOutput => {
+            let summary_id = dataset.schema().field("summary").unwrap().id;
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains(&format!(
+                    "{} is set true on fragment 1, but the DataReplacement has no group for \
+                     that fragment whose file writes 'summary' (field id {summary_id})",
+                    flag_label(&dataset, summary)
                 )),
                 "{error}"
             );
@@ -1905,13 +2116,24 @@ async fn test_rejected_publication_exposes_nothing(#[case] failure: PublicationF
         "no staged file was installed"
     );
     for (flag_id, column) in [(summary, "summary"), (keywords, "keywords")] {
-        assert!(latest.cell_flag_true_rows(flag_id).unwrap().is_empty());
-        assert!(
-            column_values(&latest, column, None)
-                .await
-                .iter()
-                .all(|(_, value)| value.is_none()),
-            "{column} was not published anywhere"
+        assert_eq!(
+            latest.cell_flag_true_rows(flag_id).unwrap(),
+            full(newer_fragments)
+        );
+        let expected: Vec<(i32, Option<String>)> = (1..=4)
+            .map(|id| {
+                let (fragment, offset) = ((id - 1) / 2, (id - 1) % 2);
+                let is_newer = newer_fragments.contains(&(fragment as u32));
+                (
+                    id,
+                    is_newer.then(|| format!("newer-{column}-{fragment}-{offset}")),
+                )
+            })
+            .collect();
+        assert_eq!(
+            column_values(&latest, column, None).await,
+            expected,
+            "{column} shows only the newer results"
         );
     }
 }

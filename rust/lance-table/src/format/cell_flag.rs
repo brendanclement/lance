@@ -16,9 +16,10 @@
 //!
 //! A flag, or a fragment of a flag, with no entry in `states` is false.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use lance_core::datatypes::Schema;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
@@ -77,6 +78,48 @@ impl CellFlagDefinition {
             .copied()
             .chain(std::iter::once(self.field_id))
     }
+
+    /// The flag as error messages name it, with its output field in `schema`.
+    pub fn label(&self, schema: &Schema) -> String {
+        format!(
+            "cell flag '{}' (flag id {}) on {}",
+            self.name,
+            self.flag_id,
+            field_label(schema, self.field_id)
+        )
+    }
+}
+
+/// A field as error messages name it: its path in `schema` and its id, or
+/// only its id when `schema` has no such field.
+pub fn field_label(schema: &Schema, field_id: i32) -> String {
+    match schema.field_path(field_id) {
+        Ok(path) => format!("'{path}' (field id {field_id})"),
+        Err(_) => format!("field id {field_id}"),
+    }
+}
+
+/// Every field id of `schema` mapped to the id of its top-level ancestor.
+/// Flags watch top-level fields while data files list leaf ids.
+pub fn top_level_ancestors(schema: &Schema) -> HashMap<i32, i32> {
+    let mut ancestors = HashMap::new();
+    for top in &schema.fields {
+        let mut stack = vec![top];
+        while let Some(field) = stack.pop() {
+            ancestors.insert(field.id, top.id);
+            stack.extend(field.children.iter());
+        }
+    }
+    ancestors
+}
+
+/// `fragment_id` as the fragment half of a cell flag row address.
+pub fn fragment_key(fragment_id: u64) -> Result<u32> {
+    u32::try_from(fragment_id).map_err(|_| {
+        Error::invalid_input(format!(
+            "fragment id {fragment_id} does not fit the 32 bits a cell flag row address holds"
+        ))
+    })
 }
 
 /// Every registered cell flag of a dataset and the rows where each is true.

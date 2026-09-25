@@ -71,10 +71,9 @@ message Transaction {
      * the source rows, which the update deletes.
      */
     message MovedRows {
-      reserved 3;
       string fragment_path = 1;
       bytes offsets = 2;
-      bytes source_row_addrs = 4;
+      bytes source_row_addrs = 3;
     }
     // Top-level field ids, wrapped so that an empty list differs from none.
     message WrittenFields {

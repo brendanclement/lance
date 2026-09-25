@@ -11,8 +11,6 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_select::RowAddrTreeMap;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
-use crate::format::CellFlagRegistry;
-
 /// Set a flag to `value` for `rows`.
 ///
 /// Setting a dependent flag true publishes its output, and needs a
@@ -21,6 +19,12 @@ use crate::format::CellFlagRegistry;
 /// assign must be copied unchanged from the read snapshot, as read through
 /// Lance. Lance treats those rows as logically unchanged for invalidation,
 /// and as physically written for conflict detection.
+///
+/// A flag published together with a dependent flag upstream of it, whose
+/// output is one of its sources, must be computed from the upstream values
+/// the same transaction publishes on the rows both assign, not from the read
+/// snapshot: those rows are exempt from the clear the upstream publication
+/// would otherwise record for it.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct CellFlagUpdate {
     pub flag_id: u32,
@@ -129,16 +133,5 @@ impl CellFlagChanges {
     pub fn pairs_flags_with_read_values(&self) -> bool {
         self.sets_any_flag()
             || (!self.moved_rows.is_empty() && self.moved_rows_written_fields.is_some())
-    }
-
-    /// Whether an explicit update sets a flag that `registry` defines as
-    /// dependent to true, i.e. this transaction publishes computed outputs.
-    pub fn publishes_dependent_flags(&self, registry: &CellFlagRegistry) -> bool {
-        self.updates.iter().any(|update| {
-            update.value
-                && registry
-                    .definition(update.flag_id)
-                    .is_some_and(|definition| definition.is_dependent())
-        })
     }
 }

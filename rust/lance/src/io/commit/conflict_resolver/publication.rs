@@ -14,10 +14,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
-use lance_table::format::{CellFlagDefinition, DeletionFile, Fragment, Manifest};
+use lance_table::format::cell_flag::{field_label, fragment_key, top_level_ancestors};
+use lance_table::format::{DeletionFile, Fragment, Manifest};
 use lance_table::transaction::ensure_cell_flags_registered_at_read_version;
 use roaring::RoaringBitmap;
 
@@ -68,42 +68,6 @@ struct Group {
 struct GroupWrites {
     conflicts: Vec<(u64, DeferralReason, Error)>,
     deletion_updates: Vec<(u64, Option<DeletionFile>)>,
-}
-
-fn top_level_ancestors(schema: &Schema) -> HashMap<i32, i32> {
-    let mut ancestors = HashMap::new();
-    for top in &schema.fields {
-        let mut stack = vec![top];
-        while let Some(field) = stack.pop() {
-            ancestors.insert(field.id, top.id);
-            stack.extend(field.children.iter());
-        }
-    }
-    ancestors
-}
-
-fn field_label(schema: &Schema, field_id: i32) -> String {
-    match schema.field_path(field_id) {
-        Ok(path) => format!("'{path}' (field id {field_id})"),
-        Err(_) => format!("field id {field_id}"),
-    }
-}
-
-fn flag_label(schema: &Schema, definition: &CellFlagDefinition) -> String {
-    format!(
-        "cell flag '{}' (flag id {}) on {}",
-        definition.name,
-        definition.flag_id,
-        field_label(schema, definition.field_id)
-    )
-}
-
-fn fragment_key(fragment_id: u64) -> Result<u32> {
-    u32::try_from(fragment_id).map_err(|_| {
-        Error::invalid_input(format!(
-            "fragment id {fragment_id} does not fit the 32 bits a cell flag row address holds"
-        ))
-    })
 }
 
 fn materialize(selection: &RowAddrSelection, physical_rows: u32) -> RoaringBitmap {
@@ -168,7 +132,7 @@ impl Publication {
                 (
                     definition.flag_id,
                     PublishedFlag {
-                        label: flag_label(schema, definition),
+                        label: definition.label(schema),
                         mask_when_false: definition.mask_when_false,
                     },
                 )
@@ -828,7 +792,7 @@ pub fn ensure_skip_eligible(read_manifest: &Manifest, transaction: &Transaction)
         if !update.value || !definition.is_dependent() {
             return Err(refuse(format!(
                 "it sets {}, which is {}, to {}",
-                flag_label(schema, definition),
+                definition.label(schema),
                 if definition.is_dependent() {
                     "dependent"
                 } else {

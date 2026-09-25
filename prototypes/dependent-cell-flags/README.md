@@ -117,6 +117,18 @@ whole-fragment contribution that meets rows `f` assigns is refused with `Invalid
 transaction would publish values its own write invalidates. Groups of non-publications clear the
 whole fragment.
 
+**A flag published in the same transaction as a dependent flag upstream of it must, on the rows
+both assign, be computed from the upstream values that transaction publishes, not from the read
+snapshot.** Those rows are exempt from the clear the upstream's publication causes, so Lance
+cannot notice a downstream value computed from the upstream's old (masked) value. Published in
+separate transactions, the upstream's publication clears the downstream flag instead
+(`publication::test_chained_outputs_published_together`).
+
+Every true assignment is validated against the read version before the rebase: each offset must
+be a physical row of its fragment, and each assigned fragment needs a group whose file writes the
+flag's output. An invalid publication fails with `InvalidInput` even when a concurrent commit
+would have deferred the offending group.
+
 ## Conflicts and the `Skip` policy
 
 A publication is checked against every transaction committed in `(read_version, head]`, across
@@ -158,6 +170,10 @@ Other cell flag conflicts, in both policies:
   one of its source fragments (retryable), so it rereads the published values.
 - A registration conflicts with a concurrent `Overwrite` or `Restore` (incompatible), and with a
   `Project` or `Merge` that removes or re-ids a field it names (retryable).
+- An `Update` that rewrites a field it read through a masking flag (a partial-schema
+  `merge_insert` copying unmatched rows in place, or a row-moving update) conflicts (retryable)
+  with a concurrent drop or replacement of that flag. It wrote the masked cells back as NULL; the
+  drop exposes the stored values, and the retry reads them.
 
 ## Supported / Unsupported
 
@@ -170,7 +186,9 @@ Supported:
   directly or upstream, were not set), partial-schema `merge_insert` (`RewriteColumns`, in place,
   per-row clears), `DataReplacement` of a source or output (whole fragment), deletes, and
   `DataOverlay` of an unwatched field. A write staged before a registration still records the
-  clear.
+  clear. A partial `merge_insert` records the offsets it patched only when the version it read has
+  stable row ids or a registry, so one staged before the first registration clears whole
+  fragments.
 - Publication through `DataReplacement` on several fragments, incremental (copy-through), with
   sibling outputs in one file, under `Reject` or `Skip`, across commit retries.
 - Registration drop and replace, which fence older publishers; registering or dropping a masking
@@ -196,11 +214,12 @@ Unsupported, each failing with an explicit error (test in `dataset_cell_flags.rs
 | Making a masked output non-nullable | `NotSupported` | `…::non_nullable_masked_output` |
 | Setting a dependent flag true outside a `DataReplacement` that writes its output | `NotSupported` / `InvalidInput` | `…::dependent_flag_set_outside_publication`; `lance-table` `change_gate`, `publication_validation_errors` |
 | Masking with an ordinary flag (no `clear_on_write`) | `NotSupported` | `…::masking_ordinary_flag`; `lance-table` `registration_validation_errors::ordinary_mask` |
-| Masking a non-nullable, nested, list, struct, blob or legacy (v1) field | `InvalidInput` / `NotSupported` | `lance-table` `registration_validation_errors`, `masking_registration_rejects_indexed_output_and_legacy_storage` |
+| Masking a non-nullable, nested, list, struct, blob or legacy (v1) field | `InvalidInput` / `NotSupported` | `lance-table` `registration_validation_errors`, `masking_registration_rejects_indexed_output_mem_wal_and_legacy_storage` |
 | Any index on a masked output; masking an indexed field | `NotSupported` | `dataset_cell_flags_masking`: `test_indexing_a_masked_field_fails_before_building`, `test_masking_an_indexed_field_is_refused` |
 | Row-moving writes without flag state (`merge_insert` `RewriteRows`, raw staged `Update`) on a fragment where an ordinary flag is true | `NotSupported` (retryable when staged before the flag's registration) | `dataset_cell_flags_update`: `test_stateless_row_move_is_refused_where_an_ordinary_flag_is_true`, `test_row_move_retries_over_flag_registered_after_its_read` |
 | Detached commits; batch commits or dataset creation carrying flag changes | `NotSupported` | `test_detached_and_batch_commits_are_refused`, `test_creating_a_dataset_with_cell_flag_changes_is_refused` |
-| MemWAL (LSM) reads over a base table with a masking flag | `NotSupported` | `dataset_cell_flags_masking::test_lsm_reads_of_a_masked_dataset_are_refused` |
+| Initializing MemWAL or opening a MemWAL writer where a flag masks a field; registering a masking flag where MemWAL is initialized (checked at commit, so also when staged before the other) | `NotSupported` | `dataset_cell_flags_masking::test_mem_wal_and_masking_are_exclusive`; `lance-table` `operation_gate::mem_wal_on_masked`, `masking_registration_rejects_indexed_output_mem_wal_and_legacy_storage` |
+| MemWAL (LSM) reads over a base table version with a masking flag | `NotSupported` | `dataset_cell_flags_masking::test_lsm_reads_of_a_masked_dataset_are_refused` |
 | `Skip` through `CommitBuilder::execute`, or on anything but a publication | `InvalidInput` | `dataset_cell_flags_publication::test_skip_needs_a_publication_and_a_report` |
 
 Dependent flags on rows moved by a stateless row-moving write fall back to unassigned: safe, but
@@ -221,15 +240,15 @@ Requirements from the task, with the tests that cover them (files under
 | 3 | Invalidation while the flag is already false | `publication::test_refresh_skips_rows_invalidated_while_flag_false` (3 write paths × 2 policies); `cell_flags::test_dependent_flag_publication_and_invalidation`; `lance-table` `derive_records_clears_when_already_false_and_against_head_registry` |
 | 4 | Input A → B → A | `publication::test_input_restored_before_refresh_publishes` (3 write paths × 2 policies) |
 | 5 | A newer worker's result survives an older worker | `publication::test_newer_result_survives_older_refresh`, `test_copied_rows_cannot_overwrite_newer_result`, `test_retry_that_defers_a_group_keeps_the_newer_flag` |
-| 6 | An input write staged before a publication commits after it and clears it | `publication::test_input_write_staged_before_publication_clears_it`; `update::test_update_retries_over_concurrent_publication`; `cell_flags::test_write_staged_before_registration_records_clear` |
+| 6 | An input write staged before a publication commits after it and clears it | `publication::test_input_write_staged_before_publication_clears_it`; `update::test_update_retries_over_concurrent_publication`, `test_rewrite_retries_over_drop_of_the_mask_it_read_through`; `cell_flags::test_write_staged_before_registration_records_clear`, `test_partial_merge_insert_records_offsets_only_when_read` |
 | 7 | An unrelated-field update keeps dependent outputs | `update::test_update_moves_flags_whose_watched_fields_it_does_not_set::unrelated_field`, `test_in_place_merge_insert_clears_only_flags_watching_it::unrelated_field`; `masking::test_write_predicates_see_masked_values::unwatched_field` |
-| 8 | Shared inputs invalidate all and only the right outputs | `update::test_update_moves_flags_whose_watched_fields_it_does_not_set`, `test_in_place_merge_insert_clears_only_flags_watching_it`; `cell_flags::test_clears_propagate_down_dependency_chains`; `publication::test_refresh_loop_never_shows_a_stale_output` |
+| 8 | Shared inputs invalidate all and only the right outputs | `update::test_update_moves_flags_whose_watched_fields_it_does_not_set`, `test_in_place_merge_insert_clears_only_flags_watching_it`; `cell_flags::test_clears_propagate_down_dependency_chains`; `publication::test_refresh_loop_never_shows_a_stale_output`, `test_chained_outputs_published_together` |
 | 9 | One unsafe fragment does not block safe ones under `Skip` | `publication::test_unsafe_fragment_does_not_block_safe_ones` (5 kinds × 2 policies), `test_refresh_loop_never_shows_a_stale_output` |
 | 10 | A full-file replacement cannot overwrite newer results outside its rows | `publication::test_copied_rows_cannot_overwrite_newer_result`, `test_newer_result_survives_older_refresh`; `lance-table` `derive_counts_unassigned_rows_of_a_publication_as_copied`, `publication_exempts_only_published_inputs` |
 | 11 | An assigned NULL is distinguishable from pending work | `masking::test_masked_field_reads_null_where_flag_is_false` |
 | 12 | Registration replace/drop fences old work | `publication::test_registration_change_fences_old_publisher`; `cell_flags::test_dropped_flag_fences_staged_publication`, `test_publication_needs_flag_registered_at_read_version`; `lance-table` `apply_fences_changes_for_unknown_flags` |
 | 13 | A commit retry after a competing commit keeps every invalidation | `publication::test_commit_retry_records_every_invalidation` (3 write paths × registration/publication competitor; the first manifest write loses its slot to a competitor committed by a `CommitHandler` wrapper), `test_publication_retry_accumulates_deferrals` |
-| 14 | A failed publication exposes no partial values or assignments | `publication::test_rejected_publication_exposes_nothing` (conflict and invalid assignment), `test_registration_change_fences_old_publisher`, the `Reject` branches of the tests above |
+| 14 | A failed publication exposes no partial values or assignments | `publication::test_rejected_publication_exposes_nothing` (conflict; invalid assignment under `Reject`, and under `Skip` with a concurrent commit deferring the invalid group or every group), `test_registration_change_fences_old_publisher`, the `Reject` branches of the tests above |
 | 15 | Unsupported operations fail explicitly | see the table above |
 | M | Masking, `IS NULL`, `COUNT(column)` vs `COUNT(*)` | `masking::test_filters_see_masked_values`, `test_aggregates_count_masked_cells_as_null`, `test_every_reader_funnel_masks_each_batch`, `test_takes_and_late_materialization_mask`, `test_sort_and_group_by_see_masked_values` |
 
@@ -259,6 +278,9 @@ cargo test -p lance --doc cell_flag
   publication clears it, like a source write.
 - **Copy-through contract.** A publication replaces whole fragments, and rows it does not assign
   must be copied from its read snapshot.
+- **Chained outputs published together.** A downstream output published in the same transaction
+  as its upstream must be computed from the upstream's new values on the rows both assign; the
+  draft computes every value from the read snapshot.
 - **`Skip` only for publication-only transactions**, and only through `execute_with_report`. The
   policy is set on `CommitBuilder`, not passed to `commit`.
 - **Fragment-group deferral.** An unsafe group is deferred whole; there is no row-subset
@@ -267,8 +289,13 @@ cargo test -p lance --doc cell_flag
 - **Compaction and indexes are refused** rather than preserving flags or maintaining index
   coverage over masked outputs.
 
-Known gaps: `LsmScanner::without_base_table` has no manifest to consult and serves MemWAL rows
-unmasked; compaction is refused only at commit, after it has reserved fragment ids and written
-its files; a plain delete leaves flag state on deleted rows, which still counts toward the
-ordinary-flag gate for row-moving writes; `DeferredGroup::valid_rows` can list rows deleted after
-the read version.
+Known gaps: fresh-tier readers that take no base table (`LsmScanner::without_base_table`,
+`ShardWriter::scan`, `MemTable::scan`) and `ShardWriter::open` never see a manifest. Since no
+version holds both MemWAL and a masking flag, their rows come from a MemWAL initialized while no
+field was masked, but a writer or shard left over after `drop_index` removes the MemWAL index keeps
+serving its rows unmasked once a masking flag is registered. A caller-staged `DataReplacement`
+computed from masked reads is not retried over a concurrent drop of the mask; it writes whatever it
+read, and its whole-fragment clear keeps downstream flags safe. Compaction is refused only at commit,
+after it has reserved fragment ids and written its files; a plain delete leaves flag state on
+deleted rows, which still counts toward the ordinary-flag gate for row-moving writes;
+`DeferredGroup::valid_rows` can list rows deleted after the read version.

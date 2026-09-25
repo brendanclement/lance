@@ -631,7 +631,9 @@ impl MergeInsertParams {
 struct PatchSink {
     /// Fragments that gained a data file, one entry per task.
     fragments: Mutex<Vec<Fragment>>,
-    /// Physical offsets each fragment had patched.
+    /// Physical offsets each fragment had patched. Only populated where
+    /// something reads them: stable row ids, or a cell flag registry at the
+    /// version the job read.
     offsets: Mutex<HashMap<u64, RoaringBitmap>>,
 }
 
@@ -653,7 +655,10 @@ pub(super) struct PatchedFragments {
     /// re-stamp exactly the patched rows with the version the commit actually
     /// got, and lets the commit clear dependent cell flags on exactly those
     /// rows. `None` when no row was patched, which is how a stored transaction
-    /// decodes, so the in-memory transaction compares equal to it.
+    /// decodes, so the in-memory transaction compares equal to it, and when
+    /// the dataset has neither stable row ids nor cell flags. A flag
+    /// registered before the commit then clears every row of the updated
+    /// fragments.
     pub matched_offsets: Option<UpdatedFragmentOffsets>,
 }
 
@@ -1722,16 +1727,18 @@ impl MergeInsertJob {
                 // paths below consume `_rowaddr`. Stable row ids re-stamp their
                 // row-version metadata from these, and the commit clears
                 // dependent cell flags on exactly these rows.
-                let offsets: RoaringBitmap = get_row_addr_iter(&batches)
-                    .map(|(row_addr, _)| RowAddress::from(row_addr).row_offset())
-                    .collect();
-                patched
-                    .offsets
-                    .lock()
-                    .unwrap()
-                    .entry(metadata.id)
-                    .or_default()
-                    .extend(offsets);
+                if dataset.manifest.uses_stable_row_ids() || dataset.manifest.cell_flags.is_some() {
+                    let offsets: RoaringBitmap = get_row_addr_iter(&batches)
+                        .map(|(row_addr, _)| RowAddress::from(row_addr).row_offset())
+                        .collect();
+                    patched
+                        .offsets
+                        .lock()
+                        .unwrap()
+                        .entry(metadata.id)
+                        .or_default()
+                        .extend(offsets);
+                }
 
                 if has_full_fragment_coverage {
                     // Exact, deletion-free coverage can be written directly because the

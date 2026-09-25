@@ -44,8 +44,9 @@ use lance_table::io::commit::{
 };
 use lance_table::io::manifest::read_manifest;
 use lance_table::transaction::{
-    CellFlagChanges, derive_cell_flag_invalidations, ensure_cell_flags_registered_at_read_version,
-    ensure_operation_allowed_with_cell_flags, ensure_row_move_saw_flag_registrations,
+    CellFlagChanges, derive_cell_flag_invalidations, ensure_cell_flag_assignments_fit_read_version,
+    ensure_cell_flags_registered_at_read_version, ensure_operation_allowed_with_cell_flags,
+    ensure_row_move_saw_flag_registrations,
 };
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
@@ -1638,6 +1639,7 @@ pub(crate) async fn commit_transaction_with_report(
     if policy == DependencyConflictPolicy::Skip {
         conflict_resolver::ensure_skip_eligible(&read_version_dataset.manifest, &transaction)?;
     }
+    ensure_cell_flag_assignments_fit_read_version(&read_version_dataset.manifest, &transaction)?;
     let mut report = PublicationReport::new(read_version);
     // Every concurrent version checked across attempts, in order.
     let mut seen_versions: Vec<u64> = Vec::new();

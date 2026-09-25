@@ -22,12 +22,12 @@ use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::overlay::OverlayCoverage;
-use lance_table::format::{CellFlagRegistry, IndexMetadata};
+use lance_table::format::{CellFlagRegistry, IndexMetadata, Manifest};
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -55,6 +55,58 @@ struct CellFlagRebase {
     /// The registry at the read version of an update that moves flagged rows,
     /// to tell which flags a concurrent transaction sets are dependent.
     moved_rows_registry: Option<Arc<CellFlagRegistry>>,
+    /// Labels of the flags that, at the read version of an `Update`, masked a
+    /// field it rewrites from the values it read, keyed by flag id.
+    masked_reads: BTreeMap<u32, String>,
+}
+
+/// Whether `operation` writes back values it read: an `Update` that rewrites
+/// columns in place, copying the rows it did not match, or that moves rows
+/// into new fragments.
+fn rewrites_read_values(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Update {
+            update_mode,
+            new_fragments,
+            fields_modified,
+            ..
+        } if matches!(update_mode, Some(UpdateMode::RewriteColumns))
+            || !fields_modified.is_empty()
+            || !new_fragments.is_empty()
+    )
+}
+
+/// The flags of `read_manifest` that mask a field `operation` rewrites from
+/// what it read there: the fields an in-place update writes, or every field
+/// of the rows a row-moving update moves.
+fn masked_reads(read_manifest: &Manifest, operation: &Operation) -> BTreeMap<u32, String> {
+    let (
+        Some(registry),
+        Operation::Update {
+            update_mode,
+            new_fragments,
+            fields_modified,
+            ..
+        },
+    ) = (read_manifest.cell_flags.as_deref(), operation)
+    else {
+        return BTreeMap::new();
+    };
+    let moves_rows =
+        !new_fragments.is_empty() && !matches!(update_mode, Some(UpdateMode::RewriteColumns));
+    registry
+        .definitions()
+        .iter()
+        .filter(|definition| definition.mask_when_false)
+        .filter(|definition| {
+            moves_rows
+                || fields_modified
+                    .iter()
+                    .any(|field_id| i32::try_from(*field_id) == Ok(definition.field_id))
+        })
+        .map(|definition| (definition.flag_id, definition.label(&read_manifest.schema)))
+        .collect()
 }
 
 /// Whether `operation` may make a nullability-affecting schema change: a
@@ -137,15 +189,15 @@ impl<'a> TransactionRebase<'a> {
         let mut rebase =
             Self::try_new_without_cell_flags(dataset, transaction, affected_rows).await?;
         rebase.cell_flags.policy = policy;
-        let Some(changes) = rebase.transaction.cell_flag_changes.as_deref() else {
-            return Ok(rebase);
-        };
-        let publishes = changes.sets_any_flag()
+        let changes = rebase.transaction.cell_flag_changes.as_deref();
+        let publishes = changes.is_some_and(CellFlagChanges::sets_any_flag)
             && matches!(
                 rebase.transaction.operation,
                 Operation::DataReplacement { .. }
             );
-        if !publishes && changes.moved_rows.is_empty() {
+        let moves_flagged_rows = changes.is_some_and(|changes| !changes.moved_rows.is_empty());
+        let rewrites_read_values = rewrites_read_values(&rebase.transaction.operation);
+        if !publishes && !moves_flagged_rows && !rewrites_read_values {
             return Ok(rebase);
         }
         let read_dataset = dataset_at_read_version(dataset, &rebase.transaction).await?;
@@ -156,8 +208,12 @@ impl<'a> TransactionRebase<'a> {
                 &rebase.initial_fragments,
                 policy,
             )?;
-        } else {
+        } else if moves_flagged_rows {
             rebase.cell_flags.moved_rows_registry = read_dataset.manifest.cell_flags.clone();
+        }
+        if rewrites_read_values {
+            rebase.cell_flags.masked_reads =
+                masked_reads(&read_dataset.manifest, &rebase.transaction.operation);
         }
         Ok(rebase)
     }
@@ -422,7 +478,41 @@ impl<'a> TransactionRebase<'a> {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
         }?;
+        self.check_masked_reads_txn(other_transaction, other_version)?;
         self.check_cell_flag_changes_txn(other_transaction, other_version)
+    }
+
+    /// An update that rewrote a field it read through a masking flag wrote the
+    /// masked cells back as NULL, which is harmless only while the flag masks
+    /// them. A concurrent drop of the flag exposes the stored values those
+    /// NULLs would replace, without a write the update could conflict with
+    /// otherwise, so it conflicts here and the retry reads them.
+    fn check_masked_reads_txn(
+        &self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        let Some(label) = other_transaction
+            .cell_flag_changes
+            .iter()
+            .flat_map(|changes| changes.drops.iter())
+            .find_map(|flag_id| self.cell_flags.masked_reads.get(flag_id))
+        else {
+            return Ok(());
+        };
+        let name = self.transaction.operation.name();
+        Err(Error::retryable_commit_conflict_source(
+            other_version,
+            format!(
+                "This {name} transaction was preempted: concurrent {} at version \
+                 {other_version} dropped {label}, which masked that field at version {}, where \
+                 this {name} read the values it rewrites. The masked cells it copied read NULL \
+                 there and would overwrite the values the drop exposes. Please retry.",
+                other_transaction.operation.name(),
+                self.transaction.read_version,
+            )
+            .into(),
+        ))
     }
 
     /// Explicit cell flag updates address rows by their physical position at

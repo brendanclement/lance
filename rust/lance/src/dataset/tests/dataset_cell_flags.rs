@@ -18,6 +18,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::feature_flags::FLAG_UNSTABLE_CELL_FLAGS;
+use roaring::RoaringBitmap;
 use rstest::rstest;
 
 use crate::dataset::cell_flag::CellFlagOptions;
@@ -25,7 +26,7 @@ use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::schema_evolution::NewColumnTransform;
 use crate::dataset::transaction::{
     CellFlagChanges, CellFlagRegistration, CellFlagUpdate, DataReplacementGroup, Operation,
-    Transaction, TransactionBuilder, translate_config_updates,
+    Transaction, TransactionBuilder, UpdatedFragmentOffsets, translate_config_updates,
 };
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
@@ -426,6 +427,56 @@ async fn test_partial_merge_insert_clears_written_rows(
     let mut written = RowAddrTreeMap::new();
     written.insert(1);
     assert_eq!(dataset.cell_flag_true_rows(flag_id).unwrap(), expected);
+    assert_eq!(
+        recorded_invalidations(&dataset).await,
+        cleared(flag_id, written)
+    );
+}
+
+/// Without stable row ids or a registry nothing reads the offsets a partial
+/// merge_insert patched, so it does not record them. A flag registered before
+/// it commits is then cleared on the whole fragment it rewrote.
+#[rstest]
+#[tokio::test]
+async fn test_partial_merge_insert_records_offsets_only_when_read(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = articles(stable_row_ids).await;
+    let source = record_batch!(("id", Int32, [2]), ("body", Utf8, ["new body"])).unwrap();
+    let staged = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap()
+        .execute_uncommitted_batches(vec![source])
+        .await
+        .unwrap()
+        .transaction;
+    let Operation::Update {
+        updated_fragment_offsets,
+        ..
+    } = &staged.operation
+    else {
+        panic!("expected an Update, got {}", staged.operation);
+    };
+    let expected_offsets = stable_row_ids
+        .then(|| UpdatedFragmentOffsets(HashMap::from([(0, RoaringBitmap::from_iter([1_u32]))])));
+    assert_eq!(updated_fragment_offsets, &expected_offsets);
+
+    let flag_id = register_ready(&mut dataset).await;
+    let dataset = CommitBuilder::new(Arc::new(dataset))
+        .execute(staged)
+        .await
+        .unwrap();
+    let written = if stable_row_ids {
+        let mut written = RowAddrTreeMap::new();
+        written.insert(1);
+        written
+    } else {
+        full(&[0])
+    };
     assert_eq!(
         recorded_invalidations(&dataset).await,
         cleared(flag_id, written)

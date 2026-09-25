@@ -106,8 +106,13 @@ pub struct DeferredGroup {
 /// computed. Every row of a replaced fragment that it does not assign must be
 /// copied unchanged from the read snapshot, as read through Lance. Lance
 /// treats those rows as logically unchanged for invalidation, and as
-/// physically written for conflict detection. At commit, every transaction
-/// since the read version is checked:
+/// physically written for conflict detection. A flag published together with
+/// a dependent flag upstream of it must, on the rows both assign, be computed
+/// from the upstream values the publication writes rather than from the
+/// snapshot. Assignments are checked against the read version first: an
+/// offset beyond its fragment, or a fragment without a group writing the
+/// flag's output, fails the commit with `InvalidInput` under either policy.
+/// Then every transaction since the read version is checked:
 ///
 /// ```text
 /// concurrent change                               Reject      Skip

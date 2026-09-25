@@ -24,8 +24,10 @@
 //! snapshot, as read through Lance. Lance treats those rows as logically
 //! unchanged for invalidation, and as physically written for conflict
 //! detection, so an incremental refresh keeps the rows an earlier one
-//! completed. [`PublicationReport`] describes how concurrent transactions are
-//! checked. A flag without sources is *ordinary*: only explicit updates
+//! completed. A flag published together with a dependent flag upstream of it
+//! must, on the rows both assign, be computed from the upstream values the
+//! same transaction publishes. [`PublicationReport`] describes how concurrent
+//! transactions are checked. A flag without sources is *ordinary*: only explicit updates
 //! change it, and it cannot mask its field.
 //!
 //! A row-moving update gives the rows it writes new addresses, so their state
@@ -135,9 +137,10 @@ pub struct CellFlagOptions {
     /// scan, such as a row-moving update, write masked cells back as NULL,
     /// which only a dependent flag tolerates, since a publication sets it true
     /// together with fresh values. The field must be a nullable scalar and must
-    /// not be indexed. While such a flag is registered, MemWAL (LSM) reads
-    /// over the dataset fail: MemWAL rows carry no flag state to mask them
-    /// with.
+    /// not be indexed. MemWAL rows carry no flag state to mask them with, so a
+    /// masking flag cannot be registered while MemWAL is initialized, MemWAL
+    /// cannot be initialized or written while one is registered, and LSM reads
+    /// over a version that has one fail.
     pub mask_when_false: bool,
 }
 
