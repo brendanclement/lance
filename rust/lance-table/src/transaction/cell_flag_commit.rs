@@ -1222,7 +1222,15 @@ fn normalize(state: &RowAddrTreeMap, fragments: &HashMap<u32, &Fragment>) -> Row
             {
                 RowAddrSelection::Full
             }
-            other => other.clone(),
+            // The state is stored in every manifest, and writers build
+            // assignments offset by offset: run containers keep a mostly
+            // true fragment (holes at deleted or pending rows) to a few runs.
+            RowAddrSelection::Partial(rows) => {
+                let mut rows = rows.clone();
+                rows.optimize();
+                RowAddrSelection::Partial(rows)
+            }
+            RowAddrSelection::Full => RowAddrSelection::Full,
         };
         insert_selection(&mut normalized, *fragment_id, selection);
     }
@@ -2321,6 +2329,43 @@ mod tests {
             .build();
         let empty = commit(&cleared, &clear_all).unwrap();
         assert!(registry_of(&empty).states().is_empty());
+    }
+
+    #[test]
+    fn apply_run_compresses_partial_state() {
+        const LARGE_ROWS: u32 = 100_000;
+        let mut base = manifest();
+        let mut large = fragment(0);
+        large.physical_rows = Some(LARGE_ROWS as usize);
+        base.fragments = Arc::new(vec![large]);
+        base.max_fragment_id = Some(0);
+        let head = commit(
+            &base,
+            &register_txn(1, vec![registration_of(TITLE, "reviewed", &[], false)]),
+        )
+        .unwrap();
+        // Every row but a scattered few, inserted one at a time.
+        let offsets: Vec<u32> = (0..LARGE_ROWS).filter(|offset| offset % 997 != 0).collect();
+        let set = TransactionBuilder::new(2, update_config())
+            .cell_flag_changes(CellFlagChanges {
+                updates: vec![CellFlagUpdate {
+                    flag_id: 1,
+                    value: true,
+                    rows: rows(&[(0, Some(&offsets))]),
+                }],
+                ..Default::default()
+            })
+            .build();
+        let set = commit(&head, &set).unwrap();
+        let state = registry_of(&set).states().get(&1).unwrap();
+        assert_eq!(state.as_ref(), &rows(&[(0, Some(&offsets))]));
+        let uncompressed: RoaringBitmap = offsets.iter().copied().collect();
+        let serialized = state.serialized_size();
+        assert!(
+            serialized * 20 < uncompressed.serialized_size(),
+            "run-compressed state takes {serialized} bytes, uncompressed {}",
+            uncompressed.serialized_size()
+        );
     }
 
     #[test]
