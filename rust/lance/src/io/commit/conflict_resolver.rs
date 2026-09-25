@@ -473,11 +473,29 @@ impl<'a> TransactionRebase<'a> {
                 .iter()
                 .filter(|update| !is_published(update))
             {
-                if theirs.updates.iter().any(|their| {
-                    their.flag_id == ours.flag_id && !(their.rows.clone() & &ours.rows).is_empty()
-                }) {
-                    return Err(self.retryable_conflict_err(other_transaction, other_version));
-                }
+                let Some(overlap) = theirs
+                    .updates
+                    .iter()
+                    .filter(|their| their.flag_id == ours.flag_id)
+                    .map(|their| their.rows.clone() & &ours.rows)
+                    .find(|overlap| !overlap.is_empty())
+                else {
+                    continue;
+                };
+                let fragments: Vec<u32> = overlap.iter().map(|(fragment, _)| *fragment).collect();
+                return Err(Error::retryable_commit_conflict_source(
+                    other_version,
+                    format!(
+                        "This {} transaction was preempted by concurrent transaction {} at \
+                         version {other_version}, which also updated cell flag {} on rows of \
+                         fragment(s) {fragments:?} that this transaction sets to {}. Please retry.",
+                        self.transaction.operation,
+                        other_transaction.operation,
+                        ours.flag_id,
+                        ours.value
+                    )
+                    .into(),
+                ));
             }
         }
         let handles_moved_rows =

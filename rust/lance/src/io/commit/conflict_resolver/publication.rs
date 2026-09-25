@@ -25,7 +25,7 @@ use super::{TransactionRebase, read_fragment_deletion_bitmap, wrong_operation_er
 use crate::Dataset;
 use crate::dataset::cell_flag::{
     DeferralReason, DeferredGroup, DeferredRows, DependencyConflictPolicy, PublicationDeferrals,
-    invalidated_rows,
+    invalidated_rows, removed_fragments,
 };
 use crate::dataset::transaction::{
     CellFlagUpdate, DataReplacementGroup, Operation, Transaction, UpdateMode,
@@ -274,9 +274,15 @@ impl Publication {
             match self.policy {
                 DependencyConflictPolicy::Reject => return Err(error),
                 DependencyConflictPolicy::Skip => {
-                    self.deferred_groups
+                    let deferral = self
+                        .deferred_groups
                         .entry(fragment_id)
                         .or_insert((reason, other_version));
+                    // Once the fragment is gone, none of the group's staged
+                    // positions can be reused, whatever deferred it first.
+                    if reason.removes_fragment() && !deferral.0.removes_fragment() {
+                        *deferral = (reason, other_version);
+                    }
                 }
             }
         }
@@ -459,50 +465,29 @@ impl TransactionRebase<'_> {
                 }
             }
         };
+        for (fragment_id, reason) in removed_fragments(other)
+            .into_iter()
+            .filter(|(id, _)| groups.contains_key(id))
+        {
+            let error = match reason {
+                DeferralReason::FragmentRemoved => {
+                    self.data_replacement_target_removed_err(fragment_id, other, other_version)
+                }
+                _ => retryable(),
+            };
+            writes.conflicts.push((fragment_id, reason, error));
+        }
         match &other.operation {
             Operation::Delete {
-                updated_fragments,
-                deleted_fragment_ids,
-                ..
-            } => {
-                for fragment_id in deleted_fragment_ids
-                    .iter()
-                    .filter(|id| groups.contains_key(id))
-                {
-                    writes.conflicts.push((
-                        *fragment_id,
-                        DeferralReason::FragmentRemoved,
-                        self.data_replacement_target_removed_err(
-                            *fragment_id,
-                            other,
-                            other_version,
-                        ),
-                    ));
-                }
-                note_deletions(&mut writes, updated_fragments);
-            }
+                updated_fragments, ..
+            } => note_deletions(&mut writes, updated_fragments),
             Operation::Update {
-                removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
                 fields_modified,
                 update_mode,
                 ..
             } => {
-                for fragment_id in removed_fragment_ids
-                    .iter()
-                    .filter(|id| groups.contains_key(id))
-                {
-                    writes.conflicts.push((
-                        *fragment_id,
-                        DeferralReason::FragmentRemoved,
-                        self.data_replacement_target_removed_err(
-                            *fragment_id,
-                            other,
-                            other_version,
-                        ),
-                    ));
-                }
                 let moves_rows = !new_fragments.is_empty()
                     && matches!(update_mode, Some(UpdateMode::RewriteRows) | None);
                 for fragment in updated_fragments {
@@ -528,22 +513,6 @@ impl TransactionRebase<'_> {
                 }
                 // Under Skip, moved rows count as deleted at their old addresses.
                 note_deletions(&mut writes, updated_fragments);
-            }
-            Operation::Rewrite {
-                groups: rewrite_groups,
-                ..
-            } => {
-                for fragment in rewrite_groups
-                    .iter()
-                    .flat_map(|group| group.old_fragments.iter())
-                    .filter(|fragment| groups.contains_key(&fragment.id))
-                {
-                    writes.conflicts.push((
-                        fragment.id,
-                        DeferralReason::FragmentRewritten,
-                        retryable(),
-                    ));
-                }
             }
             Operation::DataReplacement { replacements } => {
                 let published = other.cell_flag_changes.as_deref();
@@ -734,11 +703,7 @@ impl TransactionRebase<'_> {
                     });
                 }
                 if let Some(reason) = deferral {
-                    let has_positions = !matches!(
-                        reason,
-                        DeferralReason::FragmentRemoved | DeferralReason::FragmentRewritten
-                    );
-                    if has_positions && !remaining.is_empty() {
+                    if !reason.removes_fragment() && !remaining.is_empty() {
                         valid_rows
                             .entry(fragment_id)
                             .or_default()

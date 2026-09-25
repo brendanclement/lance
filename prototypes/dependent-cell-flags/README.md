@@ -104,8 +104,14 @@ Under `Skip`, a row deferred for one flag is deferred for every flag whose outpu
 writes. The group still installs its file, so those rows hold stale values under a false flag;
 where that changes what an output reads as (an unmasked output, or a sibling flag that was true),
 the commit clears the flag explicitly so that flags computed from it are cleared too. A deferred
-group installs nothing and its staged file is left on storage. When every group is deferred, no
+group installs nothing and its staged file is left on storage. The sibling rule also holds for a
+deferred group's `valid_rows` when a later commit retry finds them stale. A group whose fragment is
+removed or rewritten by `checked_version` is reported with that reason, whatever deferred it first,
+and no row of that fragment is reported as deferred or reusable. When every group is deferred, no
 version is written. The read version of a publication is never advanced.
+
+`Reject` still drops assignments of rows deleted since the read version and commits the rest;
+`execute_with_report` reports them as `RowVacated`.
 
 `Skip` applies only to a publication whose updates all set dependent flags true and whose files
 write only those flags' outputs; anything else is refused with `InvalidInput`, as is `Skip` through

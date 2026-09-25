@@ -47,7 +47,7 @@ pub use publication::{
     DeferralReason, DeferredGroup, DeferredRows, DependencyConflictPolicy, PublicationReport,
     PublicationResult,
 };
-pub(crate) use publication::{PublicationDeferrals, invalidated_rows};
+pub(crate) use publication::{PublicationDeferrals, invalidated_rows, removed_fragments};
 
 /// How a cell flag reacts to writes and reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

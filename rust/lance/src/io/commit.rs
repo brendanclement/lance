@@ -1685,8 +1685,7 @@ pub(crate) async fn commit_transaction_with_report(
 
             let deferrals;
             (transaction, deferrals) = rebase.finish_with_report(&dataset).await?;
-            report.check_deferred_groups(&other_transactions);
-            report.record(deferrals);
+            report.record(&other_transactions, deferrals);
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
         }

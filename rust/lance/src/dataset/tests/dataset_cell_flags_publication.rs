@@ -43,10 +43,10 @@ use crate::dataset::transaction::{
 };
 use crate::dataset::write::CommitBuilder;
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
-use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, UpdateBuilder};
+use crate::dataset::{DeleteBuilder, MergeInsertBuilder, MergeInsertWriteMode, UpdateBuilder};
 use crate::{Dataset, Result};
 
-use DeferralReason::{InputChanged, NewerResult, RowVacated};
+use DeferralReason::{FragmentRemoved, InputChanged, NewerResult, RowVacated};
 use DependencyConflictPolicy::{Reject, Skip};
 
 fn rows(entries: &[(u32, &[u32])]) -> RowAddrTreeMap {
@@ -635,6 +635,20 @@ async fn test_newer_result_survives_older_refresh(
                 matches!(error, Error::RetryableCommitConflict { .. }),
                 "{error}"
             );
+            // The input change is checked first, being the earlier version.
+            let expected = if is_input_changed {
+                format!(
+                    "{} cannot be published on 1 row(s) of fragment 0: concurrent Update at \
+                     version {input_changed_at} changed their inputs",
+                    flag_label(&older_read, flag_id)
+                )
+            } else {
+                format!(
+                    "preempted by concurrent transaction DataReplacement at version {}",
+                    repaired.version().version
+                )
+            };
+            assert!(error.to_string().contains(&expected), "{error}");
             let head = latest(&repaired).await;
             assert_eq!(head.version().version, repaired.version().version);
             assert_eq!(head.cell_flag_true_rows(flag_id).unwrap(), full(&[0]));
@@ -966,6 +980,11 @@ async fn test_copied_rows_cannot_overwrite_newer_result(
                 matches!(error, Error::RetryableCommitConflict { .. }),
                 "{error}"
             );
+            let expected = format!(
+                "preempted by concurrent transaction DataReplacement at version {}",
+                repaired.version().version
+            );
+            assert!(error.to_string().contains(&expected), "{error}");
             None
         }
         Skip => {
@@ -1437,6 +1456,104 @@ async fn test_retry_that_defers_a_group_keeps_the_newer_flag() {
     );
 }
 
+/// How fragment 0 is removed after a refresh staged it.
+#[derive(Debug, Clone, Copy)]
+enum Removal {
+    Delete,
+    MoveRows,
+}
+
+/// Fragment 0's group is deferred to a newer result and id 2's input changes
+/// before the fragment is removed, while the publication rebases or while its
+/// first attempt writes its manifest. The removal is what the caller must act
+/// on, and no row of fragment 0 is left to reuse or recompute.
+#[rstest]
+#[case::delete(Removal::Delete, false)]
+#[case::move_rows(Removal::MoveRows, false)]
+#[case::delete_during_retry(Removal::Delete, true)]
+#[tokio::test]
+async fn test_fragment_removal_supersedes_earlier_deferral(
+    #[case] removal: Removal,
+    #[case] is_during_retry: bool,
+) {
+    let mut dataset = articles(false).await;
+    let flag_id = register_ready(&mut dataset).await;
+    let read = dataset.clone();
+    let refresh = stage_all(&read, "summary", "s").await;
+    let newer = stage_rows(&dataset, 0, &["summary"], |_, offset| {
+        Some(format!("newer-0-{offset}"))
+    })
+    .await;
+    let repaired = publish(&dataset, vec![newer], set_true(flag_id, full(&[0])), Reject)
+        .await
+        .unwrap()
+        .dataset;
+    let written = merge_insert_body(&repaired, 2, "new").await;
+    let publication = replacement_txn(
+        read.version().version,
+        refresh.clone(),
+        set_true(flag_id, full(&[0, 1])),
+    );
+    let mut commit =
+        CommitBuilder::new(Arc::new(read.clone())).with_dependency_conflict_policy(Skip);
+    let handler = if is_during_retry {
+        let delete = DeleteBuilder::new(Arc::new(written.clone()), "id <= 2")
+            .execute_uncommitted()
+            .await
+            .unwrap()
+            .transaction;
+        let handler = Arc::new(CommitsCompetitorFirst {
+            inner: written.commit_handler.clone(),
+            competitor: Mutex::new(Some((Arc::new(written.clone()), delete))),
+        });
+        commit = commit.with_commit_handler(handler.clone());
+        Some(handler)
+    } else {
+        match removal {
+            Removal::Delete => {
+                written.clone().delete("id <= 2").await.unwrap();
+            }
+            Removal::MoveRows => {
+                update_where(&written, "id <= 2", "body", "moved").await;
+            }
+        }
+        None
+    };
+
+    let result = commit.execute_with_report(publication).await.unwrap();
+    if let Some(handler) = handler {
+        assert!(handler.competitor.lock().unwrap().is_none());
+    }
+    let removed_at = written.version().version + 1;
+    assert_eq!(
+        result.report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version: removed_at,
+            committed_version: Some(removed_at + 1),
+            published: vec![published(flag_id, full(&[1]))],
+            deferred_rows: vec![],
+            deferred_groups: vec![DeferredGroup {
+                fragment_id: 0,
+                data_file: refresh[0].1.clone(),
+                reason: FragmentRemoved,
+                conflicting_version: removed_at,
+                valid_rows: vec![],
+            }],
+        }
+    );
+    assert_eq!(result.report.reusable_rows(flag_id), full(&[1]));
+    assert!(result.dataset.get_fragment(0).is_none());
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(flag_id).unwrap(),
+        full(&[1])
+    );
+    assert_eq!(
+        published_values(&result.dataset, "summary", flag_id).await,
+        values(&[(3, Some("s-1-0")), (4, Some("s-1-1"))])
+    );
+}
+
 /// `ready` publishes an unmasked summary; `fresh` is computed from it.
 #[tokio::test]
 async fn test_unmasked_stale_output_invalidates_downstream_flags() {
@@ -1696,6 +1813,118 @@ async fn test_stale_row_defers_every_sibling_output(#[values(false, true)] is_re
     }
 }
 
+/// Fragment 0's group is deferred to a newer result of both outputs, and only
+/// summary is then cleared on id 1, while the publication rebases or while its
+/// first attempt writes its manifest. Either way id 1's staged values are
+/// deferred for both outputs.
+#[rstest]
+#[tokio::test]
+async fn test_deferred_group_defers_every_sibling_output(
+    #[values(false, true)] is_during_retry: bool,
+) {
+    let (dataset, summary, keywords, staged) = sibling_outputs().await;
+    let newer = stage_rows(&dataset, 0, &["summary", "keywords"], |column, offset| {
+        Some(format!("newer-{column}-0-{offset}"))
+    })
+    .await;
+    let repaired = publish(
+        &dataset,
+        vec![newer],
+        both(summary, keywords, full(&[0])),
+        Reject,
+    )
+    .await
+    .unwrap()
+    .dataset;
+    let clear = TransactionBuilder::new(repaired.version().version, update_config())
+        .cell_flag_changes(CellFlagChanges {
+            updates: vec![CellFlagUpdate {
+                flag_id: summary,
+                value: false,
+                rows: rows(&[(0, &[0])]),
+            }],
+            ..Default::default()
+        })
+        .build();
+    let publication = replacement_txn(
+        dataset.version().version,
+        staged.clone(),
+        both(summary, keywords, full(&[0, 1])),
+    );
+    let mut commit =
+        CommitBuilder::new(Arc::new(dataset.clone())).with_dependency_conflict_policy(Skip);
+    let handler = if is_during_retry {
+        let handler = Arc::new(CommitsCompetitorFirst {
+            inner: repaired.commit_handler.clone(),
+            competitor: Mutex::new(Some((Arc::new(repaired.clone()), clear))),
+        });
+        commit = commit.with_commit_handler(handler.clone());
+        Some(handler)
+    } else {
+        CommitBuilder::new(Arc::new(repaired.clone()))
+            .execute(clear)
+            .await
+            .unwrap();
+        None
+    };
+
+    let result = commit.execute_with_report(publication).await.unwrap();
+    if let Some(handler) = handler {
+        assert!(handler.competitor.lock().unwrap().is_none());
+    }
+    let republished_at = repaired.version().version;
+    let cleared_at = republished_at + 1;
+    assert_eq!(
+        result.report,
+        PublicationReport {
+            read_version: dataset.version().version,
+            checked_version: cleared_at,
+            committed_version: Some(cleared_at + 1),
+            published: both(summary, keywords, full(&[1])),
+            deferred_rows: vec![
+                deferred(summary, rows(&[(0, &[0])]), InputChanged, cleared_at),
+                deferred(keywords, rows(&[(0, &[0])]), InputChanged, cleared_at),
+            ],
+            deferred_groups: vec![DeferredGroup {
+                fragment_id: 0,
+                data_file: staged[0].1.clone(),
+                reason: NewerResult,
+                conflicting_version: republished_at,
+                valid_rows: both(summary, keywords, rows(&[(0, &[1])])),
+            }],
+        }
+    );
+    assert_eq!(
+        result.report.reusable_rows(keywords),
+        with_full(rows(&[(0, &[1])]), 1)
+    );
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(summary).unwrap(),
+        with_full(rows(&[(0, &[1])]), 1)
+    );
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(keywords).unwrap(),
+        full(&[0, 1])
+    );
+    assert_eq!(
+        published_values(&result.dataset, "summary", summary).await,
+        values(&[
+            (2, Some("newer-summary-0-1")),
+            (3, Some("summary-1-0")),
+            (4, Some("summary-1-1")),
+        ])
+    );
+    assert_eq!(
+        published_values(&result.dataset, "keywords", keywords).await,
+        values(&[
+            (1, Some("newer-keywords-0-0")),
+            (2, Some("newer-keywords-0-1")),
+            (3, Some("keywords-1-0")),
+            (4, Some("keywords-1-1")),
+        ])
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_rows_deleted_before_publication_are_reported_vacated(
@@ -1922,6 +2151,12 @@ async fn test_explicit_updates_of_the_same_rows_conflict(
             matches!(error, Error::RetryableCommitConflict { .. }),
             "{error}"
         );
+        let expected = format!(
+            "preempted by concurrent transaction UpdateConfig at version {}, which also updated \
+             cell flag {reviewed} on rows of fragment(s) [0] that this transaction sets to true",
+            other.version().version
+        );
+        assert!(error.to_string().contains(&expected), "{error}");
         let head = latest(&other).await;
         assert_eq!(head.version().version, other.version().version);
         assert!(head.cell_flag_true_rows(reviewed).unwrap().is_empty());
