@@ -686,6 +686,11 @@ impl TransactionRebase<'_> {
                 .as_mut()
                 .ok_or_else(|| Error::internal("a publication lost its cell flag changes"))?,
         );
+        let head_states = dataset
+            .manifest
+            .cell_flags
+            .as_deref()
+            .map(|registry| registry.states());
         let mut deferrals = PublicationDeferrals::default();
         let mut valid_rows: BTreeMap<u64, Vec<CellFlagUpdate>> = BTreeMap::new();
         let mut stale_clears = Vec::new();
@@ -760,15 +765,40 @@ impl TransactionRebase<'_> {
             {
                 update.rows = publication.subtract(&update.rows, &removed)?;
             }
-            // The stale values are installed but no longer published. Where
-            // the output is not masked they change what it reads as, so flags
-            // computed from it must be cleared there too.
-            if !flag.mask_when_false && !input_changed.is_empty() {
+            // The group installs values it no longer assigns on these rows.
+            // Where that changes what the output reads as, because it is not
+            // masked or because only a sibling's input changed and this flag
+            // is still true, clear the flag and so the flags computed from it.
+            let visible = if flag.mask_when_false {
+                head_states
+                    .and_then(|states| states.get(flag_id))
+                    .map_or_else(RowAddrTreeMap::new, |state| input_changed & state.as_ref())
+            } else {
+                input_changed
+            };
+            if !visible.is_empty() {
                 stale_clears.push(CellFlagUpdate {
                     flag_id: *flag_id,
                     value: false,
-                    rows: input_changed,
+                    rows: visible,
                 });
+            }
+        }
+        // Only Skip defers groups, and under Skip every clear of a published
+        // flag is one an earlier attempt added for stale values a group
+        // installed. A deferred group installs nothing, and a newer result may
+        // own those rows by now.
+        if !deferred_files.is_empty() {
+            let mut deferred_fragments = RowAddrTreeMap::new();
+            for fragment_id in deferred_files.keys() {
+                deferred_fragments.insert_fragment(fragment_key(*fragment_id)?);
+            }
+            for update in changes
+                .updates
+                .iter_mut()
+                .filter(|update| !update.value && publication.publishes(update.flag_id))
+            {
+                update.rows = publication.subtract(&update.rows, &deferred_fragments)?;
             }
         }
         changes.updates.extend(stale_clears);
@@ -791,10 +821,7 @@ impl TransactionRebase<'_> {
 /// Refuse [`DependencyConflictPolicy::Skip`] for a transaction that is not a
 /// publication Skip can trim: deferring part of anything else would apply
 /// its other changes partially.
-pub(crate) fn ensure_skip_eligible(
-    read_manifest: &Manifest,
-    transaction: &Transaction,
-) -> Result<()> {
+pub fn ensure_skip_eligible(read_manifest: &Manifest, transaction: &Transaction) -> Result<()> {
     let refuse = |why: String| {
         Error::invalid_input(format!(
             "DependencyConflictPolicy::Skip only applies to a publication, a DataReplacement \

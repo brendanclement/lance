@@ -343,6 +343,15 @@ async fn test_input_write_masks_published_output(
             cleared(flag_id, write.clears())
         }
     );
+    let expected_flags = match write {
+        // The moved row keeps its old, now deleted, address in the state.
+        BodyWrite::Update => full(&[0, 1]),
+        BodyWrite::Replace | BodyWrite::MergeInsert => write.still_valid(),
+    };
+    assert_eq!(
+        written.cell_flag_true_rows(flag_id).unwrap(),
+        expected_flags
+    );
     let id_2_published = !matches!(write, BodyWrite::Replace);
     let mut expected = vec![(3, Some("s-1-0")), (4, Some("s-1-1"))];
     if id_2_published {
@@ -699,10 +708,16 @@ async fn test_input_write_staged_before_publication_clears_it(
     })
     .await;
     let staged = stage_all(&dataset, "summary", "s").await;
-    let published_at = publish(&dataset, staged, set_true(flag_id, full(&[0, 1])), Reject)
+    let publication = publish(&dataset, staged, set_true(flag_id, full(&[0, 1])), Reject)
         .await
-        .unwrap()
-        .dataset;
+        .unwrap();
+    assert_eq!(
+        publication.report.published,
+        set_true(flag_id, full(&[0, 1]))
+    );
+    assert!(publication.report.deferred_rows.is_empty());
+    assert!(publication.report.deferred_groups.is_empty());
+    let published_at = publication.dataset;
 
     let written = match write {
         BodyWrite::Replace => CommitBuilder::new(Arc::new(published_at.clone()))
@@ -1324,6 +1339,12 @@ async fn test_publication_retry_accumulates_deferrals() {
             }],
         }
     );
+    let committed = result.dataset.read_transaction().await.unwrap().unwrap();
+    assert_eq!(
+        committed.read_version,
+        read.version().version,
+        "the retried publication keeps the version its values were computed at"
+    );
     assert_eq!(
         result.dataset.cell_flag_true_rows(flag_id).unwrap(),
         rows(&[(0, &[1]), (1, &[1])])
@@ -1331,6 +1352,88 @@ async fn test_publication_retry_accumulates_deferrals() {
     assert_eq!(
         published_values(&result.dataset, "summary", flag_id).await,
         values(&[(2, Some("newer-0-1")), (4, Some("s-1-1"))])
+    );
+}
+
+/// The first attempt installs fragment 0 with id 2's stale, unmasked value and
+/// clears `ready` there; the retry defers that group to a newer result, which
+/// must keep its flag on id 2.
+#[tokio::test]
+async fn test_retry_that_defers_a_group_keeps_the_newer_flag() {
+    let mut dataset = articles(false).await;
+    let ready = dataset
+        .register_cell_flag(
+            "summary",
+            "ready",
+            CellFlagOptions::default().with_clear_on_write(["body"]),
+        )
+        .await
+        .unwrap()
+        .flag_id;
+    let read = dataset.clone();
+    let refresh = stage_all(&read, "summary", "s").await;
+    let written = merge_insert_body(&dataset, 2, "new").await;
+    let newer = stage_rows(&written, 0, &["summary"], |_, offset| {
+        Some(format!("newer-0-{offset}"))
+    })
+    .await;
+    let competitor = replacement_txn(
+        written.version().version,
+        vec![newer],
+        set_true(ready, full(&[0])),
+    );
+    let handler = Arc::new(CommitsCompetitorFirst {
+        inner: written.commit_handler.clone(),
+        competitor: Mutex::new(Some((Arc::new(written.clone()), competitor))),
+    });
+
+    let result = CommitBuilder::new(Arc::new(read.clone()))
+        .with_commit_handler(handler.clone())
+        .with_dependency_conflict_policy(Skip)
+        .execute_with_report(replacement_txn(
+            read.version().version,
+            refresh.clone(),
+            set_true(ready, full(&[0, 1])),
+        ))
+        .await
+        .unwrap();
+    assert!(handler.competitor.lock().unwrap().is_none());
+    let changed_at = written.version().version;
+    let republished_at = changed_at + 1;
+    assert_eq!(
+        result.report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version: republished_at,
+            committed_version: Some(republished_at + 1),
+            published: vec![published(ready, full(&[1]))],
+            deferred_rows: vec![deferred(
+                ready,
+                rows(&[(0, &[1])]),
+                InputChanged,
+                changed_at
+            )],
+            deferred_groups: vec![DeferredGroup {
+                fragment_id: 0,
+                data_file: refresh[0].1.clone(),
+                reason: NewerResult,
+                conflicting_version: republished_at,
+                valid_rows: vec![published(ready, rows(&[(0, &[0])]))],
+            }],
+        }
+    );
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(ready).unwrap(),
+        full(&[0, 1])
+    );
+    assert_eq!(
+        column_values(&result.dataset, "summary", None).await,
+        values(&[
+            (1, Some("newer-0-0")),
+            (2, Some("newer-0-1")),
+            (3, Some("s-1-0")),
+            (4, Some("s-1-1")),
+        ])
     );
 }
 
@@ -1440,8 +1543,8 @@ async fn test_unmasked_stale_output_invalidates_downstream_flags() {
     assert_eq!(file_of(&result.dataset, 0, "keywords"), keywords_path);
 }
 
-/// `summary` and `keywords` computed together from body: two dependent flags
-/// whose outputs share one file per fragment.
+/// `summary` (from title and body) and `keywords` (from body) computed
+/// together: two dependent flags whose outputs share one file per fragment.
 async fn sibling_outputs() -> (Dataset, u32, u32, Vec<DataReplacementGroup>) {
     let mut dataset = articles(false).await;
     let keywords = ArrowSchema::new(vec![ArrowField::new("keywords", DataType::Utf8, true)]);
@@ -1461,19 +1564,25 @@ async fn sibling_outputs() -> (Dataset, u32, u32, Vec<DataReplacementGroup>) {
         .await
         .unwrap()
         .flag_id;
+    let staged = stage_siblings(&dataset, "").await;
+    (dataset, summary, keywords, staged)
+}
+
+/// One file per fragment holding `{prefix}{column}-{fragment}-{offset}`.
+async fn stage_siblings(dataset: &Dataset, prefix: &str) -> Vec<DataReplacementGroup> {
     let mut staged = Vec::new();
     for fragment_id in [0, 1] {
         staged.push(
             stage_rows(
-                &dataset,
+                dataset,
                 fragment_id,
                 &["summary", "keywords"],
-                |column, offset| Some(format!("{column}-{fragment_id}-{offset}")),
+                |column, offset| Some(format!("{prefix}{column}-{fragment_id}-{offset}")),
             )
             .await,
         );
     }
-    (dataset, summary, keywords, staged)
+    staged
 }
 
 fn both(summary: u32, keywords: u32, rows: RowAddrTreeMap) -> Vec<CellFlagUpdate> {
@@ -1517,9 +1626,26 @@ async fn test_rejected_publication_exposes_nothing() {
     }
 }
 
+/// With `is_recompute`, both outputs are already published and the refresh
+/// recomputes them. Id 3's recomputed keywords is then installed over a
+/// published value it no longer assigns, so keywords must be cleared there.
+#[rstest]
 #[tokio::test]
-async fn test_stale_row_defers_every_sibling_output() {
-    let (dataset, summary, keywords, staged) = sibling_outputs().await;
+async fn test_stale_row_defers_every_sibling_output(#[values(false, true)] is_recompute: bool) {
+    let (mut dataset, summary, keywords, mut staged) = sibling_outputs().await;
+    let prefix = if is_recompute { "re-" } else { "" };
+    if is_recompute {
+        dataset = publish(
+            &dataset,
+            staged,
+            both(summary, keywords, full(&[0, 1])),
+            Reject,
+        )
+        .await
+        .unwrap()
+        .dataset;
+        staged = stage_siblings(&dataset, prefix).await;
+    }
     // Clears only summary on id 3, the first row of fragment 1.
     let clear = TransactionBuilder::new(dataset.version().version, update_config())
         .cell_flag_changes(CellFlagChanges {
@@ -1562,9 +1688,9 @@ async fn test_stale_row_defers_every_sibling_output() {
         assert_eq!(
             published_values(&result.dataset, column, flag_id).await,
             values(&[
-                (1, Some(&format!("{column}-0-0"))),
-                (2, Some(&format!("{column}-0-1"))),
-                (4, Some(&format!("{column}-1-1"))),
+                (1, Some(&format!("{prefix}{column}-0-0"))),
+                (2, Some(&format!("{prefix}{column}-0-1"))),
+                (4, Some(&format!("{prefix}{column}-1-1"))),
             ])
         );
     }

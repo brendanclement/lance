@@ -573,15 +573,18 @@ impl<'a> CommitBuilder<'a> {
             report.record_commit(manifest.version, &transaction);
         }
 
-        info!(
-            target: TRACE_DATASET_EVENTS,
-            event=DATASET_COMMITTED_EVENT,
-            uri=dest.uri(),
-            read_version=transaction.read_version,
-            committed_version=manifest.version,
-            detached=self.detached,
-            operation=&transaction.operation.name()
-        );
+        // A publication that deferred every group committed nothing.
+        if report.committed_version.is_some() {
+            info!(
+                target: TRACE_DATASET_EVENTS,
+                event=DATASET_COMMITTED_EVENT,
+                uri=dest.uri(),
+                read_version=transaction.read_version,
+                committed_version=manifest.version,
+                detached=self.detached,
+                operation=&transaction.operation.name()
+            );
+        }
 
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 

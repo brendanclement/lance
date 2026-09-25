@@ -2,36 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! What a publication committed and what it deferred.
-//!
-//! A *publication* is a `DataReplacement` that sets dependent cell flags true:
-//! a refresh that read a snapshot, computed the flags' outputs, staged one
-//! full-fragment file per fragment (a *group*) and assigns the rows it
-//! computed. Every row of a replaced fragment it does not assign must be
-//! copied unchanged from that snapshot, as read through Lance; Lance treats
-//! those rows as logically unchanged when it derives invalidations, and as
-//! physically written when it checks conflicts. At commit, every transaction
-//! since the read version is checked:
-//!
-//! ```text
-//! concurrent change                               Reject      Skip
-//! drops or replaces a published flag              error       error
-//! invalidates assigned rows (input written)       retryable   rows deferred (InputChanged)
-//! deletes assigned rows                           rows deferred (RowVacated)
-//! moves assigned rows (row-moving update)         retryable   rows deferred (RowVacated)
-//! publishes on a group's fragment and fields      retryable   group deferred (NewerResult)
-//! writes a group's fields on its fragment         retryable   group deferred (OutputWritten)
-//! removes a group's fragment                      error       group deferred (FragmentRemoved)
-//! compacts a group's fragment                     retryable   group deferred (FragmentRewritten)
-//! merge, overwrite, restore, dropping or indexing
-//!   a replaced field, MemWAL state updates        error       error
-//! ```
-//!
-//! A group whose rows are deferred still installs its file: the stale values
-//! stay stored under a false flag. A deferred group installs nothing, and its
-//! staged file stays on storage for the caller to reuse. Rows whose inputs
-//! changed are reported as deferred rows whether or not their group was
-//! installed, so [`PublicationReport::reusable_rows`] is exactly the staged
-//! work that is still correct.
 
 use std::sync::Arc;
 
@@ -60,7 +30,9 @@ pub enum DependencyConflictPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DeferralReason {
     /// A field the flag watches was written on the row, or the flag was
-    /// cleared there, after the read version. The row must be recomputed.
+    /// cleared there, after the read version. Also reported for the other
+    /// flags whose outputs the same file writes, which publish together. The
+    /// row must be recomputed.
     InputChanged,
     /// The row was deleted, or moved to a new address by a row-moving update,
     /// after the read version. Its old address no longer holds a live row.
@@ -112,6 +84,37 @@ pub struct DeferredGroup {
 
 /// The outcome of committing a transaction through
 /// [`CommitBuilder::execute_with_report`](crate::dataset::CommitBuilder::execute_with_report).
+///
+/// A *publication* is a `DataReplacement` that sets dependent cell flags true:
+/// a refresh that read a snapshot, computed the flags' outputs, staged one
+/// full-fragment file per fragment (a *group*) and assigns the rows it
+/// computed. Every row of a replaced fragment that it does not assign must be
+/// copied unchanged from the read snapshot, as read through Lance. Lance
+/// treats those rows as logically unchanged for invalidation, and as
+/// physically written for conflict detection. At commit, every transaction
+/// since the read version is checked:
+///
+/// ```text
+/// concurrent change                               Reject      Skip
+/// drops or replaces a published flag              error       error
+/// invalidates assigned rows (input written)       retryable   rows deferred (InputChanged)
+/// deletes assigned rows                           rows deferred (RowVacated)
+/// moves assigned rows (row-moving update)         retryable   rows deferred (RowVacated)
+/// publishes on a group's fragment and fields      retryable   group deferred (NewerResult)
+/// writes a group's fields on its fragment         retryable   group deferred (OutputWritten)
+/// removes a group's fragment                      error       group deferred (FragmentRemoved)
+/// compacts a group's fragment                     retryable   group deferred (FragmentRewritten)
+/// merge, overwrite, restore, dropping or indexing
+///   a replaced field, MemWAL state updates        error       error
+/// ```
+///
+/// A row deferred for one flag is deferred for every flag whose output its
+/// group's file writes. A group whose rows are deferred still installs its
+/// file: the stale values stay stored under a false flag. A deferred group
+/// installs nothing, and its staged file stays on storage for the caller to
+/// reuse. Rows whose inputs changed are reported as deferred rows whether or
+/// not their group was installed, so [`Self::reusable_rows`] is exactly the
+/// staged work that is still correct.
 ///
 /// Deferrals accumulate across commit retries. A follow-up refresh of the
 /// deferred work must read at `committed_version`, or at `checked_version`
@@ -279,7 +282,7 @@ fn union_of(updates: &[CellFlagUpdate], flag_id: u32) -> RowAddrTreeMap {
 /// Rows `transaction` clears `flag_id` on, explicitly or through the clears
 /// its writes imply. A publication that assigns any of them computed them from
 /// inputs that have since changed.
-pub(crate) fn invalidated_rows(transaction: &Transaction, flag_id: u32) -> RowAddrTreeMap {
+pub fn invalidated_rows(transaction: &Transaction, flag_id: u32) -> RowAddrTreeMap {
     let mut rows = RowAddrTreeMap::new();
     let Some(changes) = transaction.cell_flag_changes.as_deref() else {
         return rows;
@@ -297,9 +300,9 @@ pub(crate) fn invalidated_rows(transaction: &Transaction, flag_id: u32) -> RowAd
 
 /// What one commit attempt's rebase deferred.
 #[derive(Debug, Default)]
-pub(crate) struct PublicationDeferrals {
-    pub(crate) rows: Vec<DeferredRows>,
-    pub(crate) groups: Vec<DeferredGroup>,
+pub struct PublicationDeferrals {
+    pub rows: Vec<DeferredRows>,
+    pub groups: Vec<DeferredGroup>,
 }
 
 /// A commit through

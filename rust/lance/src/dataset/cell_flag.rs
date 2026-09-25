@@ -19,7 +19,13 @@
 //! and carries a [`CellFlagUpdate`](crate::dataset::transaction::CellFlagUpdate)
 //! setting it, committed through [`CommitBuilder`] with the version the
 //! values were computed from as its read version; the flag must already be
-//! registered there. A flag without sources is *ordinary*: only explicit
+//! registered there. In such a publication, every row of a replaced fragment
+//! that the transaction does not assign must be copied unchanged from the
+//! read snapshot, as read through Lance. Lance treats those rows as logically
+//! unchanged for invalidation, and as physically written for conflict
+//! detection, so an incremental refresh keeps the rows an earlier one
+//! completed. [`PublicationReport`] describes how concurrent transactions are
+//! checked. A flag without sources is *ordinary*: only explicit
 //! updates change it, and a row-moving update keeps its state only for the
 //! rows it lists in `moved_rows`.
 

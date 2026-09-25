@@ -14,6 +14,13 @@ use roaring::RoaringBitmap;
 use crate::format::CellFlagRegistry;
 
 /// Set a flag to `value` for `rows`.
+///
+/// Setting a dependent flag true publishes its output, and needs a
+/// `DataReplacement` whose files write that output for the assigned
+/// fragments. Every row of a replaced fragment that the transaction does not
+/// assign must be copied unchanged from the read snapshot, as read through
+/// Lance. Lance treats those rows as logically unchanged for invalidation,
+/// and as physically written for conflict detection.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct CellFlagUpdate {
     pub flag_id: u32,
