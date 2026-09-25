@@ -17,7 +17,7 @@ use std::sync::Arc;
 use lance_core::{Error, Result};
 use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use lance_table::format::cell_flag::{field_label, fragment_key, top_level_ancestors};
-use lance_table::format::{DeletionFile, Fragment, Manifest};
+use lance_table::format::{CellFlagDefinition, DeletionFile, Fragment, Manifest};
 use lance_table::transaction::ensure_cell_flags_registered_at_read_version;
 use roaring::RoaringBitmap;
 
@@ -55,6 +55,9 @@ pub(super) struct Publication {
 struct PublishedFlag {
     label: String,
     mask_when_false: bool,
+    /// The flags the transaction also publishes whose outputs this flag
+    /// watches.
+    upstreams: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -122,18 +125,30 @@ impl Publication {
             return Ok(None);
         };
         let schema = &read_manifest.schema;
-        let flags: BTreeMap<u32, PublishedFlag> = changes
+        let definitions: BTreeMap<u32, &CellFlagDefinition> = changes
             .updates
             .iter()
             .filter(|update| update.value)
             .filter_map(|update| registry.definition(update.flag_id))
             .filter(|definition| definition.is_dependent())
-            .map(|definition| {
+            .map(|definition| (definition.flag_id, definition))
+            .collect();
+        let flags: BTreeMap<u32, PublishedFlag> = definitions
+            .iter()
+            .map(|(flag_id, definition)| {
+                let upstreams = definition
+                    .clear_on_write
+                    .iter()
+                    .filter_map(|source| registry.dependent_flag(*source))
+                    .filter(|upstream| definitions.contains_key(&upstream.flag_id))
+                    .map(|upstream| upstream.flag_id)
+                    .collect();
                 (
-                    definition.flag_id,
+                    *flag_id,
                     PublishedFlag {
                         label: definition.label(schema),
                         mask_when_false: definition.mask_when_false,
+                        upstreams,
                     },
                 )
             })
@@ -534,8 +549,9 @@ impl TransactionRebase<'_> {
     }
 
     /// Drop the deferred groups, and the rows that went stale or were vacated
-    /// from the assignments of every flag in their group, reporting both. The
-    /// read version is kept: the values were computed there.
+    /// from the assignments of every flag in their group, reporting both, and
+    /// which staged values of a deferred group stay reusable. The read version
+    /// is kept: the values were computed there.
     pub(super) async fn finish_publication(
         self,
         dataset: &Dataset,
@@ -612,6 +628,20 @@ impl TransactionRebase<'_> {
         for entries in removals.values_mut() {
             entries.sort_by_key(|(version, reason, _)| (*version, *reason));
         }
+        // Taken before the loop below trims them: a deferred file holds the
+        // values staged for every row its flags assign at this attempt.
+        let staged: BTreeMap<u32, RowAddrTreeMap> = publication
+            .flags
+            .keys()
+            .map(|flag_id| (*flag_id, assigned_rows(&transaction, *flag_id)))
+            .collect();
+        let staged_rows = |flag_id: u32| {
+            staged.get(&flag_id).ok_or_else(|| {
+                Error::internal(format!(
+                    "published cell flag {flag_id} has no assignment in the publication"
+                ))
+            })
+        };
 
         let changes = Arc::make_mut(
             transaction
@@ -628,17 +658,9 @@ impl TransactionRebase<'_> {
         let mut valid_rows: BTreeMap<u64, Vec<CellFlagUpdate>> = BTreeMap::new();
         let mut stale_clears = Vec::new();
         for (flag_id, flag) in &publication.flags {
-            let mut assigned = RowAddrTreeMap::new();
-            for update in changes
-                .updates
-                .iter()
-                .filter(|update| update.value && update.flag_id == *flag_id)
-            {
-                assigned |= &update.rows;
-            }
             let mut removed = RowAddrTreeMap::new();
             let mut input_changed = RowAddrTreeMap::new();
-            for (fragment, selection) in assigned.iter() {
+            for (fragment, selection) in staged_rows(*flag_id)?.iter() {
                 let fragment_id = u64::from(*fragment);
                 // Rows outside every group are refused when the commit applies them.
                 let Some(group) = publication.groups.get(&fragment_id) else {
@@ -646,7 +668,7 @@ impl TransactionRebase<'_> {
                 };
                 let deferral = deferred_files
                     .get(&fragment_id)
-                    .map(|(_, reason, _)| *reason);
+                    .map(|(_, reason, version)| (*reason, *version));
                 let mut remaining = materialize(selection, group.physical_rows);
                 let mut dropped = RoaringBitmap::new();
                 for (version, reason, rows) in removals.get(&fragment_id).into_iter().flatten() {
@@ -666,16 +688,43 @@ impl TransactionRebase<'_> {
                         conflicting_version: *version,
                     });
                 }
-                if let Some(reason) = deferral {
-                    if !reason.removes_fragment() && !remaining.is_empty() {
-                        valid_rows
-                            .entry(fragment_id)
-                            .or_default()
-                            .push(CellFlagUpdate {
+                if let Some((reason, conflicting_version)) = deferral {
+                    if !reason.removes_fragment() {
+                        // Values on rows an upstream assigns here were computed
+                        // from its staged value, which never committed.
+                        // Elsewhere the file holds the upstream's copied
+                        // snapshot value, and a later write or clear of the
+                        // upstream there clears this flag too (InputChanged),
+                        // so only direct upstreams matter, however long the
+                        // chain. TODO: a concurrent publication of both flags
+                        // on a row changes the upstream there without clearing
+                        // this flag, so the row stays valid.
+                        let mut from_staged_input = RoaringBitmap::new();
+                        for upstream in &flag.upstreams {
+                            if let Some(rows) = staged_rows(*upstream)?.get(fragment) {
+                                from_staged_input |= materialize(rows, group.physical_rows);
+                            }
+                        }
+                        from_staged_input &= &remaining;
+                        if !from_staged_input.is_empty() {
+                            remaining -= &from_staged_input;
+                            deferrals.rows.push(DeferredRows {
                                 flag_id: *flag_id,
-                                value: true,
-                                rows: fragment_rows(*fragment, remaining),
+                                rows: fragment_rows(*fragment, from_staged_input),
+                                reason: DeferralReason::UpstreamNotPublished,
+                                conflicting_version,
                             });
+                        }
+                        if !remaining.is_empty() {
+                            valid_rows
+                                .entry(fragment_id)
+                                .or_default()
+                                .push(CellFlagUpdate {
+                                    flag_id: *flag_id,
+                                    value: true,
+                                    rows: fragment_rows(*fragment, remaining),
+                                });
+                        }
                     }
                     removed.insert_fragment(*fragment);
                 } else {

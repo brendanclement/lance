@@ -23,7 +23,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ADDR};
 use lance_io::object_store::ObjectStore;
-use lance_select::{RowAddrTreeMap, RowSetOps};
+use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use lance_table::format::{IndexMetadata, Manifest, Transaction as TableTransaction};
 use lance_table::io::commit::{
     CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
@@ -50,7 +50,9 @@ use crate::dataset::write::{CommitBuilder, WriteParams};
 use crate::dataset::{DeleteBuilder, MergeInsertBuilder, MergeInsertWriteMode, UpdateBuilder};
 use crate::{Dataset, Result};
 
-use DeferralReason::{FragmentRemoved, InputChanged, NewerResult, RowVacated};
+use DeferralReason::{
+    FragmentRemoved, InputChanged, NewerResult, RowVacated, UpstreamNotPublished,
+};
 use DependencyConflictPolicy::{Reject, Skip};
 
 fn rows(entries: &[(u32, &[u32])]) -> RowAddrTreeMap {
@@ -1925,6 +1927,905 @@ async fn test_chained_outputs_published_together(#[values(false, true)] is_toget
         })
         .collect();
     assert_eq!(column_values(&dataset, "translation", None).await, expected);
+}
+
+/// `summary` computed from body and `translation` from summary.
+const CHAIN: [(&str, &str); 2] = [("summary", "body"), ("translation", "summary")];
+
+/// Two fragments of `fragment_rows` rows holding `id` and `body` (`b{id}`),
+/// and a masked output for each `(output, input)` of `outputs`, computed from
+/// that input with [`computed`].
+async fn computed_outputs(fragment_rows: i32, outputs: &[(&str, &str)]) -> Dataset {
+    let ids: Vec<i32> = (1..=2 * fragment_rows).collect();
+    let bodies = StringArray::from_iter_values(ids.iter().map(|id| format!("b{id}")));
+    let batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+        ("body", Arc::new(bodies) as ArrayRef),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: fragment_rows as usize,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let fields: Vec<ArrowField> = outputs
+        .iter()
+        .map(|(output, _)| ArrowField::new(*output, DataType::Utf8, true))
+        .collect();
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(fields))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    for (output, input) in outputs {
+        dataset
+            .register_cell_flag(
+                output,
+                "ready",
+                CellFlagOptions::default()
+                    .with_clear_on_write([*input])
+                    .with_mask_when_false(true),
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+}
+
+/// What `column` computes from its input as a masked read shows it.
+fn computed(column: &str, input: Option<&str>) -> String {
+    format!("{column}({})", input.unwrap_or("NULL"))
+}
+
+fn flag_of(dataset: &Dataset, column: &str) -> u32 {
+    dataset.cell_flag(column, "ready").unwrap().flag_id
+}
+
+fn input_of(dataset: &Dataset, column: &str) -> String {
+    let flag = dataset.cell_flag(column, "ready").unwrap();
+    let input = dataset
+        .schema()
+        .field_by_id(flag.clear_on_write[0])
+        .unwrap();
+    input.name.clone()
+}
+
+/// `column` of every live row of `dataset`, by row address.
+async fn values_by_addr(dataset: &Dataset, column: &str) -> BTreeMap<u64, Option<String>> {
+    let batch = dataset
+        .scan()
+        .project(&[column])
+        .unwrap()
+        .with_row_address()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let column_values = batch[column].as_string::<i32>();
+    let addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>();
+    (0..batch.num_rows())
+        .map(|row| {
+            let value = column_values
+                .is_valid(row)
+                .then(|| column_values.value(row).to_string());
+            (addrs.value(row), value)
+        })
+        .collect()
+}
+
+/// Values of assigned rows, by output and row address.
+type StagedValues = BTreeMap<(String, u64), Option<String>>;
+
+/// A refresh of computed outputs staged against one snapshot.
+#[derive(Default)]
+struct Refresh {
+    groups: Vec<DataReplacementGroup>,
+    assigned: BTreeMap<u32, RowAddrTreeMap>,
+    staged: StagedValues,
+}
+
+impl Refresh {
+    /// Stage one file on fragment `fragment_id` of `read` for `outputs`, in
+    /// dependency order with the offsets each assigns. An assigned offset
+    /// takes its value from `reused` when that holds one, and is otherwise
+    /// computed from its input as this file holds it, or as `read` shows it
+    /// when the file does not write the input. Other offsets are copied.
+    async fn stage(
+        &mut self,
+        read: &Dataset,
+        fragment_id: u32,
+        outputs: &[(&str, &[u32])],
+        reused: &StagedValues,
+    ) {
+        let fragment = read.get_fragment(fragment_id as usize).unwrap();
+        let physical_rows = fragment.physical_rows().await.unwrap() as u32;
+        let addr = |offset: u32| u64::from(RowAddress::new_from_parts(fragment_id, offset));
+        let mut file: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        for (column, offsets) in outputs {
+            let input = input_of(read, column);
+            let inputs = match file.get(&input) {
+                Some(inputs) => inputs.clone(),
+                None => {
+                    let shown = values_by_addr(read, &input).await;
+                    (0..physical_rows)
+                        .map(|offset| shown[&addr(offset)].clone())
+                        .collect()
+                }
+            };
+            let shown = values_by_addr(read, column).await;
+            let mut column_values = Vec::new();
+            for offset in 0..physical_rows {
+                let key = (column.to_string(), addr(offset));
+                let value = if offsets.contains(&offset) {
+                    let value = reused.get(&key).cloned().unwrap_or_else(|| {
+                        Some(computed(column, inputs[offset as usize].as_deref()))
+                    });
+                    self.staged.insert(key, value.clone());
+                    value
+                } else {
+                    shown[&addr(offset)].clone()
+                };
+                column_values.push(value);
+            }
+            file.insert(column.to_string(), column_values);
+
+            let mut rows = RowAddrTreeMap::new();
+            if offsets.len() == physical_rows as usize {
+                rows.insert_fragment(fragment_id);
+            } else {
+                rows.insert_bitmap(fragment_id, offsets.iter().copied().collect());
+            }
+            *self.assigned.entry(flag_of(read, column)).or_default() |= &rows;
+        }
+        let columns: Vec<&str> = outputs.iter().map(|(column, _)| *column).collect();
+        let group = stage_rows(read, u64::from(fragment_id), &columns, |column, offset| {
+            file[column][offset as usize].clone()
+        })
+        .await;
+        self.groups.push(group);
+    }
+
+    fn updates(&self) -> Vec<CellFlagUpdate> {
+        self.assigned
+            .iter()
+            .map(|(flag_id, rows)| published(*flag_id, rows.clone()))
+            .collect()
+    }
+
+    fn transaction(&self, read: &Dataset) -> Transaction {
+        replacement_txn(read.version().version, self.groups.clone(), self.updates())
+    }
+
+    async fn publish(
+        &self,
+        read: &Dataset,
+        policy: DependencyConflictPolicy,
+    ) -> Result<PublicationResult> {
+        publish(read, self.groups.clone(), self.updates(), policy).await
+    }
+
+    /// The staged values `report` lists as reusable.
+    fn reusable(&self, report: &PublicationReport, dataset: &Dataset) -> StagedValues {
+        self.staged
+            .iter()
+            .filter(|((column, addr), _)| {
+                report
+                    .reusable_rows(flag_of(dataset, column))
+                    .contains(*addr)
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Every row this refresh assigned is reported once: published, deferred
+    /// or valid in a deferred group.
+    fn assert_report_accounts_for_every_row(&self, read: &Dataset, report: &PublicationReport) {
+        let addrs = |rows: &RowAddrTreeMap| -> Vec<u64> {
+            let mut addrs = Vec::new();
+            for (fragment, selection) in rows.iter() {
+                let offsets: Vec<u32> = match selection {
+                    RowAddrSelection::Full => {
+                        let fragment = read.get_fragment(*fragment as usize).unwrap();
+                        (0..fragment.metadata().physical_rows.unwrap() as u32).collect()
+                    }
+                    RowAddrSelection::Partial(offsets) => offsets.iter().collect(),
+                };
+                addrs.extend(
+                    offsets
+                        .into_iter()
+                        .map(|offset| u64::from(RowAddress::new_from_parts(*fragment, offset))),
+                );
+            }
+            addrs
+        };
+        for (flag_id, assigned) in &self.assigned {
+            let published = report.published_rows(*flag_id);
+            let deferred = report
+                .deferred_rows
+                .iter()
+                .filter(|deferred| deferred.flag_id == *flag_id)
+                .map(|deferred| &deferred.rows);
+            let valid = report
+                .deferred_groups
+                .iter()
+                .flat_map(|group| &group.valid_rows)
+                .filter(|valid| valid.flag_id == *flag_id)
+                .map(|valid| &valid.rows);
+            let mut reported = BTreeSet::new();
+            for addr in std::iter::once(&published)
+                .chain(deferred)
+                .chain(valid)
+                .flat_map(addrs)
+            {
+                assert!(
+                    reported.insert(addr),
+                    "flag {flag_id} reports row {addr:#x} twice"
+                );
+            }
+            let assigned: BTreeSet<u64> = addrs(assigned).into_iter().collect();
+            assert_eq!(reported, assigned, "flag {flag_id}");
+        }
+    }
+
+    /// Every staged value `report` lists as reusable is what its output
+    /// computes from its input as `head` shows it.
+    async fn assert_reusable_values_follow_inputs(
+        &self,
+        head: &Dataset,
+        report: &PublicationReport,
+    ) {
+        let mut inputs: BTreeMap<String, BTreeMap<u64, Option<String>>> = BTreeMap::new();
+        for ((column, addr), value) in self.reusable(report, head) {
+            let input = input_of(head, &column);
+            if !inputs.contains_key(&input) {
+                let shown = values_by_addr(head, &input).await;
+                inputs.insert(input.clone(), shown);
+            }
+            let expected = computed(&column, inputs[&input][&addr].as_deref());
+            assert_eq!(
+                value.as_deref(),
+                Some(expected.as_str()),
+                "reusable {column} at row {addr:#x}"
+            );
+        }
+    }
+}
+
+/// Summary and the translation computed from it are staged in one file, and a
+/// concurrent translation of id 1 defers that file. Its translations were
+/// computed from summaries that never committed, so they are deferred for
+/// recomputation, while its summaries stay reusable. A follow-up that follows
+/// the report, translating alone or after republishing the reusable
+/// summaries, leaves every translation computed from the committed summary.
+#[rstest]
+#[tokio::test]
+async fn test_deferred_group_recomputes_outputs_of_its_staged_upstream(
+    #[values(false, true)] is_summary_republished: bool,
+) {
+    let read = computed_outputs(2, &CHAIN).await;
+    let (summary, translation) = (flag_of(&read, "summary"), flag_of(&read, "translation"));
+    let mut refresh = Refresh::default();
+    for fragment_id in [0, 1] {
+        let outputs: [(&str, &[u32]); 2] = [("summary", &[0, 1]), ("translation", &[0, 1])];
+        refresh
+            .stage(&read, fragment_id, &outputs, &StagedValues::new())
+            .await;
+    }
+    let mut competitor = Refresh::default();
+    competitor
+        .stage(&read, 0, &[("translation", &[0])], &StagedValues::new())
+        .await;
+    let competed_at = competitor
+        .publish(&read, Reject)
+        .await
+        .unwrap()
+        .dataset
+        .version()
+        .version;
+
+    let result = refresh.publish(&read, Skip).await.unwrap();
+    let report = &result.report;
+    assert_eq!(
+        *report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version: competed_at,
+            committed_version: Some(competed_at + 1),
+            published: vec![
+                published(summary, full(&[1])),
+                published(translation, full(&[1]))
+            ],
+            deferred_rows: vec![deferred(
+                translation,
+                rows(&[(0, &[0, 1])]),
+                UpstreamNotPublished,
+                competed_at
+            )],
+            deferred_groups: vec![DeferredGroup {
+                fragment_id: 0,
+                data_file: refresh.groups[0].1.clone(),
+                reason: NewerResult,
+                conflicting_version: competed_at,
+                valid_rows: vec![published(summary, rows(&[(0, &[0, 1])]))],
+            }],
+        }
+    );
+    assert_eq!(
+        report.reusable_rows(summary),
+        with_full(rows(&[(0, &[0, 1])]), 1)
+    );
+    assert_eq!(report.reusable_rows(translation), full(&[1]));
+    refresh.assert_report_accounts_for_every_row(&read, report);
+    refresh
+        .assert_reusable_values_follow_inputs(&result.dataset, report)
+        .await;
+    let mut head = result.dataset.clone();
+    assert_eq!(head.cell_flag_true_rows(summary).unwrap(), full(&[1]));
+    assert_eq!(
+        head.cell_flag_true_rows(translation).unwrap(),
+        with_full(rows(&[(0, &[0])]), 1)
+    );
+    assert_eq!(
+        column_values(&head, "translation", None).await,
+        values(&[
+            (1, Some("translation(NULL)")),
+            (2, None),
+            (3, Some("translation(summary(b3))")),
+            (4, Some("translation(summary(b4))")),
+        ])
+    );
+
+    // Fragment 0's work: reuse what is reusable, recompute what is deferred
+    // from the snapshot each step reads.
+    let offsets = |rows: RowAddrTreeMap| -> Vec<u32> {
+        rows.get_fragment_bitmap(0).unwrap().iter().collect()
+    };
+    if is_summary_republished {
+        let summaries = offsets(report.reusable_rows(summary));
+        let mut summarize = Refresh::default();
+        summarize
+            .stage(
+                &head,
+                0,
+                &[("summary", &summaries)],
+                &refresh.reusable(report, &head),
+            )
+            .await;
+        head = summarize.publish(&head, Reject).await.unwrap().dataset;
+        // Published alone, summary clears the translation computed from it.
+        assert_eq!(head.cell_flag_true_rows(translation).unwrap(), full(&[1]));
+    }
+    let translations = offsets(report.deferred_rows_of(translation, UpstreamNotPublished));
+    let mut translate = Refresh::default();
+    translate
+        .stage(
+            &head,
+            0,
+            &[("translation", &translations)],
+            &refresh.reusable(report, &head),
+        )
+        .await;
+    let done = translate.publish(&head, Reject).await.unwrap().dataset;
+
+    let summary_rows = if is_summary_republished {
+        full(&[0, 1])
+    } else {
+        full(&[1])
+    };
+    assert_eq!(done.cell_flag_true_rows(summary).unwrap(), summary_rows);
+    assert_eq!(
+        done.cell_flag_true_rows(translation).unwrap(),
+        full(&[0, 1])
+    );
+    let summaries = column_values(&done, "summary", None).await;
+    let fragment_0 = if is_summary_republished {
+        [Some("summary(b1)"), Some("summary(b2)")]
+    } else {
+        [None, None]
+    };
+    assert_eq!(
+        summaries[..2],
+        values(&[(1, fragment_0[0]), (2, fragment_0[1])])
+    );
+    let expected: Vec<(i32, Option<String>)> = summaries
+        .into_iter()
+        .map(|(id, summary)| (id, Some(computed("translation", summary.as_deref()))))
+        .collect();
+    assert_eq!(column_values(&done, "translation", None).await, expected);
+}
+
+/// Summary is assigned on ids 1 and 2, translation on ids 2 and 3: only id 2's
+/// translation was computed from a staged summary. Id 3's was computed from
+/// the published summary the file copies, and stays reusable.
+#[tokio::test]
+async fn test_deferred_group_defers_only_rows_its_upstream_assigns() {
+    let dataset = computed_outputs(3, &CHAIN).await;
+    let (summary, translation) = (
+        flag_of(&dataset, "summary"),
+        flag_of(&dataset, "translation"),
+    );
+    let mut first = Refresh::default();
+    for fragment_id in [0, 1] {
+        first
+            .stage(
+                &dataset,
+                fragment_id,
+                &[("summary", &[0, 1, 2])],
+                &StagedValues::new(),
+            )
+            .await;
+    }
+    let summarized = first.publish(&dataset, Reject).await.unwrap().dataset;
+    let written = merge_insert_body(&summarized, 1, "new1").await;
+    let read = merge_insert_body(&written, 2, "new2").await;
+    assert_eq!(
+        read.cell_flag_true_rows(summary).unwrap(),
+        with_full(rows(&[(0, &[2])]), 1)
+    );
+
+    let mut refresh = Refresh::default();
+    let outputs: [(&str, &[u32]); 2] = [("summary", &[0, 1]), ("translation", &[1, 2])];
+    refresh
+        .stage(&read, 0, &outputs, &StagedValues::new())
+        .await;
+    refresh
+        .stage(
+            &read,
+            1,
+            &[("translation", &[0, 1, 2])],
+            &StagedValues::new(),
+        )
+        .await;
+    let mut competitor = Refresh::default();
+    competitor
+        .stage(&read, 0, &[("translation", &[0])], &StagedValues::new())
+        .await;
+    let competed_at = competitor
+        .publish(&read, Reject)
+        .await
+        .unwrap()
+        .dataset
+        .version()
+        .version;
+
+    let result = refresh.publish(&read, Skip).await.unwrap();
+    let report = &result.report;
+    assert_eq!(
+        *report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version: competed_at,
+            committed_version: Some(competed_at + 1),
+            published: vec![published(translation, full(&[1]))],
+            deferred_rows: vec![deferred(
+                translation,
+                rows(&[(0, &[1])]),
+                UpstreamNotPublished,
+                competed_at
+            )],
+            deferred_groups: vec![DeferredGroup {
+                fragment_id: 0,
+                data_file: refresh.groups[0].1.clone(),
+                reason: NewerResult,
+                conflicting_version: competed_at,
+                valid_rows: vec![
+                    published(summary, rows(&[(0, &[0, 1])])),
+                    published(translation, rows(&[(0, &[2])])),
+                ],
+            }],
+        }
+    );
+    assert_eq!(report.reusable_rows(summary), rows(&[(0, &[0, 1])]));
+    assert_eq!(
+        report.reusable_rows(translation),
+        with_full(rows(&[(0, &[2])]), 1)
+    );
+    refresh.assert_report_accounts_for_every_row(&read, report);
+    refresh
+        .assert_reusable_values_follow_inputs(&result.dataset, report)
+        .await;
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(summary).unwrap(),
+        with_full(rows(&[(0, &[2])]), 1)
+    );
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(translation).unwrap(),
+        with_full(rows(&[(0, &[0])]), 1)
+    );
+    assert_eq!(
+        column_values(&result.dataset, "summary", None).await,
+        values(&[
+            (1, None),
+            (2, None),
+            (3, Some("summary(b3)")),
+            (4, Some("summary(b4)")),
+            (5, Some("summary(b5)")),
+            (6, Some("summary(b6)")),
+        ])
+    );
+    assert_eq!(
+        column_values(&result.dataset, "translation", None).await,
+        values(&[
+            (1, Some("translation(NULL)")),
+            (2, None),
+            (3, None),
+            (4, Some("translation(summary(b4))")),
+            (5, Some("translation(summary(b5))")),
+            (6, Some("translation(summary(b6))")),
+        ])
+    );
+}
+
+/// Summary, translation (from summary) and keywords (from translation) staged
+/// in one file: each output's rows where its direct upstream is assigned are
+/// deferred. Id 1's keywords was computed from the translation the file
+/// copies, though its summary is staged, and stays reusable.
+#[tokio::test]
+async fn test_deferred_group_defers_each_link_of_a_chain() {
+    let read = computed_outputs(
+        3,
+        &[
+            ("summary", "body"),
+            ("translation", "summary"),
+            ("keywords", "translation"),
+        ],
+    )
+    .await;
+    let [summary, translation, keywords] =
+        ["summary", "translation", "keywords"].map(|column| flag_of(&read, column));
+    let mut refresh = Refresh::default();
+    let outputs: [(&str, &[u32]); 3] = [
+        ("summary", &[0, 1]),
+        ("translation", &[1, 2]),
+        ("keywords", &[0, 2]),
+    ];
+    refresh
+        .stage(&read, 0, &outputs, &StagedValues::new())
+        .await;
+    let outputs: [(&str, &[u32]); 3] = [
+        ("summary", &[0, 1, 2]),
+        ("translation", &[0, 1, 2]),
+        ("keywords", &[0, 1, 2]),
+    ];
+    refresh
+        .stage(&read, 1, &outputs, &StagedValues::new())
+        .await;
+    let mut competitor = Refresh::default();
+    competitor
+        .stage(&read, 0, &[("keywords", &[1])], &StagedValues::new())
+        .await;
+    let competed_at = competitor
+        .publish(&read, Reject)
+        .await
+        .unwrap()
+        .dataset
+        .version()
+        .version;
+
+    let result = refresh.publish(&read, Skip).await.unwrap();
+    let report = &result.report;
+    assert_eq!(
+        *report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version: competed_at,
+            committed_version: Some(competed_at + 1),
+            published: [summary, translation, keywords]
+                .map(|flag_id| published(flag_id, full(&[1])))
+                .to_vec(),
+            deferred_rows: vec![
+                deferred(
+                    translation,
+                    rows(&[(0, &[1])]),
+                    UpstreamNotPublished,
+                    competed_at
+                ),
+                deferred(
+                    keywords,
+                    rows(&[(0, &[2])]),
+                    UpstreamNotPublished,
+                    competed_at
+                ),
+            ],
+            deferred_groups: vec![DeferredGroup {
+                fragment_id: 0,
+                data_file: refresh.groups[0].1.clone(),
+                reason: NewerResult,
+                conflicting_version: competed_at,
+                valid_rows: vec![
+                    published(summary, rows(&[(0, &[0, 1])])),
+                    published(translation, rows(&[(0, &[2])])),
+                    published(keywords, rows(&[(0, &[0])])),
+                ],
+            }],
+        }
+    );
+    for (flag_id, valid) in [
+        (summary, &[0, 1][..]),
+        (translation, &[2]),
+        (keywords, &[0]),
+    ] {
+        assert_eq!(
+            report.reusable_rows(flag_id),
+            with_full(rows(&[(0, valid)]), 1)
+        );
+    }
+    refresh.assert_report_accounts_for_every_row(&read, report);
+    refresh
+        .assert_reusable_values_follow_inputs(&result.dataset, report)
+        .await;
+    for flag_id in [summary, translation] {
+        assert_eq!(
+            result.dataset.cell_flag_true_rows(flag_id).unwrap(),
+            full(&[1])
+        );
+    }
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(keywords).unwrap(),
+        with_full(rows(&[(0, &[1])]), 1)
+    );
+    assert_eq!(
+        column_values(&result.dataset, "translation", None).await,
+        values(&[
+            (1, None),
+            (2, None),
+            (3, None),
+            (4, Some("translation(summary(b4))")),
+            (5, Some("translation(summary(b5))")),
+            (6, Some("translation(summary(b6))")),
+        ])
+    );
+    assert_eq!(
+        column_values(&result.dataset, "keywords", None).await,
+        values(&[
+            (1, None),
+            (2, Some("keywords(NULL)")),
+            (3, None),
+            (4, Some("keywords(translation(summary(b4)))")),
+            (5, Some("keywords(translation(summary(b5)))")),
+            (6, Some("keywords(translation(summary(b6)))")),
+        ])
+    );
+}
+
+/// What reaches fragment 0 while the publication's first attempt writes its
+/// manifest, so that only its retry sees it.
+#[derive(Debug, Clone, Copy)]
+enum DuringRetry {
+    /// A translation of id 1 that defers the group, which the first attempt
+    /// installed without id 2, whose body had changed.
+    Deferral,
+    /// A new body for id 2, after the first attempt deferred the group to a
+    /// translation of id 1.
+    BodyWrite,
+}
+
+/// However the attempts split the conflicts, the final report defers the
+/// translations computed from staged summaries, reports each row once and
+/// leaves nothing chained reusable.
+#[rstest]
+#[case::deferral(DuringRetry::Deferral)]
+#[case::body_write(DuringRetry::BodyWrite)]
+#[tokio::test]
+async fn test_retry_keeps_chained_outputs_of_a_deferred_group_unreusable(
+    #[case] during_retry: DuringRetry,
+) {
+    let read = computed_outputs(2, &CHAIN).await;
+    let (summary, translation) = (flag_of(&read, "summary"), flag_of(&read, "translation"));
+    let mut refresh = Refresh::default();
+    for fragment_id in [0, 1] {
+        let outputs: [(&str, &[u32]); 2] = [("summary", &[0, 1]), ("translation", &[0, 1])];
+        refresh
+            .stage(&read, fragment_id, &outputs, &StagedValues::new())
+            .await;
+    }
+    let translate_id_1 = async |dataset: &Dataset| {
+        let mut competitor = Refresh::default();
+        competitor
+            .stage(dataset, 0, &[("translation", &[0])], &StagedValues::new())
+            .await;
+        competitor.transaction(dataset)
+    };
+    let (competitor_read, competitor, written_at, translated_at) = match during_retry {
+        DuringRetry::Deferral => {
+            let written = merge_insert_body(&read, 2, "new").await;
+            let written_at = written.version().version;
+            let publication = translate_id_1(&written).await;
+            (written, publication, written_at, written_at + 1)
+        }
+        DuringRetry::BodyWrite => {
+            let translated = CommitBuilder::new(Arc::new(read.clone()))
+                .execute(translate_id_1(&read).await)
+                .await
+                .unwrap();
+            let translated_at = translated.version().version;
+            let source = record_batch!(("id", Int32, [2]), ("body", Utf8, ["new"])).unwrap();
+            let write =
+                MergeInsertBuilder::try_new(Arc::new(translated.clone()), vec!["id".into()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .write_mode(MergeInsertWriteMode::RewriteColumns)
+                    .try_build()
+                    .unwrap()
+                    .execute_uncommitted_batches(vec![source])
+                    .await
+                    .unwrap()
+                    .transaction;
+            (translated, write, translated_at + 1, translated_at)
+        }
+    };
+    let handler = Arc::new(CommitsCompetitorFirst {
+        inner: read.commit_handler.clone(),
+        competitor: Mutex::new(Some((Arc::new(competitor_read), competitor))),
+    });
+
+    let result = CommitBuilder::new(Arc::new(read.clone()))
+        .with_commit_handler(handler.clone())
+        .with_dependency_conflict_policy(Skip)
+        .execute_with_report(refresh.transaction(&read))
+        .await
+        .unwrap();
+    assert!(handler.competitor.lock().unwrap().is_none());
+    let report = &result.report;
+    let checked_version = written_at.max(translated_at);
+    // Either the first attempt drops id 2, whose body changed, and the retry
+    // defers the group, or the first attempt defers the group and the retry
+    // finds id 2's summary stale among its valid rows.
+    let mut deferred_rows = vec![deferred(
+        summary,
+        rows(&[(0, &[1])]),
+        InputChanged,
+        written_at,
+    )];
+    deferred_rows.extend(match during_retry {
+        DuringRetry::Deferral => vec![
+            deferred(translation, rows(&[(0, &[1])]), InputChanged, written_at),
+            deferred(
+                translation,
+                rows(&[(0, &[0])]),
+                UpstreamNotPublished,
+                translated_at,
+            ),
+        ],
+        DuringRetry::BodyWrite => vec![deferred(
+            translation,
+            rows(&[(0, &[0, 1])]),
+            UpstreamNotPublished,
+            translated_at,
+        )],
+    });
+    assert_eq!(
+        *report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version,
+            committed_version: Some(checked_version + 1),
+            published: vec![
+                published(summary, full(&[1])),
+                published(translation, full(&[1]))
+            ],
+            deferred_rows,
+            deferred_groups: vec![DeferredGroup {
+                fragment_id: 0,
+                data_file: refresh.groups[0].1.clone(),
+                reason: NewerResult,
+                conflicting_version: translated_at,
+                valid_rows: vec![published(summary, rows(&[(0, &[0])]))],
+            }],
+        }
+    );
+    assert_eq!(
+        report.reusable_rows(summary),
+        with_full(rows(&[(0, &[0])]), 1)
+    );
+    assert_eq!(report.reusable_rows(translation), full(&[1]));
+    refresh.assert_report_accounts_for_every_row(&read, report);
+    refresh
+        .assert_reusable_values_follow_inputs(&result.dataset, report)
+        .await;
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(summary).unwrap(),
+        full(&[1])
+    );
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(translation).unwrap(),
+        with_full(rows(&[(0, &[0])]), 1)
+    );
+    assert_eq!(
+        column_values(&result.dataset, "translation", None).await,
+        values(&[
+            (1, Some("translation(NULL)")),
+            (2, None),
+            (3, Some("translation(summary(b3))")),
+            (4, Some("translation(summary(b4))")),
+        ])
+    );
+    assert_eq!(
+        column_values(&result.dataset, "body", None).await[1],
+        (2, Some("new".to_string()))
+    );
+}
+
+/// Summary and keywords, both computed from body and neither from the other,
+/// share a file that a concurrent keywords result defers: both stay reusable.
+#[tokio::test]
+async fn test_deferred_group_keeps_independent_outputs_reusable() {
+    let read = computed_outputs(2, &[("summary", "body"), ("keywords", "body")]).await;
+    let (summary, keywords) = (flag_of(&read, "summary"), flag_of(&read, "keywords"));
+    let mut refresh = Refresh::default();
+    for fragment_id in [0, 1] {
+        let outputs: [(&str, &[u32]); 2] = [("summary", &[0, 1]), ("keywords", &[0, 1])];
+        refresh
+            .stage(&read, fragment_id, &outputs, &StagedValues::new())
+            .await;
+    }
+    let mut competitor = Refresh::default();
+    competitor
+        .stage(&read, 0, &[("keywords", &[0])], &StagedValues::new())
+        .await;
+    let competed_at = competitor
+        .publish(&read, Reject)
+        .await
+        .unwrap()
+        .dataset
+        .version()
+        .version;
+
+    let result = refresh.publish(&read, Skip).await.unwrap();
+    let report = &result.report;
+    assert_eq!(
+        *report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version: competed_at,
+            committed_version: Some(competed_at + 1),
+            published: both(summary, keywords, full(&[1])),
+            deferred_rows: vec![],
+            deferred_groups: vec![DeferredGroup {
+                fragment_id: 0,
+                data_file: refresh.groups[0].1.clone(),
+                reason: NewerResult,
+                conflicting_version: competed_at,
+                valid_rows: both(summary, keywords, rows(&[(0, &[0, 1])])),
+            }],
+        }
+    );
+    for flag_id in [summary, keywords] {
+        assert_eq!(
+            report.reusable_rows(flag_id),
+            with_full(rows(&[(0, &[0, 1])]), 1)
+        );
+    }
+    refresh.assert_report_accounts_for_every_row(&read, report);
+    refresh
+        .assert_reusable_values_follow_inputs(&result.dataset, report)
+        .await;
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(summary).unwrap(),
+        full(&[1])
+    );
+    assert_eq!(
+        result.dataset.cell_flag_true_rows(keywords).unwrap(),
+        with_full(rows(&[(0, &[0])]), 1)
+    );
+    assert_eq!(
+        column_values(&result.dataset, "keywords", None).await,
+        values(&[
+            (1, Some("keywords(b1)")),
+            (2, None),
+            (3, Some("keywords(b3)")),
+            (4, Some("keywords(b4)")),
+        ])
+    );
 }
 
 /// `summary` (from title and body) and `keywords` (from body) computed

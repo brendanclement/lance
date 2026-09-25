@@ -304,9 +304,9 @@ impl<'a> CommitBuilder<'a> {
     ///     .with_dependency_conflict_policy(DependencyConflictPolicy::Skip)
     ///     .execute_with_report(publication)
     ///     .await?;
-    /// let to_recompute = result
-    ///     .report
-    ///     .deferred_rows_of(flag_id, DeferralReason::InputChanged);
+    /// let report = &result.report;
+    /// let to_recompute = report.deferred_rows_of(flag_id, DeferralReason::InputChanged)
+    ///     | report.deferred_rows_of(flag_id, DeferralReason::UpstreamNotPublished);
     /// # Ok(to_recompute)
     /// # }
     /// ```

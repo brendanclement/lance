@@ -41,6 +41,12 @@ pub enum DeferralReason {
     /// The row was deleted, or moved to a new address by a row-moving update,
     /// after the read version. Its old address no longer holds a live row.
     RowVacated,
+    /// The flag's value on the row was computed from the output of an
+    /// upstream flag (one whose output it watches) staged in the same file
+    /// and assigned there too. The file was deferred, so that input never
+    /// committed. Recompute the row from the committed upstream value, or
+    /// republish both outputs together.
+    UpstreamNotPublished,
     /// A concurrent publication set a flag whose output the group writes, on
     /// the group's fragment. Installing the older file would overwrite the
     /// newer result.
@@ -89,11 +95,19 @@ pub struct DeferredGroup {
     /// The version whose transaction caused `reason`.
     pub conflicting_version: u64,
     /// The true assignments the group staged, one per flag, whose inputs did
-    /// not change up to `checked_version`: their staged values are still
-    /// correct results, which a refresh restaging the fragment against the
-    /// head can reuse. Rows deleted since the read version are not removed.
-    /// Empty when `reason` is that the fragment was removed or rewritten. The
-    /// rows whose inputs changed are in [`PublicationReport::deferred_rows`].
+    /// not change up to `checked_version` and were not staged in this file:
+    /// their staged values are still correct results, which a refresh
+    /// restaging the fragment against the head can reuse. Empty when
+    /// `reason` is that the fragment was removed or rewritten. The rows whose
+    /// inputs changed, and those computed from an upstream output this file
+    /// assigns ([`DeferralReason::UpstreamNotPublished`]), are in
+    /// [`PublicationReport::deferred_rows`].
+    ///
+    /// Two kinds of stale rows are not removed: rows deleted since the read
+    /// version, and rows where a concurrent publication republished the flag
+    /// together with an upstream output it watches. The latter are true at
+    /// the head, and their staged values were computed from the older
+    /// upstream value.
     pub valid_rows: Vec<CellFlagUpdate>,
 }
 
@@ -135,12 +149,17 @@ pub struct DeferredGroup {
 /// group's file writes. A group whose rows are deferred still installs its
 /// file: the stale values stay stored under a false flag. A deferred group
 /// installs nothing, and its staged file stays on storage for the caller to
-/// reuse. Rows whose inputs changed are reported as deferred rows whether or
-/// not their group was installed, so [`Self::reusable_rows`] is exactly the
-/// staged work that is still correct. The exception is a group whose fragment
-/// was removed or rewritten: it is reported with that reason, whatever
-/// deferred it first, and no row of its fragment is reported as deferred or
-/// reusable, since none is left at its staged address.
+/// reuse. Since its file never committed, a flag's values on the rows where
+/// the file also assigns a flag upstream of it, one whose output it watches,
+/// were computed from an input no reader sees: they are deferred as
+/// [`DeferralReason::UpstreamNotPublished`], while the upstream's own values
+/// stay reusable. Rows whose inputs changed are reported as deferred rows
+/// whether or not their group was installed, so [`Self::reusable_rows`] is
+/// the staged work that is still correct, but for the stale rows
+/// [`DeferredGroup::valid_rows`] keeps. A group whose fragment was removed or
+/// rewritten is reported with that reason, whatever deferred it first, and no
+/// row of its fragment is reported as deferred or reusable, since none is left
+/// at its staged address.
 ///
 /// Deferrals accumulate across commit retries. A follow-up refresh of the
 /// deferred work must read at `committed_version`, or at `checked_version`
@@ -185,14 +204,16 @@ impl PublicationReport {
     /// [`DeferredGroup::valid_rows`]. A follow-up refresh reading at
     /// `committed_version`, or `checked_version` when nothing was committed,
     /// can reuse these values instead of recomputing them, and must recompute
-    /// the rows deferred for [`DeferralReason::InputChanged`].
+    /// the rows deferred for [`DeferralReason::InputChanged`] or
+    /// [`DeferralReason::UpstreamNotPublished`].
     ///
     /// ```
     /// # use lance::dataset::cell_flag::{DeferralReason, PublicationReport};
     /// # use lance_select::RowSetOps;
     /// # fn example(report: &PublicationReport, flag_id: u32) -> bool {
     /// let reusable = report.reusable_rows(flag_id);
-    /// let to_recompute = report.deferred_rows_of(flag_id, DeferralReason::InputChanged);
+    /// let to_recompute = report.deferred_rows_of(flag_id, DeferralReason::InputChanged)
+    ///     | report.deferred_rows_of(flag_id, DeferralReason::UpstreamNotPublished);
     /// (reusable & &to_recompute).is_empty()
     /// # }
     /// ```
