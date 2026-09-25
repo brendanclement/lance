@@ -7,11 +7,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, StringArray, record_batch};
+use arrow_array::{
+    ArrayRef, RecordBatch, RecordBatchIterator, StringArray, UInt64Array, record_batch,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::stream;
 use lance_core::Error;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::feature_flags::FLAG_UNSTABLE_CELL_FLAGS;
@@ -478,6 +481,26 @@ async fn test_clears_propagate_down_dependency_chains() {
     expected.extend(cleared(translated, full(&[0])));
     expected.sort_by_key(|update| update.flag_id);
     assert_eq!(recorded_invalidations(&dataset).await, expected);
+
+    // Dropping the mask exposes summary's stored values, fragment 0's stale
+    // ones included, so every translation computed from it is stale.
+    let mut dataset = dataset;
+    dataset.drop_cell_flag("summary", "ready").await.unwrap();
+    assert!(dataset.cell_flag_true_rows(translated).unwrap().is_empty());
+    assert_eq!(
+        recorded_invalidations(&dataset).await,
+        cleared(translated, full(&[0, 1]))
+    );
+    let batch = dataset
+        .scan()
+        .project(&["summary", "translation"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let summaries: ArrayRef = Arc::new(StringArray::from(vec!["s-0-0", "s-0-1", "s-1-0", "s-1-1"]));
+    assert_eq!(&batch["summary"], &summaries);
+    assert_eq!(batch["translation"].null_count(), 4);
 }
 
 #[tokio::test]
@@ -914,4 +937,255 @@ async fn test_stale_merge_conflicts_instead_of_being_refused() {
         matches!(error, Error::RetryableCommitConflict { .. }),
         "{error}"
     );
+}
+
+/// Writes the cell flag rules cannot follow yet, each tried on a dataset
+/// whose `summary.ready` (watching title and body, masking) is true on
+/// every row.
+#[derive(Debug, Clone, Copy)]
+enum Unsupported {
+    Compaction,
+    Overwrite,
+    MemWalStateUpdate,
+    OverlayOnSource,
+    OverlayOnOutput,
+    DropSource,
+    DropOutput,
+    CastSource,
+    MergeRewritingSource,
+    NonNullableMaskedOutput,
+    DependentFlagSetOutsidePublication,
+    MaskingOrdinaryFlag,
+}
+
+/// Commit an overlay of `column` on the first row of fragment 0.
+async fn overlay(dataset: &Dataset, column: &str) -> Result<Dataset> {
+    let fragment = dataset.get_fragment(0).unwrap();
+    let mut writer = fragment
+        .write_overlay(&dataset.schema().project(&[column]).unwrap())
+        .await
+        .unwrap();
+    let row_addr: u64 = RowAddress::new_from_parts(0, 0).into();
+    let values = RecordBatch::try_from_iter([
+        (
+            "_rowaddr",
+            Arc::new(UInt64Array::from(vec![row_addr])) as ArrayRef,
+        ),
+        (column, Arc::new(StringArray::from(vec!["o"])) as ArrayRef),
+    ])
+    .unwrap();
+    writer.write_batch(&values).await.unwrap();
+    let group = writer.finish().await.unwrap().unwrap();
+    commit(
+        dataset,
+        Operation::DataOverlay {
+            groups: vec![group],
+        },
+    )
+    .await
+}
+
+async fn commit(dataset: &Dataset, operation: Operation) -> Result<Dataset> {
+    CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(Transaction::new(dataset.manifest.version, operation, None))
+        .await
+}
+
+async fn attempt(dataset: &Dataset, write: Unsupported) -> Result<()> {
+    let mut dataset = dataset.clone();
+    match write {
+        Unsupported::Compaction => {
+            compact_files(&mut dataset, CompactionOptions::default(), None).await?;
+        }
+        Unsupported::Overwrite => {
+            let batch = record_batch!(("id", Int32, [9]), ("title", Utf8, ["t9"])).unwrap();
+            InsertBuilder::new(Arc::new(dataset))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Overwrite,
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await?;
+        }
+        Unsupported::MemWalStateUpdate => {
+            commit(
+                &dataset,
+                Operation::UpdateMemWalState {
+                    compacted_sstables: vec![],
+                },
+            )
+            .await?;
+        }
+        Unsupported::OverlayOnSource => {
+            overlay(&dataset, "body").await?;
+        }
+        Unsupported::OverlayOnOutput => {
+            overlay(&dataset, "summary").await?;
+        }
+        Unsupported::DropSource => dataset.drop_columns(&["body"]).await?,
+        Unsupported::DropOutput => dataset.drop_columns(&["summary"]).await?,
+        Unsupported::CastSource => {
+            dataset
+                .alter_columns(
+                    &[ColumnAlteration::new("title".into()).cast_to(DataType::LargeUtf8)],
+                )
+                .await?
+        }
+        Unsupported::MergeRewritingSource => {
+            let body_id = dataset.schema().field("body").unwrap().id;
+            let DataReplacementGroup(_, body) = stage(&dataset, 0, "body", "b").await;
+            let mut fragments: Vec<_> = dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.metadata().clone())
+                .collect();
+            for file in &mut fragments[0].files {
+                file.fields = file
+                    .fields
+                    .iter()
+                    .map(|id| if *id == body_id { -2 } else { *id })
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            fragments[0].files.push(body);
+            commit(
+                &dataset,
+                Operation::Merge {
+                    fragments,
+                    schema: dataset.schema().clone(),
+                    preserves_nullability: true,
+                },
+            )
+            .await?;
+        }
+        Unsupported::NonNullableMaskedOutput => {
+            let mut schema = dataset.schema().clone();
+            let summary_id = schema.field("summary").unwrap().id;
+            schema.mut_field_by_id(summary_id).unwrap().nullable = false;
+            commit(
+                &dataset,
+                Operation::Project {
+                    schema,
+                    preserves_nullability: false,
+                },
+            )
+            .await?;
+        }
+        Unsupported::DependentFlagSetOutsidePublication => {
+            let ready = dataset.cell_flag("summary", "ready").unwrap().flag_id;
+            let transaction = TransactionBuilder::new(dataset.manifest.version, update_config())
+                .cell_flag_changes(CellFlagChanges {
+                    updates: set_true(ready, full(&[0])),
+                    ..Default::default()
+                })
+                .build();
+            CommitBuilder::new(Arc::new(dataset))
+                .execute(transaction)
+                .await?;
+        }
+        Unsupported::MaskingOrdinaryFlag => {
+            dataset
+                .register_cell_flag(
+                    "title",
+                    "hidden",
+                    CellFlagOptions::default().with_mask_when_false(true),
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::compaction(
+    Unsupported::Compaction,
+    "compaction would move rows without remapping their cell flag state"
+)]
+#[case::overwrite(
+    Unsupported::Overwrite,
+    "an overwrite can replace or drop flagged fields without clearing their flags"
+)]
+#[case::mem_wal_state_update(
+    Unsupported::MemWalStateUpdate,
+    "MemWAL compaction writes rows that cell flags do not track"
+)]
+#[case::overlay_on_source(
+    Unsupported::OverlayOnSource,
+    "the overlay writes 'body' (field id 2), which the flag watches"
+)]
+#[case::overlay_on_output(
+    Unsupported::OverlayOnOutput,
+    "the overlay writes 'summary' (field id 3), which the flag watches"
+)]
+#[case::drop_source(
+    Unsupported::DropSource,
+    "it drops 'body' (field id 2) or changes its id; drop the flag first"
+)]
+#[case::drop_output(
+    Unsupported::DropOutput,
+    "it drops 'summary' (field id 3) or changes its id; drop the flag first"
+)]
+#[case::cast_source(
+    Unsupported::CastSource,
+    "it drops 'title' (field id 1) or changes its id; drop the flag first"
+)]
+#[case::merge_rewriting_source(
+    Unsupported::MergeRewritingSource,
+    "the merge rewrites the data of 'body' (field id 2) in fragment 0"
+)]
+#[case::non_nullable_masked_output(
+    Unsupported::NonNullableMaskedOutput,
+    "masked cells read as NULL, so the masked output 'summary' (field id 3) must stay nullable"
+)]
+#[case::dependent_flag_set_outside_publication(
+    Unsupported::DependentFlagSetOutsidePublication,
+    "is dependent, so only a DataReplacement that writes 'summary' (field id 3) can set it true, \
+     not UpdateConfig"
+)]
+#[case::masking_ordinary_flag(
+    Unsupported::MaskingOrdinaryFlag,
+    "cannot register masking cell flag 'hidden' on 'title' (field id 1) without clear_on_write \
+     sources"
+)]
+#[tokio::test]
+async fn test_unsupported_operations_fail_explicitly(
+    #[case] write: Unsupported,
+    #[case] expected: &str,
+) {
+    let mut dataset = articles(false).await;
+    let flag_id = register_ready(&mut dataset).await;
+    let groups = stage_all(&dataset, "summary", "s").await;
+    let dataset = commit_replacement(&dataset, groups, set_true(flag_id, full(&[0, 1])))
+        .await
+        .unwrap();
+    let version = dataset.version().version;
+
+    let error = attempt(&dataset, write).await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(error.to_string().contains(expected), "{error}");
+    let mut latest = dataset.clone();
+    latest.checkout_latest().await.unwrap();
+    if matches!(write, Unsupported::Compaction) {
+        // Compaction reserves its fragment ids in a commit of its own first.
+        let reserved = latest.read_transaction().await.unwrap().unwrap();
+        assert!(
+            matches!(reserved.operation, Operation::ReserveFragments { .. }),
+            "{:?}",
+            reserved.operation
+        );
+        assert_eq!(latest.version().version, version + 1);
+    } else {
+        assert_eq!(latest.version().version, version, "nothing was committed");
+    }
+    assert_eq!(latest.cell_flags(), dataset.cell_flags());
+    assert_eq!(latest.cell_flag_true_rows(flag_id).unwrap(), full(&[0, 1]));
+    let summaries = latest
+        .scan()
+        .project(&["summary"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected: ArrayRef = Arc::new(StringArray::from(vec!["s-0-0", "s-0-1", "s-1-0", "s-1-1"]));
+    assert_eq!(&summaries["summary"], &expected);
 }

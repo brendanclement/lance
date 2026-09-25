@@ -5,18 +5,22 @@
 //! concurrently: the conflict rules, the `Skip` policy and the report.
 //!
 //! Every test stages a refresh at one version and commits the competing
-//! transactions in a chosen order. Values are asserted where the flag is true,
-//! so the assertions hold with or without masking; rows whose stale values are
-//! stored under a false flag are asserted through the installed data file.
+//! transactions in a chosen order. `published_values` shows the rows whose
+//! flag is true; `column_values` without a flag is the masked read, where the
+//! stale values `Skip` installs under a false flag read as NULL.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, UInt64Type};
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, record_batch};
+use arrow_array::{
+    Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, record_batch,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::stream;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ADDR};
 use lance_io::object_store::ObjectStore;
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -41,8 +45,8 @@ use crate::dataset::transaction::{
     CellFlagChanges, CellFlagRegistration, CellFlagUpdate, DataReplacementGroup, Transaction,
     TransactionBuilder,
 };
-use crate::dataset::write::CommitBuilder;
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
+use crate::dataset::write::{CommitBuilder, WriteParams};
 use crate::dataset::{DeleteBuilder, MergeInsertBuilder, MergeInsertWriteMode, UpdateBuilder};
 use crate::{Dataset, Result};
 
@@ -212,7 +216,16 @@ fn file_of(dataset: &Dataset, fragment_id: u64, column: &str) -> String {
 }
 
 async fn merge_insert_body(dataset: &Dataset, id: i32, body: &str) -> Dataset {
-    let source = record_batch!(("id", Int32, [id]), ("body", Utf8, [body])).unwrap();
+    merge_insert_column(dataset, id, "body", body).await
+}
+
+/// Rewrite `column` of `id` in place with a partial-schema merge_insert.
+async fn merge_insert_column(dataset: &Dataset, id: i32, column: &str, value: &str) -> Dataset {
+    let source = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from(vec![id])) as ArrayRef),
+        (column, Arc::new(StringArray::from(vec![value])) as ArrayRef),
+    ])
+    .unwrap();
     let (dataset, _) = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".into()])
         .unwrap()
         .when_matched(WhenMatched::UpdateAll)
@@ -267,6 +280,28 @@ impl BodyWrite {
             }
             Self::MergeInsert => merge_insert_body(dataset, 2, "new").await,
             Self::Update => update_where(dataset, "id = 2", "body", "new").await,
+        }
+    }
+
+    /// Write `body` as id 2's body; a replacement also rewrites id 1's body
+    /// with its original value.
+    async fn write_body_of_id_2(self, dataset: &Dataset, body: &str) -> Dataset {
+        match self {
+            Self::Replace => {
+                let file = stage_rows(dataset, 0, &["body"], |_, offset| {
+                    Some(if offset == 1 {
+                        body.to_string()
+                    } else {
+                        "b1".into()
+                    })
+                })
+                .await;
+                commit_replacement(dataset, vec![file], vec![])
+                    .await
+                    .unwrap()
+            }
+            Self::MergeInsert => merge_insert_body(dataset, 2, body).await,
+            Self::Update => update_where(dataset, "id = 2", "body", body).await,
         }
     }
 
@@ -454,16 +489,29 @@ async fn test_refresh_staged_before_input_write(
     );
     // The stale values are installed with the group, under a false flag.
     assert_eq!(file_of(&committed, 0, "summary"), refresh[0].1.path);
+    let mut masked = expected;
+    masked.push((2, None));
+    if matches!(write, BodyWrite::Replace) {
+        masked.push((1, None));
+    }
+    masked.sort();
+    assert_eq!(
+        column_values(&committed, "summary", None).await,
+        values(&masked),
+        "the stale values read as NULL"
+    );
     assert_eq!(
         column_values(&committed, "body", None).await[1],
         (2, Some(write.body_of_id_2().to_string()))
     );
 }
 
+/// A row-moving update records no clear: it moves the row, and the refresh's
+/// assignment at the old address is vacated instead.
 #[rstest]
 #[tokio::test]
 async fn test_refresh_skips_rows_invalidated_while_flag_false(
-    #[values(BodyWrite::Replace, BodyWrite::MergeInsert)] write: BodyWrite,
+    #[values(BodyWrite::Replace, BodyWrite::MergeInsert, BodyWrite::Update)] write: BodyWrite,
     #[values(Reject, Skip)] policy: DependencyConflictPolicy,
 ) {
     let mut dataset = articles(false).await;
@@ -472,11 +520,24 @@ async fn test_refresh_skips_rows_invalidated_while_flag_false(
     let refresh = stage_all(&read, "summary", "s").await;
     let written = write.apply(&dataset).await;
     assert!(written.cell_flag_true_rows(flag_id).unwrap().is_empty());
-    assert_eq!(
-        recorded_invalidations(&written).await,
-        cleared(flag_id, write.clears()),
-        "recorded although the flag was never true"
-    );
+    let changes = written
+        .read_transaction()
+        .await
+        .unwrap()
+        .unwrap()
+        .cell_flag_changes
+        .unwrap();
+    if matches!(write, BodyWrite::Update) {
+        let body = written.schema().field("body").unwrap().id;
+        assert_eq!(changes.moved_rows_written_fields, Some(vec![body]));
+        assert!(changes.derived_invalidations.is_empty());
+    } else {
+        assert_eq!(
+            recorded_invalidations(&written).await,
+            cleared(flag_id, write.clears()),
+            "recorded although the flag was never true"
+        );
+    }
 
     let result = publish(&read, refresh, set_true(flag_id, full(&[0, 1])), policy).await;
     if policy == Reject {
@@ -485,13 +546,17 @@ async fn test_refresh_skips_rows_invalidated_while_flag_false(
             matches!(error, Error::RetryableCommitConflict { .. }),
             "{error}"
         );
-        assert!(
-            error.to_string().contains(&format!(
+        let expected = match write {
+            BodyWrite::Update => format!(
+                "preempted by concurrent transaction Update at version {}",
+                written.version().version
+            ),
+            BodyWrite::Replace | BodyWrite::MergeInsert => format!(
                 "cannot be published on {} row(s) of fragment 0",
                 write.stale().len().unwrap()
-            )),
-            "{error}"
-        );
+            ),
+        };
+        assert!(error.to_string().contains(&expected), "{error}");
         let head = latest(&written).await;
         assert_eq!(head.version().version, written.version().version);
         assert!(head.cell_flag_true_rows(flag_id).unwrap().is_empty());
@@ -509,7 +574,7 @@ async fn test_refresh_skips_rows_invalidated_while_flag_false(
         vec![deferred(
             flag_id,
             write.stale(),
-            InputChanged,
+            write.reason(),
             written.version().version
         )]
     );
@@ -521,26 +586,26 @@ async fn test_refresh_skips_rows_invalidated_while_flag_false(
         result.dataset.cell_flag_true_rows(flag_id).unwrap(),
         write.still_valid()
     );
-    assert!(
-        !published_values(&result.dataset, "summary", flag_id)
-            .await
-            .iter()
-            .any(|(id, _)| *id == 2),
-        "id 2 is not published"
+    let id_1 = (!matches!(write, BodyWrite::Replace)).then_some("s-0-0");
+    assert_eq!(
+        column_values(&result.dataset, "summary", None).await,
+        values(&[(1, id_1), (2, None), (3, Some("s-1-0")), (4, Some("s-1-1"))]),
+        "id 2 is not published and its stale value reads as NULL"
     );
 }
 
 #[rstest]
 #[tokio::test]
 async fn test_input_restored_before_refresh_publishes(
+    #[values(BodyWrite::Replace, BodyWrite::MergeInsert, BodyWrite::Update)] write: BodyWrite,
     #[values(Reject, Skip)] policy: DependencyConflictPolicy,
 ) {
     let mut dataset = articles(false).await;
     let flag_id = register_ready(&mut dataset).await;
     let read = dataset.clone();
     let refresh = stage_all(&read, "summary", "s").await;
-    let changed = merge_insert_body(&dataset, 2, "changed").await;
-    let restored = merge_insert_body(&changed, 2, "b2").await;
+    let changed = write.write_body_of_id_2(&dataset, "changed").await;
+    let restored = write.write_body_of_id_2(&changed, "b2").await;
     assert_eq!(
         column_values(&restored, "body", None).await,
         column_values(&read, "body", None).await,
@@ -575,17 +640,20 @@ async fn test_input_restored_before_refresh_publishes(
         result.report.deferred_rows,
         vec![deferred(
             flag_id,
-            rows(&[(0, &[1])]),
-            InputChanged,
+            write.stale(),
+            write.reason(),
             changed.version().version
         )]
     );
     assert_eq!(result.report.checked_version, restored.version().version);
-    let valid = with_full(rows(&[(0, &[0])]), 1);
-    assert_eq!(result.dataset.cell_flag_true_rows(flag_id).unwrap(), valid);
     assert_eq!(
-        published_values(&result.dataset, "summary", flag_id).await,
-        values(&[(1, Some("s-0-0")), (3, Some("s-1-0")), (4, Some("s-1-1"))])
+        result.dataset.cell_flag_true_rows(flag_id).unwrap(),
+        write.still_valid()
+    );
+    let id_1 = (!matches!(write, BodyWrite::Replace)).then_some("s-0-0");
+    assert_eq!(
+        column_values(&result.dataset, "summary", None).await,
+        values(&[(1, id_1), (2, None), (3, Some("s-1-0")), (4, Some("s-1-1"))])
     );
 }
 
@@ -928,6 +996,16 @@ async fn test_unsafe_fragment_does_not_block_safe_ones(
     if result.dataset.get_fragment(0).is_some() {
         assert_ne!(file_of(&result.dataset, 0, "summary"), refresh[0].1.path);
     }
+    // Ids 1 and 2 still read NULL wherever they live, including the values
+    // the output writes typed in without publishing them.
+    if !is_republished && !matches!(unsafe_write, UnsafeWrite::DeleteFragment) {
+        expected.extend(values(&[(1, None), (2, None)]));
+        expected.sort();
+    }
+    assert_eq!(
+        column_values(&result.dataset, "summary", None).await,
+        expected
+    );
 }
 
 #[rstest]
@@ -1177,8 +1255,8 @@ async fn test_write_staged_before_registration_defers_later_refresh(
         full(&[1])
     );
     assert_eq!(
-        published_values(&result.dataset, "summary", flag_id).await,
-        values(&[(3, Some("s-1-0")), (4, Some("s-1-1"))])
+        column_values(&result.dataset, "summary", None).await,
+        values(&[(1, None), (2, None), (3, Some("s-1-0")), (4, Some("s-1-1"))])
     );
 }
 
@@ -1224,8 +1302,26 @@ impl CommitHandler for CommitsCompetitorFirst {
     }
 }
 
+/// A transaction the handler commits while a body write's first manifest
+/// write is in flight.
+#[derive(Debug, Clone, Copy)]
+enum Competitor {
+    /// Registers `translation.ready`, which watches body.
+    Registration,
+    /// Publishes `summary.ready` on every row.
+    Publication,
+}
+
+/// The body write loses its first commit slot to the competitor and retries:
+/// through the commit loop's rebase, or, where the competitor rewrote a
+/// fragment it updates, by rerunning the whole write. The transaction file it
+/// finally commits must record the clears the head at that point implies.
+#[rstest]
 #[tokio::test]
-async fn test_commit_retry_records_every_invalidation() {
+async fn test_commit_retry_records_every_invalidation(
+    #[values(BodyWrite::Replace, BodyWrite::MergeInsert, BodyWrite::Update)] write: BodyWrite,
+    #[values(Competitor::Registration, Competitor::Publication)] competitor: Competitor,
+) {
     let mut dataset = articles(false).await;
     let translation = ArrowSchema::new(vec![ArrowField::new("translation", DataType::Utf8, true)]);
     dataset
@@ -1238,45 +1334,84 @@ async fn test_commit_retry_records_every_invalidation() {
         .unwrap();
     let ready = register_ready(&mut dataset).await;
     let schema = dataset.schema();
-    let registration = TransactionBuilder::new(dataset.version().version, update_config())
-        .cell_flag_changes(CellFlagChanges {
-            registrations: vec![CellFlagRegistration {
-                field_id: schema.field("translation").unwrap().id,
-                name: "ready".to_string(),
-                clear_on_write: vec![schema.field("body").unwrap().id],
-                mask_when_false: true,
-            }],
-            ..Default::default()
-        })
-        .build();
+    let competing = match competitor {
+        Competitor::Registration => {
+            TransactionBuilder::new(dataset.version().version, update_config())
+                .cell_flag_changes(CellFlagChanges {
+                    registrations: vec![CellFlagRegistration {
+                        field_id: schema.field("translation").unwrap().id,
+                        name: "ready".to_string(),
+                        clear_on_write: vec![schema.field("body").unwrap().id],
+                        mask_when_false: true,
+                    }],
+                    ..Default::default()
+                })
+                .build()
+        }
+        Competitor::Publication => replacement_txn(
+            dataset.version().version,
+            stage_all(&dataset, "summary", "s").await,
+            set_true(ready, full(&[0, 1])),
+        ),
+    };
     let handler = Arc::new(CommitsCompetitorFirst {
         inner: dataset.commit_handler.clone(),
-        competitor: Mutex::new(Some((Arc::new(dataset.clone()), registration))),
+        competitor: Mutex::new(Some((Arc::new(dataset.clone()), competing))),
     });
-    let body = stage_rows(&dataset, 0, &["body"], |_, offset| {
-        Some(format!("new-{offset}"))
-    })
-    .await;
+    let mut writer = dataset.clone();
+    writer.commit_handler = handler.clone();
 
-    let written = CommitBuilder::new(Arc::new(dataset.clone()))
-        .with_commit_handler(handler.clone())
-        .execute(replacement_txn(
-            dataset.version().version,
-            vec![body],
-            vec![],
-        ))
-        .await
-        .unwrap();
+    let written = write.apply(&writer).await;
     assert!(handler.competitor.lock().unwrap().is_none());
     assert_eq!(
         written.version().version,
         dataset.version().version + 2,
         "the competitor took the first attempt's version"
     );
-    let translated = written.cell_flag("translation", "ready").unwrap().flag_id;
-    let mut expected = cleared(ready, full(&[0]));
-    expected.extend(cleared(translated, full(&[0])));
-    assert_eq!(recorded_invalidations(&written).await, expected);
+    let changes = written
+        .read_transaction()
+        .await
+        .unwrap()
+        .unwrap()
+        .cell_flag_changes
+        .unwrap();
+    let translated = written
+        .cell_flag("translation", "ready")
+        .map(|flag| flag.flag_id);
+    if matches!(write, BodyWrite::Update) {
+        // The moved row's new address starts unassigned for both flags.
+        let body = schema.field("body").unwrap().id;
+        assert_eq!(changes.moved_rows_written_fields, Some(vec![body]));
+        assert!(recorded_invalidations(&written).await.is_empty());
+    } else {
+        let mut expected = cleared(ready, write.clears());
+        if let Some(translated) = translated {
+            expected.extend(cleared(translated, write.clears()));
+        }
+        assert_eq!(recorded_invalidations(&written).await, expected);
+    }
+    match competitor {
+        Competitor::Registration => {
+            assert!(written.cell_flag_true_rows(ready).unwrap().is_empty());
+            let translated = translated.unwrap();
+            assert!(written.cell_flag_true_rows(translated).unwrap().is_empty());
+        }
+        Competitor::Publication => {
+            assert_eq!(
+                written.cell_flag_true_rows(ready).unwrap(),
+                write.still_valid()
+            );
+            let id_1 = (!matches!(write, BodyWrite::Replace)).then_some("s-0-0");
+            assert_eq!(
+                column_values(&written, "summary", None).await,
+                values(&[(1, id_1), (2, None), (3, Some("s-1-0")), (4, Some("s-1-1"))])
+            );
+        }
+    }
+    assert_eq!(
+        column_values(&written, "body", None).await[1],
+        (2, Some(write.body_of_id_2().to_string()))
+    );
 }
 
 #[tokio::test]
@@ -1360,9 +1495,15 @@ async fn test_publication_retry_accumulates_deferrals() {
         result.dataset.cell_flag_true_rows(flag_id).unwrap(),
         rows(&[(0, &[1]), (1, &[1])])
     );
+    // Id 1's newer value and id 3's installed stale value are masked alike.
     assert_eq!(
-        published_values(&result.dataset, "summary", flag_id).await,
-        values(&[(2, Some("newer-0-1")), (4, Some("s-1-1"))])
+        column_values(&result.dataset, "summary", None).await,
+        values(&[
+            (1, None),
+            (2, Some("newer-0-1")),
+            (3, None),
+            (4, Some("s-1-1"))
+        ])
     );
 }
 
@@ -1540,9 +1681,13 @@ async fn test_fragment_removal_supersedes_earlier_deferral(
         result.dataset.cell_flag_true_rows(flag_id).unwrap(),
         full(&[1])
     );
+    let mut expected = values(&[(3, Some("s-1-0")), (4, Some("s-1-1"))]);
+    if matches!(removal, Removal::MoveRows) && !is_during_retry {
+        expected.splice(0..0, values(&[(1, None), (2, None)]));
+    }
     assert_eq!(
-        published_values(&result.dataset, "summary", flag_id).await,
-        values(&[(3, Some("s-1-0")), (4, Some("s-1-1"))])
+        column_values(&result.dataset, "summary", None).await,
+        expected
     );
 }
 
@@ -1648,8 +1793,12 @@ async fn test_unmasked_stale_output_invalidates_downstream_flags() {
             .unwrap()
             .is_empty()
     );
-    // The stale keywords are installed under a false flag.
+    // The stale keywords are installed under a false flag and read as NULL.
     assert_eq!(file_of(&result.dataset, 0, "keywords"), keywords_path);
+    assert_eq!(
+        column_values(&result.dataset, "keywords", None).await,
+        values(&[(1, None), (2, None), (3, None), (4, None)])
+    );
 }
 
 /// `summary` (from title and body) and `keywords` (from body) computed
@@ -1698,35 +1847,67 @@ fn both(summary: u32, keywords: u32, rows: RowAddrTreeMap) -> Vec<CellFlagUpdate
     vec![published(summary, rows.clone()), published(keywords, rows)]
 }
 
-#[tokio::test]
-async fn test_rejected_publication_exposes_nothing() {
-    let (dataset, summary, keywords, staged) = sibling_outputs().await;
-    let written = merge_insert_body(&dataset, 3, "new").await;
+/// Why a publication of both sibling outputs fails.
+#[derive(Debug, Clone, Copy)]
+enum PublicationFailure {
+    /// A concurrent write changed id 3's body, and `Reject` refuses it all.
+    InputChanged,
+    /// The assignment names an offset fragment 1 does not have.
+    RowOutOfRange,
+}
 
-    let error = publish(
-        &dataset,
-        staged,
-        both(summary, keywords, full(&[0, 1])),
-        Reject,
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        matches!(error, Error::RetryableCommitConflict { .. }),
-        "{error}"
+#[rstest]
+#[case::input_changed(PublicationFailure::InputChanged)]
+#[case::row_out_of_range(PublicationFailure::RowOutOfRange)]
+#[tokio::test]
+async fn test_rejected_publication_exposes_nothing(#[case] failure: PublicationFailure) {
+    let (dataset, summary, keywords, staged) = sibling_outputs().await;
+    let (head, assigned) = match failure {
+        PublicationFailure::InputChanged => {
+            (merge_insert_body(&dataset, 3, "new").await, full(&[0, 1]))
+        }
+        PublicationFailure::RowOutOfRange => {
+            (dataset.clone(), with_full(rows(&[(1, &[0, 1, 5])]), 0))
+        }
+    };
+
+    let error = publish(&dataset, staged, both(summary, keywords, assigned), Reject)
+        .await
+        .unwrap_err();
+    match failure {
+        PublicationFailure::InputChanged => {
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot be published on 1 row(s) of fragment 1"),
+                "{error}"
+            );
+        }
+        PublicationFailure::RowOutOfRange => {
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains(&format!(
+                    "cell flag {summary} update names offset 5 of fragment 1, which has 2 \
+                     physical rows"
+                )),
+                "{error}"
+            );
+        }
+    }
+    let latest = latest(&head).await;
+    assert_eq!(latest.version().version, head.version().version);
+    assert_eq!(
+        latest.manifest.fragments, head.manifest.fragments,
+        "no staged file was installed"
     );
-    assert!(
-        error
-            .to_string()
-            .contains("cannot be published on 1 row(s) of fragment 1"),
-        "{error}"
-    );
-    let head = latest(&written).await;
-    assert_eq!(head.version().version, written.version().version);
     for (flag_id, column) in [(summary, "summary"), (keywords, "keywords")] {
-        assert!(head.cell_flag_true_rows(flag_id).unwrap().is_empty());
+        assert!(latest.cell_flag_true_rows(flag_id).unwrap().is_empty());
         assert!(
-            column_values(&head, column, None)
+            column_values(&latest, column, None)
                 .await
                 .iter()
                 .all(|(_, value)| value.is_none()),
@@ -1795,12 +1976,14 @@ async fn test_stale_row_defers_every_sibling_output(#[values(false, true)] is_re
     for (flag_id, column) in [(summary, "summary"), (keywords, "keywords")] {
         assert_eq!(result.dataset.cell_flag_true_rows(flag_id).unwrap(), valid);
         assert_eq!(
-            published_values(&result.dataset, column, flag_id).await,
+            column_values(&result.dataset, column, None).await,
             values(&[
                 (1, Some(&format!("{prefix}{column}-0-0"))),
                 (2, Some(&format!("{prefix}{column}-0-1"))),
+                (3, None),
                 (4, Some(&format!("{prefix}{column}-1-1"))),
-            ])
+            ]),
+            "id 3's installed {column} reads as NULL"
         );
     }
 }
@@ -1899,8 +2082,9 @@ async fn test_deferred_group_defers_every_sibling_output(
         full(&[0, 1])
     );
     assert_eq!(
-        published_values(&result.dataset, "summary", summary).await,
+        column_values(&result.dataset, "summary", None).await,
         values(&[
+            (1, None),
             (2, Some("newer-summary-0-1")),
             (3, Some("summary-1-0")),
             (4, Some("summary-1-1")),
@@ -1965,6 +2149,15 @@ async fn test_follow_up_refresh_reuses_published_rows() {
     let result = publish(&read, first, set_true(flag_id, full(&[0, 1])), Skip)
         .await
         .unwrap();
+    assert_eq!(
+        column_values(&result.dataset, "summary", None).await,
+        values(&[
+            (1, Some("first-0-0")),
+            (2, None),
+            (3, Some("first-1-0")),
+            (4, Some("first-1-1"))
+        ])
+    );
     let report = &result.report;
     let reusable = report.published_rows(flag_id);
     let to_recompute = report.deferred_rows_of(flag_id, InputChanged);
@@ -2021,6 +2214,377 @@ async fn test_follow_up_refresh_reuses_published_rows() {
             (4, Some("first-1-1")),
         ])
     );
+}
+
+/// One live row as the masked scan reads it.
+struct Article {
+    id: i32,
+    title: String,
+    body: String,
+    language: String,
+    summary: Option<String>,
+    translation: Option<String>,
+}
+
+impl Article {
+    fn output(&self, column: &str) -> Option<&str> {
+        match column {
+            "summary" => self.summary.as_deref(),
+            _ => self.translation.as_deref(),
+        }
+    }
+}
+
+type Compute = fn(&Article) -> String;
+
+fn summary_of(article: &Article) -> String {
+    format!("sum({},{})", article.title, article.body)
+}
+
+fn translation_of(article: &Article) -> String {
+    format!("tr({},{})", article.body, article.language)
+}
+
+/// The computed columns of the refresh loop, with the functions, unknown to
+/// Lance, that compute them.
+const OUTPUTS: [(&str, Compute); 2] = [("summary", summary_of), ("translation", translation_of)];
+
+/// Every live row of `dataset`, by row address.
+async fn articles_by_addr(dataset: &Dataset) -> BTreeMap<u64, Article> {
+    let batch = dataset
+        .scan()
+        .project(&["id", "title", "body", "language", "summary", "translation"])
+        .unwrap()
+        .with_row_address()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let text = |column: &str, row: usize| {
+        let array = batch[column].as_string::<i32>();
+        array.is_valid(row).then(|| array.value(row).to_string())
+    };
+    let ids = batch["id"].as_primitive::<Int32Type>();
+    let addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>();
+    (0..batch.num_rows())
+        .map(|row| {
+            let article = Article {
+                id: ids.value(row),
+                title: text("title", row).unwrap(),
+                body: text("body", row).unwrap(),
+                language: text("language", row).unwrap(),
+                summary: text("summary", row),
+                translation: text("translation", row),
+            };
+            (addrs.value(row), article)
+        })
+        .collect()
+}
+
+/// The live rows of `read` whose `column` flag is false: a refresh's work.
+async fn pending_articles(read: &Dataset, column: &str) -> BTreeMap<u64, Article> {
+    let flag_id = read.cell_flag(column, "ready").unwrap().flag_id;
+    let true_rows = read.cell_flag_true_rows(flag_id).unwrap();
+    let mut articles = articles_by_addr(read).await;
+    articles.retain(|addr, _| !true_rows.contains(*addr));
+    articles
+}
+
+/// Stage, against `read`, one full-fragment `column` file for every fragment
+/// `outputs` names: `outputs` on the rows it keys, every other row copied
+/// through as `read` shows it. Returns the groups and the rows they assign.
+async fn stage_outputs(
+    read: &Dataset,
+    column: &str,
+    outputs: &BTreeMap<u64, String>,
+) -> (Vec<DataReplacementGroup>, RowAddrTreeMap) {
+    let shown: BTreeMap<u64, Option<String>> = articles_by_addr(read)
+        .await
+        .into_iter()
+        .map(|(addr, article)| (addr, article.output(column).map(str::to_string)))
+        .collect();
+    let fragments: BTreeSet<u32> = outputs
+        .keys()
+        .map(|addr| RowAddress::from(*addr).fragment_id())
+        .collect();
+    let mut groups = Vec::new();
+    for fragment_id in fragments {
+        let value = |_: &str, offset: u64| {
+            let addr = u64::from(RowAddress::new_from_parts(fragment_id, offset as u32));
+            outputs
+                .get(&addr)
+                .cloned()
+                .or_else(|| shown.get(&addr).cloned().flatten())
+        };
+        groups.push(stage_rows(read, u64::from(fragment_id), &[column], value).await);
+    }
+    let mut assigned = RowAddrTreeMap::new();
+    for addr in outputs.keys() {
+        assigned.insert(*addr);
+    }
+    (groups, assigned)
+}
+
+/// Every output of `dataset` reads the function of its row's inputs at that
+/// version where its flag is true, and NULL where it is false.
+async fn assert_outputs_follow_inputs(dataset: &Dataset) {
+    let version = dataset.version().version;
+    let articles = articles_by_addr(dataset).await;
+    for (column, compute) in OUTPUTS {
+        let true_rows = dataset
+            .cell_flag(column, "ready")
+            .map(|flag| dataset.cell_flag_true_rows(flag.flag_id).unwrap())
+            .unwrap_or_default();
+        for (addr, article) in &articles {
+            let expected = true_rows.contains(*addr).then(|| compute(article));
+            assert_eq!(
+                article.output(column),
+                expected.as_deref(),
+                "{column} of id {} at version {version}",
+                article.id
+            );
+        }
+    }
+}
+
+/// The whole refresh loop over three fragments, with `summary` computed from
+/// title and body and `translation` from body and language. Both refreshes
+/// read one snapshot. While they run, sparse source writes land through
+/// `UpdateBuilder` and partial merge_insert, and a priority refresh of one
+/// row publishes. Both publish under `Skip`; follow-up refreshes compute only
+/// what the reports leave pending and reuse the staged values they report as
+/// still valid. No version ever shows an output that is not the function of
+/// the inputs shown with it.
+#[rstest]
+#[tokio::test]
+async fn test_refresh_loop_never_shows_a_stale_output(#[values(false, true)] stable_row_ids: bool) {
+    let text = |prefix: &str| -> ArrayRef {
+        Arc::new(StringArray::from_iter_values(
+            (1..=9).map(|id| format!("{prefix}{id}")),
+        ))
+    };
+    let languages: ArrayRef = Arc::new(StringArray::from_iter_values(
+        ["en", "fr", "de"].into_iter().cycle().take(9),
+    ));
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(1..=9)) as ArrayRef,
+        ),
+        ("title", text("t")),
+        ("body", text("b")),
+        ("language", languages),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let outputs = ArrowSchema::new(vec![
+        ArrowField::new("summary", DataType::Utf8, true),
+        ArrowField::new("translation", DataType::Utf8, true),
+    ]);
+    dataset
+        .add_columns(NewColumnTransform::AllNulls(Arc::new(outputs)), None, None)
+        .await
+        .unwrap();
+    let first_version = dataset.version().version;
+    let masked_on = |sources: &[&str]| {
+        CellFlagOptions::default()
+            .with_clear_on_write(sources.iter().copied())
+            .with_mask_when_false(true)
+    };
+    let summary = dataset
+        .register_cell_flag("summary", "ready", masked_on(&["title", "body"]))
+        .await
+        .unwrap()
+        .flag_id;
+    let translation = dataset
+        .register_cell_flag("translation", "ready", masked_on(&["body", "language"]))
+        .await
+        .unwrap()
+        .flag_id;
+
+    let read = dataset.clone();
+    let computed = |articles: BTreeMap<u64, Article>, compute: Compute| {
+        articles
+            .into_iter()
+            .map(|(addr, article)| (addr, compute(&article)))
+            .collect::<BTreeMap<u64, String>>()
+    };
+    let summaries = computed(pending_articles(&read, "summary").await, summary_of);
+    let translations = computed(pending_articles(&read, "translation").await, translation_of);
+    assert_eq!((summaries.len(), translations.len()), (9, 9));
+    let (summary_groups, summary_rows) = stage_outputs(&read, "summary", &summaries).await;
+    let (translation_groups, translation_rows) =
+        stage_outputs(&read, "translation", &translations).await;
+
+    // Id 2 (fragment 0) gets a new body, which moves it; id 5 (fragment 1) a
+    // new language and id 8 (fragment 2) a new title, in place.
+    let moved_at = update_where(&dataset, "id = 2", "body", "b2-edited").await;
+    let language_at = merge_insert_column(&moved_at, 5, "language", "es").await;
+    let title_at = merge_insert_column(&language_at, 8, "title", "t8-edited").await;
+    let id_4 = rows(&[(1, &[0])]);
+    let mut priority = pending_articles(&title_at, "summary").await;
+    priority.retain(|addr, _| id_4.contains(*addr));
+    let (groups, assigned) =
+        stage_outputs(&title_at, "summary", &computed(priority, summary_of)).await;
+    let prioritized = publish(&title_at, groups, set_true(summary, assigned), Skip)
+        .await
+        .unwrap();
+    let prioritized_at = title_at.version().version + 1;
+    assert_eq!(prioritized.report.committed_version, Some(prioritized_at));
+    assert_eq!(prioritized.report.published, vec![published(summary, id_4)]);
+
+    let summarized = publish(
+        &read,
+        summary_groups.clone(),
+        set_true(summary, summary_rows),
+        Skip,
+    )
+    .await
+    .unwrap();
+    let summarized_at = prioritized_at + 1;
+    assert_eq!(
+        summarized.report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version: prioritized_at,
+            committed_version: Some(summarized_at),
+            published: vec![published(summary, rows(&[(0, &[0, 2]), (2, &[0, 2])]))],
+            deferred_rows: vec![
+                deferred(
+                    summary,
+                    rows(&[(0, &[1])]),
+                    RowVacated,
+                    moved_at.version().version
+                ),
+                deferred(
+                    summary,
+                    rows(&[(2, &[1])]),
+                    InputChanged,
+                    title_at.version().version
+                ),
+            ],
+            deferred_groups: vec![DeferredGroup {
+                fragment_id: 1,
+                data_file: summary_groups[1].1.clone(),
+                reason: NewerResult,
+                conflicting_version: prioritized_at,
+                valid_rows: vec![published(summary, rows(&[(1, &[0, 1, 2])]))],
+            }],
+        }
+    );
+    let translated = publish(
+        &read,
+        translation_groups,
+        set_true(translation, translation_rows),
+        Skip,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        translated.report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version: summarized_at,
+            committed_version: Some(summarized_at + 1),
+            published: vec![published(
+                translation,
+                rows(&[(0, &[0, 2]), (1, &[0, 2]), (2, &[0, 1, 2])])
+            )],
+            deferred_rows: vec![
+                deferred(
+                    translation,
+                    rows(&[(0, &[1])]),
+                    RowVacated,
+                    moved_at.version().version
+                ),
+                deferred(
+                    translation,
+                    rows(&[(1, &[1])]),
+                    InputChanged,
+                    language_at.version().version
+                ),
+            ],
+            deferred_groups: vec![],
+        }
+    );
+
+    // Both follow-ups read the latest version. Each recomputes only the
+    // pending rows its report does not list as reusable: the rows whose inputs
+    // changed and id 2, which moved to a fresh address.
+    let head = latest(&translated.dataset).await;
+    let mut follow_ups = Vec::new();
+    for ((column, compute), (flag_id, staged, report), (reused_ids, computed_ids)) in [
+        (
+            OUTPUTS[0],
+            (summary, &summaries, &summarized.report),
+            ([5, 6].as_slice(), [2, 8].as_slice()),
+        ),
+        (
+            OUTPUTS[1],
+            (translation, &translations, &translated.report),
+            ([].as_slice(), [2, 5].as_slice()),
+        ),
+    ] {
+        let reusable = report.reusable_rows(flag_id);
+        let recompute = report.deferred_rows_of(flag_id, InputChanged);
+        let mut outputs = BTreeMap::new();
+        let (mut reused, mut recomputed) = (BTreeSet::new(), BTreeSet::new());
+        for (addr, article) in pending_articles(&head, column).await {
+            if reusable.contains(addr) {
+                outputs.insert(addr, staged[&addr].clone());
+                reused.insert(article.id);
+            } else {
+                assert!(
+                    recompute.contains(addr) || RowAddress::from(addr).fragment_id() == 3,
+                    "{column} of id {} is neither reported nor moved",
+                    article.id
+                );
+                outputs.insert(addr, compute(&article));
+                recomputed.insert(article.id);
+            }
+        }
+        assert_eq!(reused, reused_ids.iter().copied().collect(), "{column}");
+        assert_eq!(
+            recomputed,
+            computed_ids.iter().copied().collect(),
+            "{column}"
+        );
+        let (groups, assigned) = stage_outputs(&head, column, &outputs).await;
+        follow_ups.push((flag_id, groups, assigned));
+    }
+    let mut dataset = head.clone();
+    for (flag_id, groups, assigned) in follow_ups {
+        let result = publish(&head, groups, set_true(flag_id, assigned.clone()), Skip)
+            .await
+            .unwrap();
+        assert_eq!(result.report.published, vec![published(flag_id, assigned)]);
+        assert!(result.report.deferred_rows.is_empty());
+        assert!(result.report.deferred_groups.is_empty());
+        dataset = result.dataset;
+    }
+
+    let articles = articles_by_addr(&dataset).await;
+    assert_eq!(articles.len(), 9);
+    for flag_id in [summary, translation] {
+        let true_rows = dataset.cell_flag_true_rows(flag_id).unwrap();
+        assert!(
+            articles.keys().all(|addr| true_rows.contains(*addr)),
+            "flag {flag_id} is true on every row"
+        );
+    }
+    for version in first_version..=dataset.version().version {
+        assert_outputs_follow_inputs(&dataset.checkout_version(version).await.unwrap()).await;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

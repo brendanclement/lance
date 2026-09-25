@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Cell flag state across row-moving updates. `UpdateBuilder` moves the flags
-//! of the rows it rewrites into new fragments. A row-moving `merge_insert` or
-//! a hand-staged update cannot, so it is refused where an ordinary flag is true
-//! and leaves the rows it moves unassigned for dependent flags.
+//! Cell flag state across updates of existing rows. `UpdateBuilder` moves the
+//! flags of the rows it rewrites into new fragments. A row-moving
+//! `merge_insert` or a hand-staged update cannot, so it is refused where an
+//! ordinary flag is true and leaves the rows it moves unassigned for dependent
+//! flags. A partial-schema `merge_insert` rewrites columns in place and clears
+//! only the flags watching them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, UInt64Type};
-use arrow_array::{Array, RecordBatch, RecordBatchIterator, record_batch};
+use arrow_array::{
+    Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, record_batch,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ADDR};
@@ -19,7 +23,9 @@ use lance_select::{RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use rstest::rstest;
 
-use super::dataset_cell_flags::{commit_replacement, full, set_true, stage_all, update_config};
+use super::dataset_cell_flags::{
+    cleared, commit_replacement, full, recorded_invalidations, set_true, stage_all, update_config,
+};
 use crate::dataset::cell_flag::CellFlagOptions;
 use crate::dataset::schema_evolution::NewColumnTransform;
 use crate::dataset::transaction::{
@@ -27,7 +33,7 @@ use crate::dataset::transaction::{
 };
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
-use crate::dataset::{MergeInsertBuilder, UpdateBuilder};
+use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, UpdateBuilder};
 use crate::{Dataset, Result};
 
 struct Flags {
@@ -105,7 +111,7 @@ async fn flagged_articles(stable_row_ids: bool) -> (Dataset, Flags) {
 /// stays pending, `translation` published on every row, and `reviewed` set on
 /// `reviewed_ids`. Published values are `{s|t}-{fragment}-{offset}`.
 async fn published_articles(stable_row_ids: bool, reviewed_ids: &[i32]) -> (Dataset, Flags) {
-    let (dataset, flags) = flagged_articles(stable_row_ids).await;
+    let (dataset, flags) = Box::pin(flagged_articles(stable_row_ids)).await;
     let mut all_but_id_3 = full(&[0, 2]);
     all_but_id_3.insert_bitmap(1, RoaringBitmap::from_iter([1_u32]));
     let groups = stage_all(&dataset, "summary", "s").await;
@@ -123,7 +129,7 @@ async fn published_articles(stable_row_ids: bool, reviewed_ids: &[i32]) -> (Data
     let dataset = if reviewed_ids.is_empty() {
         dataset
     } else {
-        set_reviewed(&dataset, flags.reviewed, reviewed_ids).await
+        Box::pin(set_reviewed(&dataset, flags.reviewed, reviewed_ids)).await
     };
     (dataset, flags)
 }
@@ -192,8 +198,8 @@ async fn true_ids(dataset: &Dataset, flag_id: u32) -> BTreeSet<i32> {
         .collect()
 }
 
-/// `column` by id as a masked read returns it: NULL wherever `flag_id` is
-/// false, whatever is stored there.
+/// `column` by id as the scan reads it, which must be NULL wherever
+/// `flag_id` is false, whatever is stored there.
 async fn masked(dataset: &Dataset, column: &str, flag_id: u32) -> BTreeMap<i32, Option<String>> {
     let true_rows = dataset.cell_flag_true_rows(flag_id).unwrap();
     let batch = scan_with_addrs(dataset, &["id", column]).await;
@@ -202,10 +208,14 @@ async fn masked(dataset: &Dataset, column: &str, flag_id: u32) -> BTreeMap<i32, 
     let addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>();
     (0..batch.num_rows())
         .map(|row| {
-            let is_visible = true_rows.contains(addrs.value(row)) && values.is_valid(row);
+            assert!(
+                true_rows.contains(addrs.value(row)) || values.is_null(row),
+                "{column} of id {} reads a value under a false flag",
+                ids.value(row)
+            );
             (
                 ids.value(row),
-                is_visible.then(|| values.value(row).to_string()),
+                values.is_valid(row).then(|| values.value(row).to_string()),
             )
         })
         .collect()
@@ -307,6 +317,88 @@ async fn test_update_moves_flags_whose_watched_fields_it_does_not_set(
         .flat_map(|moved| moved.source_row_addrs.iter())
         .collect();
     assert_eq!(sources, updated.map(original_addr));
+}
+
+#[rstest]
+#[case::unrelated_field("views", false, false)]
+#[case::summary_source("title", true, false)]
+#[case::shared_source("body", true, true)]
+#[case::translation_source("language", false, true)]
+#[case::summary_output("summary", true, false)]
+#[tokio::test]
+async fn test_in_place_merge_insert_clears_only_flags_watching_it(
+    #[case] column: &str,
+    #[case] clears_summary: bool,
+    #[case] clears_translation: bool,
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let (dataset, flags) = published_articles(stable_row_ids, &[2, 4]).await;
+    // One row of each fragment; id 3 is pending for summary.
+    let written = [2, 3, 5];
+    let values: ArrayRef = if column == "views" {
+        Arc::new(Int32Array::from(vec![21, 31, 51]))
+    } else {
+        Arc::new(StringArray::from(vec!["x"; 3]))
+    };
+    let source = RecordBatch::try_from_iter_with_nullable([
+        (
+            "id",
+            Arc::new(Int32Array::from(written.to_vec())) as ArrayRef,
+            false,
+        ),
+        (column, values, true),
+    ])
+    .unwrap();
+    let (dataset, _) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap()
+        .execute_batches(vec![source])
+        .await
+        .unwrap();
+
+    let addrs = addrs_by_id(&dataset).await;
+    assert!(
+        (1..=6).all(|id| addrs[&id] == original_addr(id)),
+        "rows keep their addresses"
+    );
+    let mut expected_clears = Vec::new();
+    for (output, flag_id, prefix, clears) in [
+        ("summary", flags.summary, "s", clears_summary),
+        ("translation", flags.translation, "t", clears_translation),
+    ] {
+        let expected: BTreeMap<i32, Option<String>> = (1..=6)
+            .map(|id| {
+                let is_pending = output == "summary" && id == 3;
+                let is_cleared = clears && written.contains(&id);
+                (
+                    id,
+                    (!is_pending && !is_cleared).then(|| published(prefix, id)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            masked(&dataset, output, flag_id).await,
+            expected,
+            "{output}"
+        );
+        if clears {
+            let mut rows = RowAddrTreeMap::new();
+            for id in written {
+                rows.insert(original_addr(id));
+            }
+            // Recorded on id 3 too, where summary was already false.
+            expected_clears.extend(cleared(flag_id, rows));
+        }
+    }
+    assert_eq!(recorded_invalidations(&dataset).await, expected_clears);
+    assert_eq!(
+        true_ids(&dataset, flags.reviewed).await,
+        BTreeSet::from([2, 4])
+    );
 }
 
 #[rstest]

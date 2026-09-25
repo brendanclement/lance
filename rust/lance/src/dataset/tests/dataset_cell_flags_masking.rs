@@ -762,15 +762,26 @@ async fn test_takes_and_late_materialization_mask(#[values(false, true)] stable_
     assert_eq!(id_summaries(&batch), expected(&[4, 5, 7, 8, 10, 11]));
 }
 
+/// Update predicates read masked values, and the rows an update moves keep
+/// the flags whose inputs it does not set: setting `id` keeps ids 0, 2 and 4
+/// published at their new addresses, while setting `title` masks them.
 #[rstest]
+#[case::watched_source("title", "'edited'", "title = 'edited'", false)]
+#[case::unwatched_field("id", "id + 100", "id >= 100", true)]
 #[tokio::test]
-async fn test_write_predicates_see_masked_values(#[values(false, true)] stable_row_ids: bool) {
+async fn test_write_predicates_see_masked_values(
+    #[case] column: &str,
+    #[case] value: &str,
+    #[case] updated_filter: &str,
+    #[case] keeps_flag: bool,
+    #[values(false, true)] stable_row_ids: bool,
+) {
     let (dataset, flag_id) = masked_articles(stable_row_ids).await;
     let update = |predicate: &str| {
         UpdateBuilder::new(Arc::new(dataset.clone()))
             .update_where(predicate)
             .unwrap()
-            .set("title", "'edited'")
+            .set(column, value)
             .unwrap()
             .build()
             .unwrap()
@@ -784,19 +795,37 @@ async fn test_write_predicates_see_masked_values(#[values(false, true)] stable_r
         .scan()
         .project(&["id"])
         .unwrap()
-        .filter("title = 'edited'")
+        .filter(updated_filter)
         .unwrap()
         .try_into_batch()
         .await
         .unwrap();
     let mut edited = batch["id"].as_primitive::<Int32Type>().values().to_vec();
     edited.sort();
-    assert_eq!(edited, [0, 2, 4]);
-    // Editing `title` clears the flag on exactly the edited rows, so their
-    // summaries read NULL like every other row's.
-    let all_null: Vec<(i32, Option<String>)> = LIVE_IDS.iter().map(|id| (*id, None)).collect();
-    assert_eq!(scan_id_summaries(&updated.new_dataset).await, all_null);
-    assert_eq!(flagged_ids(&updated.new_dataset, flag_id).await, [1]);
+    let moved: Vec<i32> = [0, 2, 4]
+        .into_iter()
+        .map(|id| if keeps_flag { id + 100 } else { id })
+        .collect();
+    assert_eq!(edited, moved);
+    let mut summaries: Vec<(i32, Option<String>)> = expected(&LIVE_IDS)
+        .into_iter()
+        .map(|(id, summary)| {
+            if ![0, 2, 4].contains(&id) {
+                (id, summary)
+            } else if keeps_flag {
+                (id + 100, summary)
+            } else {
+                (id, None)
+            }
+        })
+        .collect();
+    summaries.sort();
+    assert_eq!(scan_id_summaries(&updated.new_dataset).await, summaries);
+    let mut flagged = vec![1];
+    if keeps_flag {
+        flagged.extend(&moved);
+    }
+    assert_eq!(flagged_ids(&updated.new_dataset, flag_id).await, flagged);
     assert_eq!(flagged_ids(&dataset, flag_id).await, [0, 1, 2, 4]);
 
     // Deletes commit to the same store as the update above, so they start
