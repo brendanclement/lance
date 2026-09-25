@@ -15,7 +15,9 @@ Prototype measurements on one local machine (Apple M5 Pro, 18 cores, 48 GB, APFS
 `release-with-debug`, baseline `e3671b2f5`. Prototype code by run:
 
 - `21601f894`: `smoke-final`, `1m` (full matrix), `10m` (subset, one round).
-- `26388225a`, the final code, which differs from `21601f894` only in the mask builder:
+- `26388225a`, the final benchmarked code, which differs from `21601f894` only in the mask builder
+  (the later fix `25d3cf3e5` changes only what the report says about a deferred publication file
+  carrying chained outputs, which no workload publishes, so nothing was re-run):
   `1m-clean` (full 1M matrix), `10m-reads-clean-baseline-first`, `10m-reads-clean-prototype-first`,
   and the read reruns `1m-reads-maskfix`, `10m-reads-maskfix` and `10m-reads-reversed`, which
   record `e48573011`, a results-only commit with the same code.
@@ -91,8 +93,11 @@ unrelated-field updates 0.98× / 1.11× (`1m`: 1.16× / 1.20×), dense updates 1
   publication commit takes 0.51–1.80 ms under `Skip` and 0.14–0.46 ms for the rejected commits.
   The permissive baseline without flags is **not correctness-equivalent**: it publishes 10·K stale
   values after in-place writes and is rejected after row-moving writes.
-- **Saved computation** (`1m` follow-ups): completing the refresh after `Reject` recomputes every
-  row (2,000,000 UDF rows in total, 1.26–1.29 s). After row-level deferral under `Skip`, or
+- **Saved computation** (`1m` follow-ups): after `Reject`, this harness's follow-up recomputes
+  every row (2,000,000 UDF rows in total, 1.26–1.29 s), because `Reject` returns only an error, with
+  no report of what stayed valid. `Reject` stops at the first conflict, so certifying the rest as
+  reusable would need Lance to finish validating the history first: a separate API change, not
+  just exposing the report `Skip` builds. After row-level deferral under `Skip`, or
   whole-fragment deferral with `reuse_valid_staged`, only the deferred rows are recomputed
   (1,000,010–1,000,160 in total, 16–85 ms). After whole-fragment deferral with
   `recompute_all_pending`, the deferred fragments are (1,500,000 / 1,900,000 / 2,000,000 in total
