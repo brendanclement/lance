@@ -8,10 +8,11 @@ use std::time::Duration;
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
+use crate::dataset::cell_flag::moved_cell_flag_rows;
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
-use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::utils::make_rowid_capture_stream;
+use crate::dataset::transaction::{CellFlagChanges, Operation, TransactionBuilder};
+use crate::dataset::utils::{CapturedRowIds, make_rowid_capture_stream};
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
 use arrow_array::{ArrayRef, RecordBatch};
@@ -32,6 +33,7 @@ use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::rowids::RowIdIndex;
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
 
@@ -67,6 +69,11 @@ fn collect_subtree_field_ids(field: &lance_core::datatypes::Field, out: &mut Vec
 /// # }
 /// ```
 ///
+/// The updated rows are rewritten into new fragments. On a dataset with
+/// [cell flags](crate::dataset::cell_flag) their flags move with them:
+/// ordinary flags keep their state, and so does each dependent flag that
+/// watches none of the columns being set, directly or through a dependent flag
+/// upstream of it. The other dependent flags start false on the updated rows.
 #[derive(Debug, Clone)]
 pub struct UpdateBuilder {
     /// The dataset snapshot to update.
@@ -292,6 +299,7 @@ pub struct UpdateData {
     new_fragments: Vec<Fragment>,
     affected_rows: RowAddrTreeMap,
     num_updated_rows: u64,
+    cell_flag_changes: CellFlagChanges,
 }
 
 #[derive(Debug, Clone)]
@@ -494,8 +502,14 @@ impl UpdateJob {
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
-        let deletions_result = self.apply_deletions(&row_addrs).await;
-        let (old_fragments, removed_fragment_ids) = match deletions_result {
+        let deletions_result = async {
+            let cell_flag_changes =
+                self.cell_flag_changes(&removed_row_ids, row_id_index.as_deref(), &new_fragments)?;
+            let deletions = self.apply_deletions(&row_addrs).await?;
+            Ok::<_, Error>((deletions, cell_flag_changes))
+        }
+        .await;
+        let ((old_fragments, removed_fragment_ids), cell_flag_changes) = match deletions_result {
             Ok(v) => v,
             Err(e) => {
                 cleanup_data_fragments(
@@ -521,6 +535,58 @@ impl UpdateJob {
             new_fragments,
             affected_rows,
             num_updated_rows,
+            cell_flag_changes,
+        })
+    }
+
+    /// The moved rows and the fields written on them, from which the commit
+    /// moves the flag state of the updated rows.
+    ///
+    /// Listed whenever a flag is registered, not only where the snapshot has
+    /// true rows: the commit copies the head's state, which an explicit update
+    /// committed after this snapshot may have set.
+    fn cell_flag_changes(
+        &self,
+        captured_row_ids: &CapturedRowIds,
+        row_id_index: Option<&RowIdIndex>,
+        new_fragments: &[Fragment],
+    ) -> Result<CellFlagChanges> {
+        let has_cell_flags = self
+            .dataset
+            .manifest
+            .cell_flags
+            .as_deref()
+            .is_some_and(|registry| !registry.definitions().is_empty());
+        if !has_cell_flags || new_fragments.is_empty() {
+            return Ok(CellFlagChanges::default());
+        }
+        // Row ids are captured as batches leave the scan, and every later
+        // stage (`then`, `buffered`, the writer) keeps batch and row order, so
+        // the new fragments hold the rows in capture order. The row id
+        // rechunk above relies on the same.
+        let moved_rows = moved_cell_flag_rows(
+            new_fragments,
+            captured_row_ids.num_rows(),
+            captured_row_ids.row_addrs_in_capture_order(row_id_index)?,
+        )?;
+        let schema = self.dataset.schema();
+        let mut written_fields = self
+            .updates
+            .keys()
+            .map(|column| {
+                schema.field(column).map(|field| field.id).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "updated column '{column}' is not in the schema of version {}",
+                        self.dataset.manifest.version
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        written_fields.sort_unstable();
+        Ok(CellFlagChanges {
+            moved_rows,
+            moved_rows_written_fields: Some(written_fields),
+            ..Default::default()
         })
     }
 
@@ -556,7 +622,9 @@ impl UpdateJob {
             updated_fragment_offsets: None,
         };
 
-        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+            .cell_flag_changes(update_data.cell_flag_changes)
+            .build();
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)

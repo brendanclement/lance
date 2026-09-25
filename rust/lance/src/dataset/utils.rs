@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::Result;
+use crate::{Error, Result};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array};
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -114,6 +114,37 @@ impl CapturedRowIds {
         match self {
             Self::SequenceStyle(sequence) => Some(sequence),
             _ => None,
+        }
+    }
+
+    pub fn num_rows(&self) -> u64 {
+        match self {
+            Self::AddressStyle(addrs) => addrs.len(),
+            Self::SequenceStyle(sequence) => sequence.len(),
+        }
+    }
+
+    /// The address of every captured row, in capture order. Address-style
+    /// captures are in ascending order, since [`Self::capture`] refuses any
+    /// other, so that order is also the capture order.
+    pub fn row_addrs_in_capture_order<'a>(
+        &'a self,
+        index: Option<&'a RowIdIndex>,
+    ) -> Result<Box<dyn Iterator<Item = Result<u64>> + 'a>> {
+        match self {
+            Self::AddressStyle(addrs) => Ok(Box::new(addrs.iter().map(Ok))),
+            Self::SequenceStyle(sequence) => {
+                let index = index.ok_or_else(|| {
+                    Error::internal("resolving captured stable row ids needs a row id index")
+                })?;
+                Ok(Box::new(sequence.iter().map(|row_id| {
+                    index.get(row_id)?.map(u64::from).ok_or_else(|| {
+                        Error::internal(format!(
+                            "captured row id {row_id} is not in the row id index"
+                        ))
+                    })
+                })))
+            }
         }
     }
 

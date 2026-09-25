@@ -17,7 +17,6 @@ use crate::{
     },
 };
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
@@ -563,8 +562,12 @@ impl<'a> TransactionRebase<'a> {
         let sources: HashSet<u32> = changes
             .moved_rows
             .iter()
-            .flat_map(|moved| moved.source_row_addrs.iter())
-            .map(|addr| RowAddress::from(*addr).fragment_id())
+            .flat_map(|moved| {
+                moved
+                    .source_row_addrs
+                    .bitmaps()
+                    .map(|(fragment, _)| fragment)
+            })
             .collect();
         let registry = self.cell_flags.moved_rows_registry.as_deref();
         // A flag registered after our read version cannot be classified, so it
@@ -2633,7 +2636,9 @@ mod tests {
         dataset::{CommitBuilder, InsertBuilder, WriteParams},
         io,
     };
+    use lance_core::utils::address::RowAddress;
     use lance_table::format::DataFile;
+    use roaring::RoaringTreemap;
 
     async fn test_dataset(num_rows: usize, num_fragments: usize) -> Dataset {
         let write_params = WriteParams {
@@ -4306,7 +4311,9 @@ mod tests {
             moved_rows: vec![CellFlagMovedRows {
                 fragment_path: "moved.lance".to_string(),
                 offsets: RoaringBitmap::from_iter([0_u32]),
-                source_row_addrs: vec![u64::from(RowAddress::new_from_parts(0, 1))],
+                source_row_addrs: RoaringTreemap::from_iter([u64::from(
+                    RowAddress::new_from_parts(0, 1),
+                )]),
             }],
             ..Default::default()
         };

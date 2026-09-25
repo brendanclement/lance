@@ -343,14 +343,11 @@ async fn test_input_write_masks_published_output(
             cleared(flag_id, write.clears())
         }
     );
-    let expected_flags = match write {
-        // The moved row keeps its old, now deleted, address in the state.
-        BodyWrite::Update => full(&[0, 1]),
-        BodyWrite::Replace | BodyWrite::MergeInsert => write.still_valid(),
-    };
+    // A row-moving update clears the moved row's old address, and its new
+    // row starts unassigned because the update wrote a source.
     assert_eq!(
         written.cell_flag_true_rows(flag_id).unwrap(),
-        expected_flags
+        write.still_valid()
     );
     let id_2_published = !matches!(write, BodyWrite::Replace);
     let mut expected = vec![(3, Some("s-1-0")), (4, Some("s-1-1"))];
@@ -443,14 +440,9 @@ async fn test_refresh_staged_before_input_write(
         }
     );
     let committed = result.dataset;
-    let expected_flags = match write {
-        // The moved row keeps its old, now deleted, address in the state.
-        BodyWrite::Update => full(&[0, 1]),
-        BodyWrite::Replace | BodyWrite::MergeInsert => write.still_valid(),
-    };
     assert_eq!(
         committed.cell_flag_true_rows(flag_id).unwrap(),
-        expected_flags
+        write.still_valid()
     );
     let mut expected = vec![(3, Some("new-1-0")), (4, Some("new-1-1"))];
     if !matches!(write, BodyWrite::Replace) {
