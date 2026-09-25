@@ -1,21 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod publication;
+
+pub(crate) use publication::ensure_skip_eligible;
+
+use crate::dataset::cell_flag::{DependencyConflictPolicy, PublicationDeferrals};
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
-    dataset::transaction::{DataOverlayGroup, Operation, Transaction, UpdateMode},
+    dataset::transaction::{
+        CellFlagChanges, CellFlagUpdate, DataOverlayGroup, Operation, Transaction, UpdateMode,
+    },
 };
 use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
-use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
+use lance_table::format::{CellFlagRegistry, IndexMetadata};
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -37,6 +45,17 @@ pub struct TransactionRebase<'a> {
     /// Compacted SSTables from conflicting UpdateMemWalState transactions.
     /// Used when rebasing CreateIndex of MemWalIndex.
     conflicting_mem_wal_compacted_sstables: Vec<CompactedSsTable>,
+    cell_flags: CellFlagRebase,
+}
+
+#[derive(Debug, Default)]
+struct CellFlagRebase {
+    policy: DependencyConflictPolicy,
+    /// Set when the transaction publishes dependent cell flags.
+    publication: Option<publication::Publication>,
+    /// The registry at the read version of an update that moves flagged rows,
+    /// to tell which flags a concurrent transaction sets are dependent.
+    moved_rows_registry: Option<Arc<CellFlagRegistry>>,
 }
 
 /// Whether `operation` may make a nullability-affecting schema change: a
@@ -99,6 +118,56 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
+        Self::try_new_with_policy(
+            dataset,
+            transaction,
+            affected_rows,
+            DependencyConflictPolicy::Reject,
+        )
+        .await
+    }
+
+    /// Like [`Self::try_new`], with `policy` deciding what a publication does
+    /// with rows and groups a concurrent transaction made unsafe.
+    pub(crate) async fn try_new_with_policy(
+        dataset: &Dataset,
+        transaction: Transaction,
+        affected_rows: Option<&'a RowAddrTreeMap>,
+        policy: DependencyConflictPolicy,
+    ) -> Result<Self> {
+        let mut rebase =
+            Self::try_new_without_cell_flags(dataset, transaction, affected_rows).await?;
+        rebase.cell_flags.policy = policy;
+        let Some(changes) = rebase.transaction.cell_flag_changes.as_deref() else {
+            return Ok(rebase);
+        };
+        let publishes = changes.sets_any_flag()
+            && matches!(
+                rebase.transaction.operation,
+                Operation::DataReplacement { .. }
+            );
+        if !publishes && changes.moved_rows.is_empty() {
+            return Ok(rebase);
+        }
+        let read_dataset = dataset_at_read_version(dataset, &rebase.transaction).await?;
+        if publishes {
+            rebase.cell_flags.publication = publication::Publication::try_new(
+                &read_dataset.manifest,
+                &rebase.transaction,
+                &rebase.initial_fragments,
+                policy,
+            )?;
+        } else {
+            rebase.cell_flags.moved_rows_registry = read_dataset.manifest.cell_flags.clone();
+        }
+        Ok(rebase)
+    }
+
+    async fn try_new_without_cell_flags(
+        dataset: &Dataset,
+        transaction: Transaction,
+        affected_rows: Option<&'a RowAddrTreeMap>,
+    ) -> Result<Self> {
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
@@ -117,6 +186,7 @@ impl<'a> TransactionRebase<'a> {
                 modified_fragment_ids: HashSet::new(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                cell_flags: CellFlagRebase::default(),
             }),
             Operation::Delete {
                 updated_fragments,
@@ -145,6 +215,7 @@ impl<'a> TransactionRebase<'a> {
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
+                        cell_flags: CellFlagRebase::default(),
                     });
                 }
 
@@ -158,6 +229,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    cell_flags: CellFlagRebase::default(),
                 })
             }
             Operation::Rewrite { groups, .. } => {
@@ -176,6 +248,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    cell_flags: CellFlagRebase::default(),
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -191,6 +264,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    cell_flags: CellFlagRebase::default(),
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -206,6 +280,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    cell_flags: CellFlagRebase::default(),
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -220,6 +295,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    cell_flags: CellFlagRebase::default(),
                 })
             }
         }
@@ -321,6 +397,9 @@ impl<'a> TransactionRebase<'a> {
                 self.check_overwrite_txn(other_transaction, other_version)
             }
             Operation::Append { .. } => self.check_append_txn(other_transaction, other_version),
+            Operation::DataReplacement { .. } if self.cell_flags.publication.is_some() => {
+                self.check_publication_txn(other_transaction, other_version)
+            }
             Operation::DataReplacement { .. } => {
                 self.check_data_replacement_txn(other_transaction, other_version)
             }
@@ -350,7 +429,10 @@ impl<'a> TransactionRebase<'a> {
     /// Explicit cell flag updates address rows by their physical position at
     /// the read version, and registrations name field ids resolved there.
     /// Conflict with a concurrent transaction that moved or removed an
-    /// addressed row, or that can reassign field ids.
+    /// addressed row, that updated the same flag on an addressed row, or that
+    /// can reassign field ids. A publication's own flags are checked by
+    /// `check_publication_txn` instead, except that moved or removed rows stay
+    /// a conflict under the `Reject` policy.
     fn check_cell_flag_changes_txn(
         &self,
         other_transaction: &Transaction,
@@ -359,6 +441,7 @@ impl<'a> TransactionRebase<'a> {
         let Some(changes) = self.transaction.cell_flag_changes.as_deref() else {
             return Ok(());
         };
+        self.check_moved_rows_sources(changes, other_transaction, other_version)?;
         if changes.registrations.is_empty() && changes.updates.is_empty() {
             return Ok(());
         }
@@ -380,9 +463,47 @@ impl<'a> TransactionRebase<'a> {
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
+        let publication = self.cell_flags.publication.as_ref();
+        let is_published = |update: &&CellFlagUpdate| {
+            publication.is_some_and(|publication| publication.publishes(update.flag_id))
+        };
+        if let Some(theirs) = other_transaction.cell_flag_changes.as_deref() {
+            for ours in changes
+                .updates
+                .iter()
+                .filter(|update| !is_published(update))
+            {
+                let Some(overlap) = theirs
+                    .updates
+                    .iter()
+                    .filter(|their| their.flag_id == ours.flag_id)
+                    .map(|their| their.rows.clone() & &ours.rows)
+                    .find(|overlap| !overlap.is_empty())
+                else {
+                    continue;
+                };
+                let fragments: Vec<u32> = overlap.iter().map(|(fragment, _)| *fragment).collect();
+                return Err(Error::retryable_commit_conflict_source(
+                    other_version,
+                    format!(
+                        "This {} transaction was preempted by concurrent transaction {} at \
+                         version {other_version}, which also updated cell flag {} on rows of \
+                         fragment(s) {fragments:?} that this transaction sets to {}. Please retry.",
+                        self.transaction.operation,
+                        other_transaction.operation,
+                        ours.flag_id,
+                        ours.value
+                    )
+                    .into(),
+                ));
+            }
+        }
+        let handles_moved_rows =
+            publication.is_some() && self.cell_flags.policy == DependencyConflictPolicy::Skip;
         let addressed: HashSet<u64> = changes
             .updates
             .iter()
+            .filter(|update| !(handles_moved_rows && is_published(update)))
             .flat_map(|update| update.rows.iter().map(|(fragment, _)| u64::from(*fragment)))
             .collect();
         let moved_or_removed: Vec<u64> = match &other_transaction.operation {
@@ -417,6 +538,50 @@ impl<'a> TransactionRebase<'a> {
             _ => Vec::new(),
         };
         if moved_or_removed.iter().any(|id| addressed.contains(id)) {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+        Ok(())
+    }
+
+    /// A row-moving update copies the head's flag state onto the rows it
+    /// moves, while their values were read at its read version. Those agree
+    /// only if no concurrent transaction published a dependent flag on a
+    /// source fragment in between. The Update-vs-DataReplacement rule already
+    /// makes that a conflict; this keeps it one regardless.
+    fn check_moved_rows_sources(
+        &self,
+        changes: &CellFlagChanges,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        if changes.moved_rows.is_empty() {
+            return Ok(());
+        }
+        let Some(theirs) = other_transaction.cell_flag_changes.as_deref() else {
+            return Ok(());
+        };
+        let sources: HashSet<u32> = changes
+            .moved_rows
+            .iter()
+            .flat_map(|moved| moved.source_row_addrs.iter())
+            .map(|addr| RowAddress::from(*addr).fragment_id())
+            .collect();
+        let registry = self.cell_flags.moved_rows_registry.as_deref();
+        // A flag registered after our read version cannot be classified, so it
+        // counts as dependent.
+        let is_ordinary = |flag_id: u32| {
+            registry
+                .and_then(|registry| registry.definition(flag_id))
+                .is_some_and(|definition| !definition.is_dependent())
+        };
+        if theirs.updates.iter().any(|update| {
+            update.value
+                && !is_ordinary(update.flag_id)
+                && update
+                    .rows
+                    .iter()
+                    .any(|(fragment, _)| sources.contains(fragment))
+        }) {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
         Ok(())
@@ -1903,6 +2068,9 @@ impl<'a> TransactionRebase<'a> {
 
     /// Writes
     pub async fn finish(self, dataset: &Dataset) -> Result<Transaction> {
+        if self.cell_flags.publication.is_some() {
+            return Ok(self.finish_publication(dataset).await?.0);
+        }
         match &self.transaction.operation {
             Operation::Delete { .. } | Operation::Update { .. } => {
                 self.finish_delete_update(dataset).await
@@ -1922,6 +2090,18 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(self.transaction),
         }
+    }
+
+    /// Like [`Self::finish`], also returning what a publication deferred.
+    /// A publication keeps its read version: its values were computed there.
+    pub(crate) async fn finish_with_report(
+        self,
+        dataset: &Dataset,
+    ) -> Result<(Transaction, PublicationDeferrals)> {
+        if self.cell_flags.publication.is_some() {
+            return self.finish_publication(dataset).await;
+        }
+        Ok((self.finish(dataset).await?, PublicationDeferrals::default()))
     }
 
     async fn finish_delete_update(mut self, dataset: &Dataset) -> Result<Transaction> {
@@ -2353,6 +2533,23 @@ impl<'a> TransactionRebase<'a> {
     }
 }
 
+async fn dataset_at_read_version<'d>(
+    dataset: &'d Dataset,
+    transaction: &Transaction,
+) -> Result<Cow<'d, Dataset>> {
+    if dataset.manifest.version != transaction.read_version {
+        // The read version may have been garbage-collected by a concurrent
+        // `cleanup_old_versions` between the commit attempt and the rebase.
+        // Propagate the error so the commit fails gracefully instead of
+        // panicking (which aborts the whole process when `panic = "abort"`).
+        Ok(Cow::Owned(
+            dataset.checkout_version(transaction.read_version).await?,
+        ))
+    } else {
+        Ok(Cow::Borrowed(dataset))
+    }
+}
+
 async fn initial_fragments_for_rebase(
     dataset: &Dataset,
     transaction: &Transaction,
@@ -2362,15 +2559,7 @@ async fn initial_fragments_for_rebase(
         return Ok(HashMap::new());
     }
 
-    let dataset = if dataset.manifest.version != transaction.read_version {
-        // The read version may have been garbage-collected by a concurrent
-        // `cleanup_old_versions` between the commit attempt and the rebase.
-        // Propagate the error so the commit fails gracefully instead of
-        // panicking (which aborts the whole process when `panic = "abort"`).
-        Cow::Owned(dataset.checkout_version(transaction.read_version).await?)
-    } else {
-        Cow::Borrowed(dataset)
-    };
+    let dataset = dataset_at_read_version(dataset, transaction).await?;
 
     Ok(dataset
         .fragments()
@@ -3641,6 +3830,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                cell_flags: CellFlagRebase::default(),
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
@@ -3845,6 +4035,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                cell_flags: CellFlagRebase::default(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -3904,6 +4095,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                cell_flags: CellFlagRebase::default(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4045,6 +4237,7 @@ mod tests {
                 affected_rows: affected_rows.as_ref(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                cell_flags: CellFlagRebase::default(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4059,6 +4252,114 @@ mod tests {
                     "update should be compatible with {other:?}, got {result:?}"
                 );
             }
+        }
+    }
+
+    /// A row-moving update copies the head's flag state onto the rows it moves,
+    /// whose values it read earlier, so a concurrent transaction setting a
+    /// dependent flag true on a source fragment conflicts even when the
+    /// operations alone do not. A flag the read version does not know counts
+    /// as dependent.
+    #[rstest::rstest]
+    #[case::dependent(1, 0, true)]
+    #[case::registered_later(9, 0, true)]
+    #[case::ordinary(2, 0, false)]
+    #[case::not_a_source(1, 1, false)]
+    fn test_moved_rows_conflict_with_dependent_flag_set_on_source(
+        #[case] flag_id: u32,
+        #[case] fragment_id: u32,
+        #[case] is_conflict: bool,
+    ) {
+        use crate::dataset::transaction::{
+            CellFlagChanges, CellFlagMovedRows, CellFlagUpdate, TransactionBuilder,
+        };
+        use lance_table::format::pb;
+
+        let definition = |flag_id, field_id, name: &str, clear_on_write| pb::CellFlagDefinition {
+            flag_id,
+            field_id,
+            name: name.to_string(),
+            clear_on_write,
+            mask_when_false: false,
+        };
+        let registry = CellFlagRegistry::try_from(pb::CellFlagRegistry {
+            definitions: vec![
+                definition(1, 3, "ready", vec![2]),
+                definition(2, 1, "reviewed", vec![]),
+            ],
+            next_flag_id: 3,
+            states: vec![],
+        })
+        .unwrap();
+        let update = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![Fragment::new(0)],
+            new_fragments: vec![Fragment::new(2)],
+            fields_modified: vec![],
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(RewriteRows),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        let moved = CellFlagChanges {
+            moved_rows: vec![CellFlagMovedRows {
+                fragment_path: "moved.lance".to_string(),
+                offsets: RoaringBitmap::from_iter([0_u32]),
+                source_row_addrs: vec![u64::from(RowAddress::new_from_parts(0, 1))],
+            }],
+            ..Default::default()
+        };
+        let mut rebase = TransactionRebase {
+            transaction: TransactionBuilder::new(0, update.clone())
+                .cell_flag_changes(moved)
+                .build(),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(&update).collect(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase {
+                moved_rows_registry: Some(Arc::new(registry)),
+                ..Default::default()
+            },
+        };
+        // The replacement is of fragment 1, so only its flag update can make
+        // it conflict with the update of fragment 0.
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_fragment(fragment_id);
+        let replacement = Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(
+                1,
+                DataFile::new_legacy_from_fields("summary.lance", vec![3], None),
+            )],
+        };
+        let other = TransactionBuilder::new(0, replacement)
+            .cell_flag_changes(CellFlagChanges {
+                updates: vec![CellFlagUpdate {
+                    flag_id,
+                    value: true,
+                    rows,
+                }],
+                ..Default::default()
+            })
+            .build();
+
+        let result = rebase.check_txn(&other, 1);
+        if is_conflict {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("preempted by concurrent transaction DataReplacement at version 1"),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
         }
     }
 
@@ -4087,6 +4388,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                cell_flags: CellFlagRebase::default(),
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -4102,6 +4404,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                cell_flags: CellFlagRebase::default(),
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -4182,6 +4485,7 @@ mod tests {
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
+                        cell_flags: CellFlagRebase::default(),
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -4232,6 +4536,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
         let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
         assert_eq!(
@@ -4363,6 +4668,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
         let update = Transaction::new(
             1,
@@ -4439,6 +4745,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                cell_flags: CellFlagRebase::default(),
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -4460,6 +4767,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -4504,6 +4812,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
 
         let same_name = Transaction::new(
@@ -4559,6 +4868,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -4617,6 +4927,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
         let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -4658,6 +4969,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
 
         let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -4700,6 +5012,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
 
         let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -4769,6 +5082,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                cell_flags: CellFlagRebase::default(),
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -5450,6 +5764,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                cell_flags: CellFlagRebase::default(),
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -5513,6 +5828,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5551,6 +5867,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5590,6 +5907,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5629,6 +5947,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5679,6 +5998,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5704,6 +6024,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -5750,6 +6071,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            cell_flags: CellFlagRebase::default(),
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState

@@ -229,32 +229,49 @@ fn upstream_first(registry: &CellFlagRegistry) -> Result<Vec<&CellFlagDefinition
     Ok(ordered)
 }
 
-/// The rows of `fragment` that a replacement group writing the watched fields
-/// `written` publishes for `definition` without invalidating it: the rows the
-/// transaction sets the flag true on, narrowed to those where every other
-/// watched field the group writes is the output of a dependent flag published
-/// on the same rows. `None` when no row qualifies, e.g. because the group also
-/// writes a source nothing publishes.
-fn publication_exemption(
+/// The rows of `fragment` whose value of a field `definition` watches changed,
+/// for a publication group writing the watched fields `written`. Rows the
+/// transaction does not assign are copied through, so a published flag's
+/// output changed only on the rows that flag assigns; any other written field
+/// changed on the whole fragment. The rows `definition` itself assigns are
+/// exempt, except from a whole-fragment change, which the commit then refuses
+/// as a publication its own transaction invalidates.
+fn copy_through_clears(
     registry: &CellFlagRegistry,
     definition: &CellFlagDefinition,
     written: &BTreeSet<i32>,
     published: &HashMap<u32, RowAddrTreeMap>,
-    fragment: u32,
-) -> Option<RowAddrSelection> {
-    let mut exempt = published.get(&definition.flag_id)?.get(&fragment)?.clone();
-    for field_id in written.iter().filter(|id| **id != definition.field_id) {
-        let upstream = registry.dependent_flag(*field_id)?;
-        let upstream_rows = published.get(&upstream.flag_id)?.get(&fragment)?;
-        exempt = match (exempt, upstream_rows) {
-            (exempt, RowAddrSelection::Full) => exempt,
-            (RowAddrSelection::Full, partial) => partial.clone(),
-            (RowAddrSelection::Partial(rows), RowAddrSelection::Partial(upstream_rows)) => {
-                RowAddrSelection::Partial(rows & upstream_rows)
-            }
+    fragment_id: u64,
+    head_fragments: &HashMap<u64, &Fragment>,
+) -> Result<Option<RowAddrSelection>> {
+    let fragment = fragment_key(fragment_id)?;
+    let mut changed = RowAddrTreeMap::new();
+    for field_id in written {
+        let Some(upstream) = registry
+            .dependent_flag(*field_id)
+            .filter(|upstream| published.contains_key(&upstream.flag_id))
+        else {
+            return Ok(Some(RowAddrSelection::Full));
         };
+        if upstream.flag_id == definition.flag_id {
+            continue;
+        }
+        if let Some(rows) = published[&upstream.flag_id].get(&fragment) {
+            let mut upstream_rows = RowAddrTreeMap::new();
+            insert_selection(&mut upstream_rows, fragment, rows.clone());
+            changed |= &upstream_rows;
+        }
     }
-    Some(exempt)
+    let Some(changed) = changed.get(&fragment).cloned() else {
+        return Ok(None);
+    };
+    match published
+        .get(&definition.flag_id)
+        .and_then(|rows| rows.get(&fragment))
+    {
+        Some(own) => subtract_selection(changed, own, fragment_id, head_fragments),
+        None => Ok(Some(changed)),
+    }
 }
 
 /// `written` without `exempt`, or `None` when nothing remains.
@@ -293,11 +310,17 @@ fn subtract_selection(
 /// state: a write is recorded even where the flag is already false, which is
 /// what lets a concurrent publisher that read before the write notice it.
 ///
-/// A `DataReplacement` that sets a flag true publishes it, so the rows it
-/// assigns in a group that writes the flag's output are not recorded against
-/// that flag, unless the group also writes a source that is not published on
-/// those rows. The flag's other rows in that fragment are recorded: their
-/// output value was overwritten without being published.
+/// A publication group, a `DataReplacement` group whose file writes the output
+/// of a dependent flag the transaction sets true, follows the copy-through
+/// contract: every row of its fragment the transaction does not assign was
+/// copied unchanged from the read snapshot, so it counts as logically
+/// unchanged here, while the conflict resolver counts the whole file as
+/// written. Over the watched fields of a flag the group writes, the flag's own
+/// published output contributes nothing, the output of another published flag
+/// contributes the rows that flag assigns in the fragment, and any other field
+/// the whole fragment. The rows the flag itself assigns there are exempt,
+/// except from a whole-fragment contribution. Other groups record the whole
+/// fragment.
 pub fn derive_cell_flag_invalidations(
     head: &Manifest,
     txn: &Transaction,
@@ -358,6 +381,23 @@ pub fn derive_cell_flag_invalidations(
         .map(|fragment| (fragment.id, fragment))
         .collect();
     let published = published_rows(updates);
+    let published_outputs: HashSet<i32> = published
+        .keys()
+        .filter_map(|flag_id| registry.definition(*flag_id))
+        .filter(|definition| definition.is_dependent())
+        .map(|definition| definition.field_id)
+        .collect();
+    let written_top_level: Vec<BTreeSet<i32>> = writes
+        .iter()
+        .map(|write| {
+            write
+                .field_ids
+                .iter()
+                .filter(|id| **id >= 0)
+                .map(|id| top_of(*id))
+                .collect()
+        })
+        .collect();
     let mut every_row = RowAddrTreeMap::new();
     if !remasked.is_empty() {
         for fragment in head.fragments.iter() {
@@ -372,33 +412,41 @@ pub fn derive_cell_flag_invalidations(
     for definition in upstream_first(registry)? {
         let watched: HashSet<i32> = definition.watched_field_ids().collect();
         let mut rows = RowAddrTreeMap::new();
-        for write in &writes {
-            let written: BTreeSet<i32> = write
-                .field_ids
+        for (write, written_top_level) in writes.iter().zip(&written_top_level) {
+            let written: BTreeSet<i32> = written_top_level
                 .iter()
-                .filter(|id| **id >= 0)
-                .map(|id| top_of(*id))
+                .copied()
                 .filter(|id| watched.contains(id))
                 .collect();
             if written.is_empty() {
                 continue;
             }
             let fragment = fragment_key(write.fragment_id)?;
-            let mut selection = match write.offsets {
-                Some(offsets) => RowAddrSelection::Partial(offsets.clone()),
-                None => RowAddrSelection::Full,
-            };
-            if write.is_replacement
-                && written.contains(&definition.field_id)
-                && let Some(exempt) =
-                    publication_exemption(registry, definition, &written, &published, fragment)
-            {
-                match subtract_selection(selection, &exempt, write.fragment_id, &head_fragments)? {
-                    Some(remaining) => selection = remaining,
+            let is_publication_group = write.is_replacement
+                && written_top_level
+                    .iter()
+                    .any(|id| published_outputs.contains(id));
+            let selection = if is_publication_group {
+                match copy_through_clears(
+                    registry,
+                    definition,
+                    &written,
+                    &published,
+                    write.fragment_id,
+                    &head_fragments,
+                )? {
+                    Some(selection) => selection,
                     None => continue,
                 }
-            }
-            insert_selection(&mut rows, fragment, selection);
+            } else {
+                match write.offsets {
+                    Some(offsets) => RowAddrSelection::Partial(offsets.clone()),
+                    None => RowAddrSelection::Full,
+                }
+            };
+            let mut written_rows = RowAddrTreeMap::new();
+            insert_selection(&mut written_rows, fragment, selection);
+            rows |= &written_rows;
         }
         for source in &definition.clear_on_write {
             if let Some(upstream) = registry.dependent_flag(*source)
@@ -1734,7 +1782,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_exempts_only_the_rows_a_publication_assigns() {
+    fn derive_counts_unassigned_rows_of_a_publication_as_copied() {
         let head = commit(
             &manifest(),
             &register_txn(
@@ -1758,21 +1806,14 @@ mod tests {
             })
             .build();
         let derived = derive_cell_flag_invalidations(&head, &publish).unwrap();
-        let unassigned: Vec<u32> = (3..ROWS as u32).collect();
         assert_eq!(
             derived,
-            vec![
-                CellFlagUpdate {
-                    flag_id: 1,
-                    value: false,
-                    rows: rows(&[(0, Some(&unassigned))]),
-                },
-                CellFlagUpdate {
-                    flag_id: 2,
-                    value: false,
-                    rows: rows(&[(0, None)]),
-                },
-            ]
+            vec![CellFlagUpdate {
+                flag_id: 2,
+                value: false,
+                rows: rows(&[(0, Some(&[0, 1, 2]))]),
+            }],
+            "summary changed only where ready was assigned"
         );
         let next = commit(&head, &publish).unwrap();
         assert_eq!(
@@ -1780,6 +1821,30 @@ mod tests {
             Some(&RowAddrSelection::Partial(RoaringBitmap::from_iter([
                 0_u32, 1, 2
             ])))
+        );
+
+        // An incremental refresh keeps the rows an earlier one completed.
+        let publish_rest = TransactionBuilder::new(3, replacement(0, summary_file("s2")))
+            .cell_flag_changes(CellFlagChanges {
+                updates: vec![CellFlagUpdate {
+                    flag_id: 1,
+                    value: true,
+                    rows: rows(&[(0, Some(&[3, 4]))]),
+                }],
+                ..Default::default()
+            })
+            .build();
+        let derived = derive_cell_flag_invalidations(&next, &publish_rest).unwrap();
+        assert_eq!(
+            derived.iter().map(|u| u.flag_id).collect::<Vec<_>>(),
+            vec![2]
+        );
+        let next = commit(&next, &publish_rest).unwrap();
+        assert_eq!(
+            registry_of(&next).true_rows(1, 0),
+            Some(&RowAddrSelection::Partial(RoaringBitmap::from_iter(
+                0_u32..5
+            )))
         );
 
         // A full publication records nothing against its own flag.
@@ -1942,11 +2007,12 @@ mod tests {
         Some(rows(&[(0, Some(&[0, 1, 2]))])),
         None
     )]
+    // Row 5 of summary is copied through, so fresh computed from it is valid.
     #[case::downstream_beyond_upstream(
         vec![SUMMARY, TITLE],
         Some(rows(&[(0, Some(&[0, 1, 2, 3, 4]))])),
         Some(rows(&[(0, Some(&[0, 5]))])),
-        Some("'fresh'")
+        None
     )]
     #[case::upstream_unpublished(vec![SUMMARY, TITLE], None, Some(rows(&[(0, None)])), Some("'fresh'"))]
     #[case::writes_own_source(vec![BODY, SUMMARY], Some(rows(&[(0, None)])), None, Some("'ready'"))]
