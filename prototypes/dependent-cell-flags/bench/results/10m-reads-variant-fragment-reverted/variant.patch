@@ -1,0 +1,199 @@
+diff --git a/rust/lance/src/dataset/fragment.rs b/rust/lance/src/dataset/fragment.rs
+index 77341a6ee..9e3dd0e89 100644
+--- a/rust/lance/src/dataset/fragment.rs
++++ b/rust/lance/src/dataset/fragment.rs
+@@ -3,7 +3,6 @@
+ 
+ //! Wraps a Fragment of the dataset.
+ 
+-mod cell_flag_mask;
+ pub mod session;
+ pub mod write;
+ 
+@@ -63,7 +62,6 @@ use lance_table::utils::stream::{
+ use object_store::path::Path;
+ use roaring::RoaringBitmap;
+ 
+-use self::cell_flag_mask::CellFlagMasks;
+ use self::write::FragmentCreateBuilder;
+ 
+ use super::hash_joiner::HashJoiner;
+@@ -1146,7 +1144,6 @@ impl FileFragment {
+         projection: &Schema,
+         read_config: FragReadConfig,
+     ) -> Result<FragmentReader> {
+-        let cell_flag_masks = CellFlagMasks::resolve(&self.dataset, self.metadata.id, projection)?;
+         let open_files = self.open_readers(projection, &read_config);
+         let deletion_vec_load = self.get_deletion_vector();
+ 
+@@ -1230,7 +1227,6 @@ impl FileFragment {
+                 });
+             }
+         }
+-        reader.cell_flag_masks = cell_flag_masks;
+ 
+         if read_config.with_row_id {
+             reader.with_row_id();
+@@ -1253,7 +1249,6 @@ impl FileFragment {
+         projection: &Schema,
+         read_config: &FragReadConfig,
+     ) -> Result<V1FragmentReader> {
+-        cell_flag_mask::reject_masked_v1_read(&self.dataset, self.metadata.id, projection)?;
+         let open_readers = async {
+             let mut readers = Vec::new();
+             for data_file in &self.metadata.files {
+@@ -1968,8 +1963,7 @@ impl FileFragment {
+     ///
+     /// Unlike logical range reads, offsets address the immutable rows stored in
+     /// the fragment's files. Deleted positions remain present with their stored
+-    /// column values, except that cells a cell flag masks read as NULL, so a
+-    /// copy-through writes them back without a value. Callers can stream the batches into
++    /// column values. Callers can stream the batches into
+     /// [`Dataset::write_data_file_part`](super::Dataset::write_data_file_part)
+     /// when independently computing a physical-row part.
+     ///
+@@ -2259,8 +2253,6 @@ impl FileFragment {
+         // If there is no projection, we at least need to read the row addresses
+         with_row_addr |= !with_row_id && schema.fields.is_empty();
+ 
+-        // Masked cells read as NULL here, so a column rewritten through the
+-        // updater keeps no value where its masking cell flag is false.
+         let reader = self.open(
+             &schema,
+             FragReadConfig::default()
+@@ -3355,11 +3347,6 @@ pub struct FragmentReader {
+     /// overlays. Overlays are merged into base batches (by `offset_in_frag`) before
+     /// deletion filtering, opening only the files each read's rows touch.
+     overlay: Option<OverlayReadState>,
+-
+-    /// Projected fields a masking cell flag hides on some row of this fragment,
+-    /// nulled right after the overlay merge. `None` when no projected field is
+-    /// masked here, so unmasked reads pay only this check.
+-    cell_flag_masks: Option<Arc<CellFlagMasks>>,
+ }
+ 
+ /// What [`FragmentReader`] needs to resolve overlays at read time: the coverage
+@@ -3400,7 +3387,6 @@ impl Clone for FragmentReader {
+             num_rows: self.num_rows,
+             num_physical_rows: self.num_physical_rows,
+             overlay: self.overlay.clone(),
+-            cell_flag_masks: self.cell_flag_masks.clone(),
+         }
+     }
+ }
+@@ -3454,7 +3440,6 @@ impl FragmentReader {
+             num_rows,
+             num_physical_rows,
+             overlay: None,
+-            cell_flag_masks: None,
+         })
+     }
+ 
+@@ -3519,65 +3504,39 @@ impl FragmentReader {
+         self
+     }
+ 
+-    /// Resolve the cells of physical rows in read order, *before* deletion
+-    /// filtering: merge overlay values, then null the cells a masking cell flag
+-    /// hides. Both address each row by its position in the fragment (its
+-    /// `offset_in_frag`, derived from `params`), and the flag governs a value
+-    /// whichever file supplies it. A no-op when the fragment has neither.
+-    async fn resolve_cells(
+-        &self,
+-        stream: ReadBatchTaskStream,
+-        params: &ReadBatchParams,
+-        total_num_rows: u32,
+-    ) -> Result<ReadBatchTaskStream> {
+-        if self.overlay.is_none() && self.cell_flag_masks.is_none() {
+-            return Ok(stream);
+-        }
+-        // The offset_in_frag of every row this read will return, materialized once
+-        // and shared by both steps. Cost is one u32 per output row (a whole-fragment
+-        // scan is 4 bytes/row), and it lets us both prune overlays to the read and
+-        // slice each batch's offsets without reading any data. Only paid when the
+-        // fragment has overlays or a partially masked field.
+-        //
+-        // TODO(overlay perf): this could be avoided by teaching `ReadBatchParams` to
+-        // yield a coverage bitmap directly (for pruning) and to slice per batch (for
+-        // the routing below), or by moving `ReadBatchParams` to a roaring bitmap
+-        // wholesale — a larger refactor tracked separately.
+-        let needs_offsets = self.overlay.is_some()
+-            || self
+-                .cell_flag_masks
+-                .as_ref()
+-                .is_some_and(|masks| masks.needs_offsets());
+-        let offsets_in_frag = needs_offsets
+-            .then(|| Arc::new(params.to_offsets_total(total_num_rows).values().to_vec()));
+-        let stream = match &offsets_in_frag {
+-            Some(offsets_in_frag) => self.merge_overlays(stream, offsets_in_frag).await?,
+-            None => stream,
+-        };
+-        Ok(match &self.cell_flag_masks {
+-            Some(masks) => masks.clone().apply(stream, offsets_in_frag),
+-            None => stream,
+-        })
+-    }
+-
+-    /// Merge data overlay values onto a stream of base batches. Deletions take
+-    /// precedence naturally: an overlay value for a deleted row is dropped along
+-    /// with the row downstream. A no-op when the fragment has no overlays.
++    /// Merge data overlay values onto a stream of base batches.
+     ///
+-    /// The read's `offset_in_frag` values are known up front, so overlays are
+-    /// resolved here to just the files this read's rows touch — an overlay whose
+-    /// cells fall outside the read is not opened at all. Within each batch, the
+-    /// overlay reads (only the values that batch needs) are then issued
++    /// Runs on physical rows in read order, *before* deletion filtering, so each
++    /// row can be addressed by its position in the fragment (its `offset_in_frag`,
++    /// derived from `params`) and deletions take precedence naturally: an overlay
++    /// value for a deleted row is dropped along with the row downstream. A no-op
++    /// when the fragment has no overlays.
++    ///
++    /// The read's `offset_in_frag` values are known from `params` up front, so
++    /// overlays are resolved here to just the files this read's rows touch — an
++    /// overlay whose cells fall outside the read is not opened at all. Within each
++    /// batch, the overlay reads (only the values that batch needs) are then issued
+     /// concurrently with the base read rather than after it.
+     async fn merge_overlays(
+         &self,
+         merged: ReadBatchTaskStream,
+-        offsets_in_frag: &Arc<Vec<u32>>,
++        params: &ReadBatchParams,
++        total_num_rows: u32,
+     ) -> Result<ReadBatchTaskStream> {
+         let Some(overlay) = &self.overlay else {
+             return Ok(merged);
+         };
+-        let offsets_in_frag = offsets_in_frag.clone();
++        // The offset_in_frag of every row this read will return, materialized once.
++        // Cost is one u32 per output row (a whole-fragment scan is 4 bytes/row), and
++        // it lets us both prune overlays to the read and slice each batch's offsets
++        // below without reading any data. Only paid when the fragment has overlays.
++        //
++        // TODO(overlay perf): this could be avoided by teaching `ReadBatchParams` to
++        // yield a coverage bitmap directly (for pruning) and to slice per batch (for
++        // the routing below), or by moving `ReadBatchParams` to a roaring bitmap
++        // wholesale — a larger refactor tracked separately.
++        let offsets_in_frag: Arc<Vec<u32>> =
++            Arc::new(params.to_offsets_total(total_num_rows).values().to_vec());
+ 
+         // Open only the overlay readers this read touches (pruned by row selection).
+         let plans = resolve_overlays(
+@@ -3699,7 +3658,7 @@ impl FragmentReader {
+             lance_table::utils::stream::merge_streams(read_streams)
+         };
+ 
+-        let merged = self.resolve_cells(merged, &params, total_num_rows).await?;
++        let merged = self.merge_overlays(merged, &params, total_num_rows).await?;
+ 
+         // Add the row id column (if needed) and delete rows (if a deletion
+         // vector is present).
+@@ -3893,7 +3852,7 @@ impl FragmentReader {
+ 
+         let params = ReadBatchParams::Ranges(ranges);
+         let merged_stream = self
+-            .resolve_cells(merged_stream, &params, total_num_rows)
++            .merge_overlays(merged_stream, &params, total_num_rows)
+             .await?;
+ 
+         // Add the row id column (if needed) and delete rows (if a deletion

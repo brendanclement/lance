@@ -1,0 +1,10 @@
+cell_flags_regression build=base git_sha=- scale_rows=10000000 rows_per_fragment=100000 fragments=100 samples=5 read_samples=1500 warmup=1 stable_row_ids=false data=/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/bench-data/profile-base/cell_flags_regression-base
+udf iterations=16 summary=1259 ns/row translation=1047 ns/row
+
+workload                           variant                  cache          n    wall_ms    udf_ms  stage_ms commit_ms  r_iops     r_KiB w_iops      w_KiB  manif_B   txn_B  outcome
+scan_summary_full                  populated                warm          1500      24.53         -         -         -     100    146102      0          0    24800    7842  
+scan_summary_full                  populated                fresh-session 1500      24.69         -         -         -     300    146655      0          0    24800    7842  
+scan_summary_full                  null_1pct                warm          1500      26.53         -         -         -     100    146146      0          0    24800    7842  
+scan_summary_full                  null_1pct                fresh-session 1500      27.09         -         -         -     300    146699      0          0    24800    7842  
+
+records appended to /private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/profile/base.jsonl

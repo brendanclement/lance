@@ -119,13 +119,16 @@ pub struct DeferredGroup {
 /// drops or replaces a published flag              error       error
 /// invalidates assigned rows (input written)       retryable   rows deferred (InputChanged)
 /// deletes assigned rows                           rows deferred (RowVacated)
-/// moves assigned rows (row-moving update)         retryable   rows deferred (RowVacated)
+/// moves rows out of a group's fragment            retryable   assigned rows deferred (RowVacated)
+///   (row-moving update), assigned or not
 /// publishes on a group's fragment and fields      retryable   group deferred (NewerResult)
 /// writes a group's fields on its fragment         retryable   group deferred (OutputWritten)
 /// removes a group's fragment                      error       group deferred (FragmentRemoved)
-/// compacts a group's fragment                     retryable   group deferred (FragmentRewritten)
-/// merge, overwrite, restore, dropping or indexing
-///   a replaced field, MemWAL state updates        error       error
+/// compacts a group's fragment (unreachable:       retryable   group deferred (FragmentRewritten)
+///   compaction is refused while a flag is registered)
+/// merge, or indexing a replaced field             retryable   retryable
+/// overwrite, restore, MemWAL state updates,       error       error
+///   dropping a replaced field
 /// ```
 ///
 /// A row deferred for one flag is deferred for every flag whose output its

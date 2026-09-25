@@ -1,0 +1,61 @@
+Sort by top of stack, same collapsed (when >= 5):
+        __psynch_cvwait  (in libsystem_kernel.dylib)        272049
+        fsst::fsst::decompress::<i32>  (in cell_flags_regression-cc60bdbcaa7919a6)        20152
+        kevent  (in libsystem_kernel.dylib)        6935
+        _xzm_free  (in libsystem_malloc.dylib)        5169
+        _platform_memmove  (in libsystem_platform.dylib)        4983
+        _platform_memset  (in libsystem_platform.dylib)        4368
+        pread  (in libsystem_kernel.dylib)        3056
+        _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib)        2885
+        <lance_encoding::data::VariableWidthDataBlockBuilder<i32> as lance_encoding::data::DataBlockBuilderImpl>::append_validated  (in cell_flags_regression-cc60bdbcaa7919a6)        1484
+        <lance_encoding::data::VariableWidthBlock>::into_arrow  (in cell_flags_regression-cc60bdbcaa7919a6)        1450
+        fsst::fsst::validate_offsets::<i32>  (in cell_flags_regression-cc60bdbcaa7919a6)        1415
+        <lance_encoding::encodings::logical::primitive::DecodeMiniBlockTask as lance_encoding::decoder::DecodePageTask>::decode  (in cell_flags_regression-cc60bdbcaa7919a6)        1372
+        core::str::converts::from_utf8  (in cell_flags_regression-cc60bdbcaa7919a6)        1340
+        mach_absolute_time  (in libsystem_kernel.dylib)        1056
+        <lance_encoding::encodings::physical::binary::BinaryMiniBlockDecompressor as lance_encoding::compression::MiniBlockDecompressor>::decompress  (in cell_flags_regression-cc60bdbcaa7919a6)        994
+        __psynch_mutexwait  (in libsystem_kernel.dylib)        925
+        _platform_memset_pattern16  (in libsystem_platform.dylib)        878
+        __open  (in libsystem_kernel.dylib)        820
+        <deduplicated_symbol>  (in libsystem_malloc.dylib)        784
+        _free  (in libsystem_malloc.dylib)        726
+        __psynch_cvsignal  (in libsystem_kernel.dylib)        713
+        _malloc_zone_malloc  (in libsystem_malloc.dylib)        570
+        <alloc::sync::Arc<arrow_buffer::bytes::Bytes>>::drop_slow  (in cell_flags_regression-cc60bdbcaa7919a6)        434
+        _xzm_xzone_malloc  (in libsystem_malloc.dylib)        424
+        core::ptr::drop_glue::<lance_encoding::data::VariableWidthBlock>  (in cell_flags_regression-cc60bdbcaa7919a6)        398
+        <lance_encoding::data::VariableWidthBlock>::offset_violation_detail::<i32>  (in cell_flags_regression-cc60bdbcaa7919a6)        393
+        _xzm_xzone_malloc_small_freelist  (in libsystem_malloc.dylib)        384
+        close  (in libsystem_kernel.dylib)        369
+        _xzm_xzone_free_freelist  (in libsystem_malloc.dylib)        347
+        <lance_encoding::encodings::physical::fsst::FsstMiniBlockDecompressor as lance_encoding::compression::MiniBlockDecompressor>::decompress  (in cell_flags_regression-cc60bdbcaa7919a6)        303
+        <lance_encoding::encodings::logical::primitive::MiniBlockDecoder as lance_encoding::decoder::StructuralPageDecoder>::drain  (in cell_flags_regression-cc60bdbcaa7919a6)        190
+        DYLD-STUB$$free  (in cell_flags_regression-cc60bdbcaa7919a6)        181
+        <alloc::vec::into_iter::IntoIter<u32> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::adapters::map::map_fold<u32, lance_encoding::buffer::LanceBuffer, (), <lance_encoding::encodings::logical::primitive::DecodeMiniBlockTask>::decode_miniblock_chunk::{closure#2}, core::iter::traits::iterator::Iterator::for_each::call<lance_encoding::buffer::LanceBuffer, <alloc::vec::Vec<lance_encoding::buffer::LanceBuffer>>::extend_trusted<core::iter::adapters::map::Map<alloc::vec::into_iter::IntoIter<u32>, <lance_encoding::encodings::logical::primitive::DecodeMiniBlockTask>::decode_miniblock_chunk::{closure#2}>>::{closure#0}>::{closure#0}>::{closure#0}>  (in cell_flags_regression-cc60bdbcaa7919a6)        163
+        DYLD-STUB$$_platform_bzero  (in libsystem_malloc.dylib)        154
+        _xzm_free_outlined  (in libsystem_malloc.dylib)        145
+        __ulock_wait2  (in libsystem_kernel.dylib)        136
+        __psynch_mutexdrop  (in libsystem_kernel.dylib)        131
+        bytes::bytes::shared_drop  (in cell_flags_regression-cc60bdbcaa7919a6)        102
+        __ulock_wait  (in libsystem_kernel.dylib)        98
+        xzm_malloc_zone_size  (in libsystem_malloc.dylib)        92
+        <tokio::runtime::scheduler::multi_thread::worker::Context>::run  (in cell_flags_regression-cc60bdbcaa7919a6)        91
+        <alloc::sync::Arc<std::sync::poison::rwlock::RwLock<std::collections::hash::map::HashMap<lance_encoding::statistics::Stat, alloc::sync::Arc<dyn arrow_array::array::Array>>>>>::drop_slow  (in cell_flags_regression-cc60bdbcaa7919a6)        89
+        <alloc::raw_vec::RawVecInner>::try_allocate_in  (in cell_flags_regression-cc60bdbcaa7919a6)        83
+        <alloc::vec::Vec<lance_encoding::buffer::LanceBuffer> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<lance_encoding::buffer::LanceBuffer, core::iter::adapters::map::Map<alloc::vec::into_iter::IntoIter<u32>, <lance_encoding::encodings::logical::primitive::DecodeMiniBlockTask>::decode_miniblock_chunk::{closure#2}>>>::from_iter  (in cell_flags_regression-cc60bdbcaa7919a6)        83
+        <lance_encoding::decoder::StructuralBatchDecodeStream>::into_stream::{closure#0}::{closure#0}::{closure#1}  (in cell_flags_regression-cc60bdbcaa7919a6)        81
+        core::ptr::drop_glue::<lance_encoding::encodings::logical::primitive::DecodeMiniBlockTask>  (in cell_flags_regression-cc60bdbcaa7919a6)        68
+        <hashbrown::map::HashMap<usize, (), std::hash::random::RandomState>>::rustc_entry  (in cell_flags_regression-cc60bdbcaa7919a6)        68
+        <lance_encoding::data::BlockInfo>::new  (in cell_flags_regression-cc60bdbcaa7919a6)        68
+        __bzero  (in libsystem_platform.dylib)        68
+        DYLD-STUB$$malloc  (in cell_flags_regression-cc60bdbcaa7919a6)        64
+        <lance_encoding::buffer::LanceBuffer as core::convert::From<alloc::vec::Vec<u8>>>::from  (in cell_flags_regression-cc60bdbcaa7919a6)        62
+        __ulock_wake  (in libsystem_kernel.dylib)        62
+        <futures_util::stream::futures_unordered::task::Task<futures_util::stream::futures_ordered::OrderWrapper<futures_util::future::try_future::into_future::IntoFuture<core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future<Output = core::result::Result<core::pin::Pin<alloc::boxed::Box<dyn futures_core::stream::Stream<Item = core::result::Result<core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future<Output = core::result::Result<arrow_array::record_batch::RecordBatch, datafusion_common::error::DataFusionError>> + core::marker::Send>>, datafusion_common::error::DataFusionError>> + core::marker::Send>>, datafusion_common::error::DataFusionError>> + core::marker::Send>>>>> as futures_task::arc_wake::ArcWake>::wake_by_ref  (in cell_flags_regression-cc60bdbcaa7919a6)        59
+        _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib)        59
+        _xzm_malloc_zone_malloc_type_calloc_entry  (in libsystem_malloc.dylib)        58
+        xzm_realloc  (in libsystem_malloc.dylib)        57
+        <futures_util::stream::futures_unordered::FuturesUnordered<futures_util::stream::futures_ordered::OrderWrapper<core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future<Output = core::result::Result<arrow_array::record_batch::RecordBatch, lance_core::error::Error>> + core::marker::Send>>>> as futures_core::stream::Stream>::poll_next  (in cell_flags_regression-cc60bdbcaa7919a6)        55
+        pthread_mutex_lock  (in libsystem_pthread.dylib)        55
+        write  (in libsystem_kernel.dylib)        54
+        <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&usize>  (in cell_flags_regression-cc60bdbcaa7919a6)        48

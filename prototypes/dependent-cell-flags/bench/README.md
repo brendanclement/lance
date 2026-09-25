@@ -17,25 +17,42 @@ Benchmarks for the dependent cell flag prototype (option D). They answer three q
 | `rust/lance/benches/cell_flags_common/flags.rs` | Flag helpers, included only by the flag harness: flagged tables, the refresh executor, report accounting, correctness checks. |
 | `rust/lance/benches/dependent_cell_flags.rs` | Flag workloads (`harness = false`). |
 | `run_paired.sh` | Builds both worktrees and runs baseline, prototype and flag harnesses in alternating rounds. |
-| `analyze.py` | Python standard library only. Turns the JSONL into markdown tables (`results/<scale>/analysis.md` and the `REPORT.md` sections). |
+| `analyze.py` | Python standard library only. Turns the JSONL into markdown tables (`results/<run>/analysis.md` and the `REPORT.md` sections). |
+| `run_variant.sh` | The read-path variant: `run_paired.sh` on the prototype with `rust/lance/src/dataset/fragment.rs` reverted to the baseline, without the flag harness. |
+| `run_layout_control.sh` | The layout control: the baseline against the baseline plus one unused function, 3 rounds in each order. |
+| `regenerate_report.sh` | Rebuilds every generated section of `REPORT.md` with its heading. |
 
 `mod.rs` and `cell_flags_regression.rs` must be **byte-identical** in the baseline and the
 prototype worktree, and `run_paired.sh` refuses to run otherwise. Keep additions in `flags.rs`.
 
 ## Setup
 
+Create every worktree **outside any other checkout**. Cargo merges the `.cargo/config.toml` of
+every directory above the one it builds in and concatenates array values, so a worktree under
+another Lance checkout (for example in the main checkout's `.claude/worktrees/`) gets the target's
+`rustflags` twice. That changes the binaries' hash (`cell_flags_regression-cc60bdbcaa7919a6`
+instead of `-bff5b3f24f8697e9` on this machine) and their code layout, which then shows up as a
+difference between the builds. `run_paired.sh` reads the rustflags from both builds' cargo
+fingerprints and exits with status 2 when they differ; `run_layout_control.sh` does the same.
+
 The baseline is a worktree at the commit the prototype branched from, with the regression harness
-files copied in. It is scratch and never committed:
+files copied in. It is scratch and never committed. From a checkout of this branch:
 
 ```bash
-git worktree add --detach ../lance-baseline e3671b2f5
-cp -R rust/lance/benches/cell_flags_common ../lance-baseline/rust/lance/benches/
-rm ../lance-baseline/rust/lance/benches/cell_flags_common/flags.rs
-cp rust/lance/benches/cell_flags_regression.rs ../lance-baseline/rust/lance/benches/
-# add to ../lance-baseline/rust/lance/Cargo.toml:
+git worktree add --detach /abs/lance-baseline e3671b2f5
+cp -R rust/lance/benches/cell_flags_common /abs/lance-baseline/rust/lance/benches/
+rm /abs/lance-baseline/rust/lance/benches/cell_flags_common/flags.rs
+cp rust/lance/benches/cell_flags_regression.rs /abs/lance-baseline/rust/lance/benches/
+# add to /abs/lance-baseline/rust/lance/Cargo.toml:
 # [[bench]]
 # name = "cell_flags_regression"
 # harness = false
+```
+
+The prototype worktree is a checkout of this branch, whose Rust code equals `26388225a`:
+
+```bash
+git worktree add --detach /abs/lance-proto brendan/dependency-aware-cell-flags
 ```
 
 Each worktree must build into its **own** target directory, so leave `CARGO_TARGET_DIR` unset.
@@ -55,22 +72,26 @@ Paired runs are the only runs whose baseline/prototype ratios mean anything. Sca
 | `10m` | 10M / 100k | 3 | 20 | 1 | reads, clean refresh, sparse updates, publish_after_k |
 
 ```bash
-cd <prototype worktree>
-BASELINE_WORKTREE=/abs/path/lance-baseline BENCH_DATA_DIR=/abs/path/bench-data \
+cd /abs/lance-proto
+BASELINE_WORKTREE=/abs/lance-baseline BENCH_DATA_DIR=/abs/bench-data \
   prototypes/dependent-cell-flags/bench/run_paired.sh 1m
 ```
 
 The script builds `cell_flags_regression` in the baseline worktree and `cell_flags_regression` +
 `dependent_cell_flags` here, all with `--profile release-with-debug` and at `nice -n 15`. It checks
-that each binary lies under its own worktree. Then, in each round, it runs baseline regression,
-prototype regression and prototype flags, in that order. It writes:
+that each binary lies under its own worktree and that both builds used the same rustflags. Then, in
+each round, it runs the baseline and the prototype regression harness, in the order `ORDER` sets,
+followed by the flag harness (in every round, or only in the last with `FLAG_EVERY_ROUND=0`). It
+writes:
 
 - `results/<scale>/round<r>-<build>.jsonl` (raw samples) and `round<r>-<build>.log` (stdout
   median table)
 - `results/<scale>/env.json`: `hw.model`, CPU, `hw.ncpu`, `hw.memsize`, the macOS version, `rustc -V`
-  in both worktrees, both SHAs with their `git status`, the binaries and the config
+  in both worktrees, both SHAs with their `git status`, the binaries, `ORDER`, the rustflags and
+  the config
 - `results/<scale>/runs.tsv`: the start and end of each run, plus the load average before it
-- `results/<scale>/analysis.md` and the `results:<scale>` section of `REPORT.md`
+- `results/<scale>/analysis.md` and the `REPORT.md` section named after the results directory
+  (`results:<scale>`, or the last component of `RESULTS_DIR`)
 
 It refuses to write into a results directory that already holds rounds. Any preset value can be
 overridden: `ROUNDS`, `BENCH_SAMPLES`, `BENCH_READ_SAMPLES`, `BENCH_WARMUP`, `BENCH_WORKLOADS`,
@@ -81,7 +102,8 @@ overridden: `ROUNDS`, `BENCH_SAMPLES`, `BENCH_READ_SAMPLES`, `BENCH_WARMUP`, `BE
 |---|---|---|
 | `BASELINE_WORKTREE` | required | Baseline worktree with the regression harness. |
 | `BENCH_DATA_DIR` | `$TMPDIR/lance_cell_flags_bench` | Absolute path. Each harness uses and removes its own subdirectory. |
-| `RESULTS_DIR` | `results/<scale>` | Where results go. |
+| `RESULTS_DIR` | `results/<scale>` | Where results go. Its last component names the `REPORT.md` section. |
+| `ORDER` | `baseline-first` | `baseline-first` or `prototype-first`: which regression build runs first in each round. |
 | `BENCH_RUN_NICE` | `0` | Niceness of the benchmark runs. Builds always run at 15. |
 | `FLAG_EVERY_ROUND` | `1` | `0` runs the flag harness in the last round only. |
 
@@ -91,7 +113,15 @@ To re-analyze existing results:
 python3 prototypes/dependent-cell-flags/bench/analyze.py prototypes/dependent-cell-flags/bench/results/1m \
   --out prototypes/dependent-cell-flags/bench/results/1m/analysis.md \
   --report prototypes/dependent-cell-flags/bench/REPORT.md
+prototypes/dependent-cell-flags/bench/regenerate_report.sh [REPORT.md]
 ```
+
+`--report` replaces the section `results:<name>` of that file, where `<name>` is the results
+directory's name unless `--section NAME` sets it, and appends the section when it is missing.
+`--title TEXT` sets its heading (default `Results: <name>`). Both options take one results
+directory. `regenerate_report.sh` calls `analyze.py --report` for every run with the headings
+used in `REPORT.md` and leaves its hand-written Summary alone; run it on a copy and diff to check
+that the report reproduces from the raw samples.
 
 To run one harness by hand, for example a quick dev-profile check:
 
@@ -120,6 +150,48 @@ Both harnesses read the same variables (`BenchConfig` in `cell_flags_common/mod.
 | `BENCH_CONFLICT_KS` / `BENCH_PUBLISH_KS` | `1,4,16` / `0,1,4,16,64` | K values of the conflict and publish-after workloads. |
 | `BENCH_APPEND_ROWS` | 10000 | Rows of the regression `append` workload. |
 | `BENCH_KEEP_DATA` / `BENCH_STABLE_ROW_IDS` | off | Keep the datasets / create tables with stable row ids. |
+
+## Reproducing each run
+
+Every run used the same baseline worktree at `e3671b2f5` (outside any checkout, with the harness
+files above), passed as `BASELINE_WORKTREE`, and an absolute `BENCH_DATA_DIR`. `$READS` stands for
+`scan_summary_full,filter_summary_is_null_count,count_summary_vs_star,filter_id_range_project_summary,take_random_1k`,
+and `RESULTS_DIR` for the absolute path of `results/<run>`. *Nested* means the prototype was the
+worktree under `/Users/brendan/code/lance`, so its binaries got doubled rustflags; the committed
+`run_paired.sh` refuses such builds, so those runs can be repeated only as clean builds.
+
+| Run | Prototype checkout | Invocation |
+|---|---|---|
+| `smoke` | `e63e41628` (harness before the final hardening), outside any checkout | `BENCH_RUN_NICE=15 run_paired.sh smoke` |
+| `smoke-final` | `21601f894`, nested | `RESULTS_DIR=… run_paired.sh smoke` |
+| `1m` | `21601f894`, nested | `run_paired.sh 1m` |
+| `10m` | `21601f894`, nested | `run_paired.sh 10m` |
+| `1m-reads-maskfix` | `e48573011` (code of `26388225a`), nested | `BENCH_WORKLOADS=$READS ROUNDS=3 RESULTS_DIR=… run_paired.sh 1m` |
+| `10m-reads-maskfix` | `e48573011`, nested | `BENCH_WORKLOADS=$READS ROUNDS=3 RESULTS_DIR=… run_paired.sh 10m` |
+| `10m-reads-reversed` | `e48573011` with the `ORDER` driver change later committed in `3e8c36ba0672102ad005c6de20858e9a82b32231`, nested | `BENCH_WORKLOADS=$READS ORDER=prototype-first FLAG_EVERY_ROUND=0 ROUNDS=3 RESULTS_DIR=… run_paired.sh 10m` |
+| `10m-reads-variant-fragment-reverted` | `26388225a` with `rust/lance/src/dataset/fragment.rs` from `e3671b2f5` (`variant.patch` in the results), outside any checkout | `VARIANT_WORKTREE=/abs/lance-variant RESULTS_DIR=… run_variant.sh` (defaults `ORDER=baseline-first`, `ROUNDS=3`, `BENCH_WORKLOADS=$READS`) |
+| `10m-reads-clean-baseline-first` | `26388225a` with the driver of `f1fb31606`, outside any checkout | `BENCH_WORKLOADS=$READS ORDER=baseline-first ROUNDS=3 RESULTS_DIR=… run_paired.sh 10m` |
+| `10m-reads-clean-prototype-first` | same | `BENCH_WORKLOADS=$READS ORDER=prototype-first ROUNDS=3 RESULTS_DIR=… run_paired.sh 10m` |
+| `1m-clean` | same | `FLAG_EVERY_ROUND=0 ROUNDS=3 RESULTS_DIR=… run_paired.sh 1m` |
+| `10m-reads-layout-control` | none: the baseline plus `control.patch` (in the results), outside any checkout | `CONTROL_WORKTREE=/abs/lance-layout-control RESULTS_DIR=… run_layout_control.sh` (defaults 3 rounds per order and the 10M read settings) |
+
+A checkout of this branch has the clean runs' code and driver (their `env.json` has the
+`rustflags` field that `f1fb31606` added). Differences between the recorded runs and the scripts:
+
+- `10m-reads-variant-fragment-reverted` ran with the driver of
+  `3e8c36ba0672102ad005c6de20858e9a82b32231` minus the flag harness run, before the rustflags
+  check existed, so its `env.json` has no `rustflags`; its prototype binary has the baseline's
+  hash, `cell_flags_regression-bff5b3f24f8697e9`. `run_variant.sh` uses the current driver, check
+  included.
+- `10m-reads-layout-control` was driven by an inline loop that `run_layout_control.sh` now
+  commits. The loop wrote a partial `env.json` by hand and no `BENCH_GIT_SHA`; see
+  `results/10m-reads-layout-control/README.md`. The script records the full environment and
+  checks rustflags.
+- The recorded analyses (`results/*/analysis.md`) keep `analyze.py`'s old heading,
+  `Results: <scale>`. The `REPORT.md` sections come from `regenerate_report.sh`.
+- `smoke` predates the final code and has no `REPORT.md` section.
+- `results/10m-profile/` is a sampling profile, not a benchmark run; its `README.md` has the
+  command.
 
 ## Tables and flags
 

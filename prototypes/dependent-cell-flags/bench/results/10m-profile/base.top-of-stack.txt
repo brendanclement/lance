@@ -1,0 +1,61 @@
+Sort by top of stack, same collapsed (when >= 5):
+        __psynch_cvwait  (in libsystem_kernel.dylib)        260521
+        fsst::fsst::decompress::<i32>  (in cell_flags_regression-bff5b3f24f8697e9)        18870
+        kevent  (in libsystem_kernel.dylib)        6844
+        _xzm_free  (in libsystem_malloc.dylib)        4433
+        _platform_memset  (in libsystem_platform.dylib)        4317
+        _platform_memmove  (in libsystem_platform.dylib)        4160
+        pread  (in libsystem_kernel.dylib)        3163
+        _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib)        2221
+        mach_absolute_time  (in libsystem_kernel.dylib)        1735
+        <lance_encoding::data::VariableWidthBlock>::into_arrow  (in cell_flags_regression-bff5b3f24f8697e9)        1374
+        <lance_encoding::data::VariableWidthDataBlockBuilder<i32> as lance_encoding::data::DataBlockBuilderImpl>::append_validated  (in cell_flags_regression-bff5b3f24f8697e9)        1345
+        fsst::fsst::validate_offsets::<i32>  (in cell_flags_regression-bff5b3f24f8697e9)        1338
+        core::str::converts::from_utf8  (in cell_flags_regression-bff5b3f24f8697e9)        1273
+        <lance_encoding::encodings::logical::primitive::DecodeMiniBlockTask as lance_encoding::decoder::DecodePageTask>::decode  (in cell_flags_regression-bff5b3f24f8697e9)        1135
+        __psynch_mutexwait  (in libsystem_kernel.dylib)        1134
+        <lance_encoding::encodings::physical::binary::BinaryMiniBlockDecompressor as lance_encoding::compression::MiniBlockDecompressor>::decompress  (in cell_flags_regression-bff5b3f24f8697e9)        970
+        _platform_memset_pattern16  (in libsystem_platform.dylib)        966
+        <deduplicated_symbol>  (in libsystem_malloc.dylib)        810
+        __psynch_cvsignal  (in libsystem_kernel.dylib)        732
+        __open  (in libsystem_kernel.dylib)        716
+        _malloc_zone_malloc  (in libsystem_malloc.dylib)        487
+        _xzm_xzone_malloc  (in libsystem_malloc.dylib)        404
+        <lance_encoding::data::VariableWidthBlock>::offset_violation_detail::<i32>  (in cell_flags_regression-bff5b3f24f8697e9)        350
+        close  (in libsystem_kernel.dylib)        342
+        _xzm_xzone_malloc_small_freelist  (in libsystem_malloc.dylib)        329
+        <lance_encoding::encodings::logical::primitive::MiniBlockDecoder as lance_encoding::decoder::StructuralPageDecoder>::drain  (in cell_flags_regression-bff5b3f24f8697e9)        303
+        <alloc::sync::Arc<arrow_buffer::bytes::Bytes>>::drop_slow  (in cell_flags_regression-bff5b3f24f8697e9)        262
+        _free  (in libsystem_malloc.dylib)        242
+        <alloc::vec::into_iter::IntoIter<u32> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::adapters::map::map_fold<u32, lance_encoding::buffer::LanceBuffer, (), <lance_encoding::encodings::logical::primitive::DecodeMiniBlockTask>::decode_miniblock_chunk::{closure#2}, core::iter::traits::iterator::Iterator::for_each::call<lance_encoding::buffer::LanceBuffer, <alloc::vec::Vec<lance_encoding::buffer::LanceBuffer>>::extend_trusted<core::iter::adapters::map::Map<alloc::vec::into_iter::IntoIter<u32>, <lance_encoding::encodings::logical::primitive::DecodeMiniBlockTask>::decode_miniblock_chunk::{closure#2}>>::{closure#0}>::{closure#0}>::{closure#0}>  (in cell_flags_regression-bff5b3f24f8697e9)        218
+        _xzm_xzone_free_freelist  (in libsystem_malloc.dylib)        198
+        DYLD-STUB$$_platform_bzero  (in libsystem_malloc.dylib)        195
+        <lance_encoding::encodings::physical::fsst::FsstMiniBlockDecompressor as lance_encoding::compression::MiniBlockDecompressor>::decompress  (in cell_flags_regression-bff5b3f24f8697e9)        175
+        __psynch_mutexdrop  (in libsystem_kernel.dylib)        170
+        __ulock_wait2  (in libsystem_kernel.dylib)        162
+        bytes::bytes::shared_drop  (in cell_flags_regression-bff5b3f24f8697e9)        159
+        core::ptr::drop_glue::<lance_encoding::data::VariableWidthBlock>  (in cell_flags_regression-bff5b3f24f8697e9)        143
+        DYLD-STUB$$free  (in cell_flags_regression-bff5b3f24f8697e9)        142
+        _xzm_free_outlined  (in libsystem_malloc.dylib)        139
+        <alloc::raw_vec::RawVecInner>::try_allocate_in  (in cell_flags_regression-bff5b3f24f8697e9)        129
+        malloc  (in libsystem_malloc.dylib)        115
+        __bzero  (in libsystem_platform.dylib)        93
+        core::ptr::drop_glue::<lance_encoding::encodings::logical::primitive::DecodeMiniBlockTask>  (in cell_flags_regression-bff5b3f24f8697e9)        91
+        <tokio::runtime::scheduler::multi_thread::worker::Context>::run  (in cell_flags_regression-bff5b3f24f8697e9)        84
+        <lance_encoding::decoder::StructuralBatchDecodeStream>::into_stream::{closure#0}::{closure#0}::{closure#1}  (in cell_flags_regression-bff5b3f24f8697e9)        81
+        <hashbrown::map::HashMap<usize, (), std::hash::random::RandomState>>::rustc_entry  (in cell_flags_regression-bff5b3f24f8697e9)        80
+        xzm_malloc_zone_size  (in libsystem_malloc.dylib)        78
+        write  (in libsystem_kernel.dylib)        68
+        <alloc::sync::Arc<std::sync::poison::rwlock::RwLock<std::collections::hash::map::HashMap<lance_encoding::statistics::Stat, alloc::sync::Arc<dyn arrow_array::array::Array>>>>>::drop_slow  (in cell_flags_regression-bff5b3f24f8697e9)        62
+        <lance_encoding::encodings::logical::primitive::MiniBlockScheduler as lance_encoding::encodings::logical::primitive::StructuralPageScheduler>::schedule_ranges::{closure#4}  (in cell_flags_regression-bff5b3f24f8697e9)        59
+        DYLD-STUB$$malloc  (in cell_flags_regression-bff5b3f24f8697e9)        56
+        <futures_util::stream::futures_unordered::task::Task<futures_util::stream::futures_ordered::OrderWrapper<futures_util::future::try_future::into_future::IntoFuture<core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future<Output = core::result::Result<core::pin::Pin<alloc::boxed::Box<dyn futures_core::stream::Stream<Item = core::result::Result<core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future<Output = core::result::Result<arrow_array::record_batch::RecordBatch, datafusion_common::error::DataFusionError>> + core::marker::Send>>, datafusion_common::error::DataFusionError>> + core::marker::Send>>, datafusion_common::error::DataFusionError>> + core::marker::Send>>>>> as futures_task::arc_wake::ArcWake>::wake_by_ref  (in cell_flags_regression-bff5b3f24f8697e9)        56
+        <futures_util::stream::futures_ordered::FuturesOrdered<core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future<Output = core::result::Result<arrow_array::record_batch::RecordBatch, lance_core::error::Error>> + core::marker::Send>>> as futures_util::stream::stream::StreamExt>::poll_next_unpin  (in cell_flags_regression-bff5b3f24f8697e9)        54
+        <lance_encoding::data::VariableWidthDataBlockBuilder<i32> as lance_encoding::data::DataBlockBuilderImpl>::validate_append  (in cell_flags_regression-bff5b3f24f8697e9)        51
+        _xzm_malloc_zone_malloc_type_calloc_entry  (in libsystem_malloc.dylib)        51
+        ???  (in cell_flags_regression-bff5b3f24f8697e9)  load address 0x100828000 + 0x68c8224  [0x1070f0224]        50
+        <lance_encoding::data::BlockInfo>::new  (in cell_flags_regression-bff5b3f24f8697e9)        50
+        <alloc::vec::Vec<lance_encoding::buffer::LanceBuffer> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<lance_encoding::buffer::LanceBuffer, core::iter::adapters::map::Map<alloc::vec::into_iter::IntoIter<u32>, <lance_encoding::encodings::logical::primitive::DecodeMiniBlockTask>::decode_miniblock_chunk::{closure#2}>>>::from_iter  (in cell_flags_regression-bff5b3f24f8697e9)        50
+        pthread_mutex_lock  (in libsystem_pthread.dylib)        50
+        pthread_mutex_unlock  (in libsystem_pthread.dylib)        49
+        <hashbrown::raw::RawTable<(usize, ())>>::reserve_rehash::<hashbrown::map::make_hasher<usize, (), std::hash::random::RandomState>::{closure#0}>  (in cell_flags_regression-bff5b3f24f8697e9)        45
