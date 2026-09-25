@@ -44,8 +44,10 @@ pub enum DeferralReason {
     /// The flag's value on the row was computed from the output of an
     /// upstream flag (one whose output it watches) staged in the same file
     /// and assigned there too. The file was deferred, so that input never
-    /// committed. Recompute the row from the committed upstream value, or
-    /// republish both outputs together.
+    /// committed. The staged value must not be reused, and later commit
+    /// attempts do not check it: recompute it from the upstream value the
+    /// follow-up leaves on the row, the committed one or, where the follow-up
+    /// also publishes the upstream there, the one it publishes.
     UpstreamNotPublished,
     /// A concurrent publication set a flag whose output the group writes, on
     /// the group's fragment. Installing the older file would overwrite the
@@ -97,7 +99,9 @@ pub struct DeferredGroup {
     /// The true assignments the group staged, one per flag, whose inputs did
     /// not change up to `checked_version` and were not staged in this file:
     /// their staged values are still correct results, which a refresh
-    /// restaging the fragment against the head can reuse. Empty when
+    /// restaging the fragment against the head can reuse, except on rows
+    /// where it also publishes an upstream output of the flag: there the
+    /// value must be computed from the upstream value it publishes. Empty when
     /// `reason` is that the fragment was removed or rewritten. The rows whose
     /// inputs changed, and those computed from an upstream output this file
     /// assigns ([`DeferralReason::UpstreamNotPublished`]), are in
@@ -201,11 +205,17 @@ impl PublicationReport {
 
     /// Rows of `flag_id` whose staged values are still correct at
     /// `checked_version`: the published rows and the
-    /// [`DeferredGroup::valid_rows`]. A follow-up refresh reading at
-    /// `committed_version`, or `checked_version` when nothing was committed,
-    /// can reuse these values instead of recomputing them, and must recompute
-    /// the rows deferred for [`DeferralReason::InputChanged`] or
-    /// [`DeferralReason::UpstreamNotPublished`].
+    /// [`DeferredGroup::valid_rows`], except the stale rows those keep: rows
+    /// deleted since the read version, and rows where a concurrent
+    /// publication republished the flag together with an upstream output. A
+    /// follow-up refresh reading at `committed_version`, or `checked_version`
+    /// when nothing was committed, can reuse these values instead of
+    /// recomputing them, and must recompute the rows deferred for
+    /// [`DeferralReason::InputChanged`] or
+    /// [`DeferralReason::UpstreamNotPublished`]. A reusable value was computed
+    /// from the committed values of the flag's inputs, so where the follow-up
+    /// also publishes an upstream output of the flag on the row, it must
+    /// compute the value from the upstream value it publishes instead.
     ///
     /// ```
     /// # use lance::dataset::cell_flag::{DeferralReason, PublicationReport};

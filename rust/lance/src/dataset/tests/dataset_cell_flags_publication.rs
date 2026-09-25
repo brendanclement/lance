@@ -1932,17 +1932,28 @@ async fn test_chained_outputs_published_together(#[values(false, true)] is_toget
 /// `summary` computed from body and `translation` from summary.
 const CHAIN: [(&str, &str); 2] = [("summary", "body"), ("translation", "summary")];
 
-/// Two fragments of `fragment_rows` rows holding `id` and `body` (`b{id}`),
-/// and a masked output for each `(output, input)` of `outputs`, computed from
+/// Two fragments of `fragment_rows` rows holding `id`, `body` (`b{id}`) and a
+/// NULL masked output for each `(output, input)` of `outputs`, computed from
 /// that input with [`computed`].
 async fn computed_outputs(fragment_rows: i32, outputs: &[(&str, &str)]) -> Dataset {
     let ids: Vec<i32> = (1..=2 * fragment_rows).collect();
     let bodies = StringArray::from_iter_values(ids.iter().map(|id| format!("b{id}")));
-    let batch = RecordBatch::try_from_iter([
+    let row_count = ids.len();
+    let mut columns = vec![
         ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
         ("body", Arc::new(bodies) as ArrayRef),
-    ])
-    .unwrap();
+    ];
+    // Stored rather than metadata-only: a replacement file must write only
+    // fields its fragment's files cover, or only fields they do not, so a
+    // follow-up could not stage summary with a translation a competitor
+    // already replaced.
+    for (output, _) in outputs {
+        columns.push((
+            *output,
+            Arc::new(StringArray::new_null(row_count)) as ArrayRef,
+        ));
+    }
+    let batch = RecordBatch::try_from_iter(columns).unwrap();
     let schema = batch.schema();
     let mut dataset = Dataset::write(
         RecordBatchIterator::new([Ok(batch)], schema),
@@ -1954,18 +1965,6 @@ async fn computed_outputs(fragment_rows: i32, outputs: &[(&str, &str)]) -> Datas
     )
     .await
     .unwrap();
-    let fields: Vec<ArrowField> = outputs
-        .iter()
-        .map(|(output, _)| ArrowField::new(*output, DataType::Utf8, true))
-        .collect();
-    dataset
-        .add_columns(
-            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(fields))),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
     for (output, input) in outputs {
         dataset
             .register_cell_flag(
@@ -2034,10 +2033,11 @@ struct Refresh {
 
 impl Refresh {
     /// Stage one file on fragment `fragment_id` of `read` for `outputs`, in
-    /// dependency order with the offsets each assigns. An assigned offset
-    /// takes its value from `reused` when that holds one, and is otherwise
+    /// dependency order with the offsets each assigns. An assigned offset is
     /// computed from its input as this file holds it, or as `read` shows it
-    /// when the file does not write the input. Other offsets are copied.
+    /// when the file does not write the input, unless `reused` holds its
+    /// value and the file does not also assign the input there. Other
+    /// offsets are copied.
     async fn stage(
         &mut self,
         read: &Dataset,
@@ -2049,8 +2049,10 @@ impl Refresh {
         let physical_rows = fragment.physical_rows().await.unwrap() as u32;
         let addr = |offset: u32| u64::from(RowAddress::new_from_parts(fragment_id, offset));
         let mut file: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        let file_offsets: BTreeMap<&str, &[u32]> = outputs.iter().copied().collect();
         for (column, offsets) in outputs {
             let input = input_of(read, column);
+            let input_offsets = file_offsets.get(input.as_str()).copied().unwrap_or(&[]);
             let inputs = match file.get(&input) {
                 Some(inputs) => inputs.clone(),
                 None => {
@@ -2065,9 +2067,10 @@ impl Refresh {
             for offset in 0..physical_rows {
                 let key = (column.to_string(), addr(offset));
                 let value = if offsets.contains(&offset) {
-                    let value = reused.get(&key).cloned().unwrap_or_else(|| {
-                        Some(computed(column, inputs[offset as usize].as_deref()))
-                    });
+                    let value = match reused.get(&key) {
+                        Some(value) if !input_offsets.contains(&offset) => value.clone(),
+                        _ => Some(computed(column, inputs[offset as usize].as_deref())),
+                    };
                     self.staged.insert(key, value.clone());
                     value
                 } else {
@@ -2199,16 +2202,39 @@ impl Refresh {
     }
 }
 
+/// What the follow-up of
+/// [`test_deferred_group_recomputes_outputs_of_its_staged_upstream`] does with
+/// the reusable summaries of fragment 0.
+#[derive(Debug, Clone, Copy)]
+enum SummaryFollowUp {
+    /// Leaves them unpublished and translates alone.
+    Unpublished,
+    /// Publishes them, then translates alone.
+    First,
+    /// Publishes them in the translations' file.
+    Together,
+}
+
+impl SummaryFollowUp {
+    fn publishes_summary(self) -> bool {
+        !matches!(self, Self::Unpublished)
+    }
+}
+
 /// Summary and the translation computed from it are staged in one file, and a
 /// concurrent translation of id 1 defers that file. Its translations were
 /// computed from summaries that never committed, so they are deferred for
 /// recomputation, while its summaries stay reusable. A follow-up that follows
-/// the report, translating alone or after republishing the reusable
-/// summaries, leaves every translation computed from the committed summary.
+/// the report, translating alone, after republishing the reusable summaries
+/// or together with them, leaves every translation computed from the
+/// committed summary.
 #[rstest]
+#[case::unpublished(SummaryFollowUp::Unpublished)]
+#[case::first(SummaryFollowUp::First)]
+#[case::together(SummaryFollowUp::Together)]
 #[tokio::test]
 async fn test_deferred_group_recomputes_outputs_of_its_staged_upstream(
-    #[values(false, true)] is_summary_republished: bool,
+    #[case] follow_up: SummaryFollowUp,
 ) {
     let read = computed_outputs(2, &CHAIN).await;
     let (summary, translation) = (flag_of(&read, "summary"), flag_of(&read, "translation"));
@@ -2288,34 +2314,29 @@ async fn test_deferred_group_recomputes_outputs_of_its_staged_upstream(
     let offsets = |rows: RowAddrTreeMap| -> Vec<u32> {
         rows.get_fragment_bitmap(0).unwrap().iter().collect()
     };
-    if is_summary_republished {
-        let summaries = offsets(report.reusable_rows(summary));
-        let mut summarize = Refresh::default();
-        summarize
-            .stage(
-                &head,
-                0,
-                &[("summary", &summaries)],
-                &refresh.reusable(report, &head),
-            )
-            .await;
-        head = summarize.publish(&head, Reject).await.unwrap().dataset;
-        // Published alone, summary clears the translation computed from it.
-        assert_eq!(head.cell_flag_true_rows(translation).unwrap(), full(&[1]));
-    }
+    let summaries = offsets(report.reusable_rows(summary));
     let translations = offsets(report.deferred_rows_of(translation, UpstreamNotPublished));
+    let reused = refresh.reusable(report, &head);
+    let mut outputs: Vec<(&str, &[u32])> = Vec::new();
+    match follow_up {
+        SummaryFollowUp::Unpublished => {}
+        SummaryFollowUp::First => {
+            let mut summarize = Refresh::default();
+            summarize
+                .stage(&head, 0, &[("summary", &summaries)], &reused)
+                .await;
+            head = summarize.publish(&head, Reject).await.unwrap().dataset;
+            // Published alone, summary clears the translation computed from it.
+            assert_eq!(head.cell_flag_true_rows(translation).unwrap(), full(&[1]));
+        }
+        SummaryFollowUp::Together => outputs.push(("summary", &summaries)),
+    }
+    outputs.push(("translation", &translations));
     let mut translate = Refresh::default();
-    translate
-        .stage(
-            &head,
-            0,
-            &[("translation", &translations)],
-            &refresh.reusable(report, &head),
-        )
-        .await;
+    translate.stage(&head, 0, &outputs, &reused).await;
     let done = translate.publish(&head, Reject).await.unwrap().dataset;
 
-    let summary_rows = if is_summary_republished {
+    let summary_rows = if follow_up.publishes_summary() {
         full(&[0, 1])
     } else {
         full(&[1])
@@ -2326,7 +2347,7 @@ async fn test_deferred_group_recomputes_outputs_of_its_staged_upstream(
         full(&[0, 1])
     );
     let summaries = column_values(&done, "summary", None).await;
-    let fragment_0 = if is_summary_republished {
+    let fragment_0 = if follow_up.publishes_summary() {
         [Some("summary(b1)"), Some("summary(b2)")]
     } else {
         [None, None]
@@ -2467,7 +2488,9 @@ async fn test_deferred_group_defers_only_rows_its_upstream_assigns() {
 /// Summary, translation (from summary) and keywords (from translation) staged
 /// in one file: each output's rows where its direct upstream is assigned are
 /// deferred. Id 1's keywords was computed from the translation the file
-/// copies, though its summary is staged, and stays reusable.
+/// copies, though its summary is staged, and stays reusable. A follow-up
+/// restaging every pending output in one file must still recompute a
+/// reusable value where it also publishes the value's input.
 #[tokio::test]
 async fn test_deferred_group_defers_each_link_of_a_chain() {
     let read = computed_outputs(
@@ -2593,6 +2616,54 @@ async fn test_deferred_group_defers_each_link_of_a_chain() {
             (5, Some("keywords(translation(summary(b5)))")),
             (6, Some("keywords(translation(summary(b6)))")),
         ])
+    );
+
+    // The reusable translation of id 3 and keywords of id 1 were computed
+    // from inputs this follow-up republishes, so it recomputes them.
+    let outputs: [(&str, &[u32]); 3] = [
+        ("summary", &[0, 1, 2]),
+        ("translation", &[0, 1, 2]),
+        ("keywords", &[0, 2]),
+    ];
+    let mut follow_up = Refresh::default();
+    follow_up
+        .stage(
+            &result.dataset,
+            0,
+            &outputs,
+            &refresh.reusable(report, &result.dataset),
+        )
+        .await;
+    let done = follow_up
+        .publish(&result.dataset, Reject)
+        .await
+        .unwrap()
+        .dataset;
+    for flag_id in [summary, translation] {
+        assert_eq!(done.cell_flag_true_rows(flag_id).unwrap(), full(&[0, 1]));
+    }
+    // Id 2's keywords was computed from the translation this follow-up
+    // replaces, so the translation's publication clears it.
+    assert_eq!(
+        done.cell_flag_true_rows(keywords).unwrap(),
+        with_full(rows(&[(0, &[0, 2])]), 1)
+    );
+    let summarized = |id: i32| computed("summary", Some(&format!("b{id}")));
+    let translated = |id: i32| computed("translation", Some(&summarized(id)));
+    let by_id = |value: &dyn Fn(i32) -> Option<String>| -> Vec<(i32, Option<String>)> {
+        (1..=6).map(|id| (id, value(id))).collect()
+    };
+    assert_eq!(
+        column_values(&done, "summary", None).await,
+        by_id(&|id| Some(summarized(id)))
+    );
+    assert_eq!(
+        column_values(&done, "translation", None).await,
+        by_id(&|id| Some(translated(id)))
+    );
+    assert_eq!(
+        column_values(&done, "keywords", None).await,
+        by_id(&|id| (id != 2).then(|| computed("keywords", Some(&translated(id)))))
     );
 }
 
