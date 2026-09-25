@@ -36,7 +36,8 @@ pub struct CellFlagDefinition {
     pub name: String,
     /// Ids of the top-level source fields, sorted and deduplicated. When
     /// non-empty the flag is dependent: a write to a source field, or to the
-    /// output field itself, clears the flag for the written rows.
+    /// output field itself, clears the flag for the written rows, and so does
+    /// a clear of the dependent flag whose output is one of the sources.
     pub clear_on_write: Vec<i32>,
     /// Reads return NULL for the output field wherever the flag is false.
     pub mask_when_false: bool,

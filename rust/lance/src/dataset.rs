@@ -105,7 +105,7 @@ mod take;
 /// [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 pub mod transaction {
     pub use lance_table::transaction::{
-        CarriedCellFlags, CellFlagChanges, CellFlagRegistration, CellFlagUpdate, DataOverlayGroup,
+        CellFlagChanges, CellFlagMovedRows, CellFlagRegistration, CellFlagUpdate, DataOverlayGroup,
         DataReplacementGroup, Operation, ReadVersionState, RewriteGroup, RewrittenIndex,
         Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
         UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,

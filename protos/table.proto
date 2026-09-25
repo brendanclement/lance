@@ -272,7 +272,8 @@ message CellFlagDefinition {
   string name = 3;
   /* Ids of top-level source fields, sorted and without duplicates. A non-empty
    * list makes the flag dependent: a write to any of these fields, or to the
-   * output field itself, clears the flag for the written rows.
+   * output field itself, clears the flag for the written rows, and so does a
+   * clear of the dependent flag whose output is one of these fields.
    */
   repeated int32 clear_on_write = 4;
   // Reads return NULL for the output field wherever the flag is false.

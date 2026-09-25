@@ -59,30 +59,31 @@ message Transaction {
       repeated int32 clear_on_write = 3;
       bool mask_when_false = 4;
     }
-    /* Flag state carried onto rows this transaction moved into a new
-     * fragment, which is named by the path of its first data file because
-     * fragment ids are assigned at commit. `offsets` is a portable
-     * RoaringBitmap of physical offsets in that fragment.
+    /* Rows a row-moving update rewrote into a fragment it adds, named by the
+     * path of its first data file because fragment ids are assigned at
+     * commit. `offsets` is a portable RoaringBitmap of physical offsets in
+     * that fragment; `source_row_addrs` holds the row address each of those
+     * rows had before the move, in ascending offset order. The commit copies
+     * the head's state of every ordinary flag from each source row.
      */
-    message Carried {
-      uint32 flag_id = 1;
-      string fragment_path = 2;
-      bytes offsets = 3;
+    message MovedRows {
+      string fragment_path = 1;
+      bytes offsets = 2;
+      repeated uint64 source_row_addrs = 3;
     }
     // Caller-supplied updates.
     repeated Update updates = 1;
     repeated Registration registrations = 2;
     // Ids of flags to drop.
     repeated uint32 drops = 3;
-    /* The clears implied by this transaction's writes to the source or output
-     * fields of dependent flags, recomputed against the head at every commit
-     * attempt. Recorded even where the flag was already false. Every entry
-     * has value = false.
+    /* The clears implied by this transaction's changes to the source or
+     * output fields of dependent flags, including clears that propagate from
+     * an upstream dependent flag to the flags watching its output. Recomputed
+     * against the head at every commit attempt and recorded even where the
+     * flag was already false. Every entry has value = false.
      */
     repeated Update derived_invalidations = 4;
-    repeated Carried carried = 5;
-    // Fragments whose moved rows carry their flag state through `carried`.
-    repeated uint64 carried_from_fragments = 6;
+    repeated MovedRows moved_rows = 5;
   }
 
   // Add new rows to the dataset.

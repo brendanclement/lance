@@ -44,7 +44,8 @@ use lance_table::io::commit::{
 };
 use lance_table::io::manifest::read_manifest;
 use lance_table::transaction::{
-    CellFlagChanges, derive_cell_flag_invalidations, ensure_operation_allowed_with_cell_flags,
+    CellFlagChanges, derive_cell_flag_invalidations, ensure_cell_flags_registered_at_read_version,
+    ensure_operation_allowed_with_cell_flags,
 };
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
@@ -1196,7 +1197,12 @@ pub(crate) async fn do_commit_detached_transaction(
     ensure_can_write_manifest(&dataset.manifest)?;
     // A detached version is never rebased onto the head, so the invalidations
     // of concurrent writes could not be checked or recorded against it.
-    if transaction.cell_flag_changes.is_some() || dataset.manifest.cell_flags.is_some() {
+    let has_cell_flags = dataset
+        .manifest
+        .cell_flags
+        .as_deref()
+        .is_some_and(|registry| !registry.definitions().is_empty());
+    if transaction.cell_flag_changes.is_some() || has_cell_flags {
         return Err(Error::not_supported(
             "detached commits are not supported on datasets with cell flags, nor with cell \
              flag changes",
@@ -1583,6 +1589,7 @@ pub(crate) async fn commit_transaction(
              at, but its read_version is 0",
         ));
     }
+    ensure_cell_flags_registered_at_read_version(&read_version_dataset.manifest, &transaction)?;
     // Every concurrent version checked across attempts, in order.
     let mut seen_versions: Vec<u64> = Vec::new();
 
@@ -1609,7 +1616,6 @@ pub(crate) async fn commit_transaction(
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
             ensure_can_write_manifest(&dataset.manifest)?;
-            ensure_operation_allowed_with_cell_flags(&dataset.manifest, &transaction)?;
             seen_versions.extend(other_transactions.iter().map(|(version, _)| *version));
 
             // See if we can retry the commit. Try to account for all
@@ -1627,8 +1633,10 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
-            ensure_operation_allowed_with_cell_flags(&dataset.manifest, &transaction)?;
         }
+        // After the rebase, so a stale transaction fails as a conflict rather
+        // than being refused for differences a concurrent commit introduced.
+        ensure_operation_allowed_with_cell_flags(&dataset.manifest, &transaction)?;
         if sets_cell_flags {
             ensure_saw_every_version_since_read(
                 read_version,
@@ -1894,7 +1902,7 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
-    use lance_table::format::{DataFile, DataStorageFormat};
+    use lance_table::format::{CellFlagRegistry, DataFile, DataStorageFormat};
     use lance_table::io::commit::{
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
         commit_handler_from_url,
@@ -2591,6 +2599,31 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             HashMap::new(),
+        );
+
+        // The repair would give a field a cell flag refers to a new id.
+        let mut flagged = manifest.clone();
+        flagged.cell_flags = Some(Arc::new(
+            CellFlagRegistry::try_from(pb::CellFlagRegistry {
+                definitions: vec![pb::CellFlagDefinition {
+                    flag_id: 1,
+                    field_id: 0,
+                    name: "ready".to_string(),
+                    clear_on_write: vec![2],
+                    mask_when_false: false,
+                }],
+                next_flag_id: 2,
+                states: vec![],
+            })
+            .unwrap(),
+        ));
+        let error = fix_schema(&mut flagged).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot repair the duplicate field id 2: a cell flag refers to it"),
+            "{error}"
         );
 
         fix_schema(&mut manifest).unwrap();

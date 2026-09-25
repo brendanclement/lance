@@ -343,7 +343,83 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
+        }?;
+        self.check_cell_flag_changes_txn(other_transaction, other_version)
+    }
+
+    /// Explicit cell flag updates address rows by their physical position at
+    /// the read version, and registrations name field ids resolved there.
+    /// Conflict with a concurrent transaction that moved or removed an
+    /// addressed row, or that can reassign field ids.
+    fn check_cell_flag_changes_txn(
+        &self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        let Some(changes) = self.transaction.cell_flag_changes.as_deref() else {
+            return Ok(());
+        };
+        if changes.registrations.is_empty() && changes.updates.is_empty() {
+            return Ok(());
         }
+        if matches!(
+            other_transaction.operation,
+            Operation::Overwrite { .. } | Operation::Restore { .. }
+        ) {
+            return Err(self.incompatible_conflict_err(other_transaction, other_version));
+        }
+        // A field id the registration names that leaves the schema, dropped or
+        // moved to a new id by a cast, is free for the next added field.
+        if let Operation::Project { schema, .. } | Operation::Merge { schema, .. } =
+            &other_transaction.operation
+            && changes.registrations.iter().any(|registration| {
+                std::iter::once(registration.field_id)
+                    .chain(registration.clear_on_write.iter().copied())
+                    .any(|field_id| !schema.fields.iter().any(|field| field.id == field_id))
+            })
+        {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+        let addressed: HashSet<u64> = changes
+            .updates
+            .iter()
+            .flat_map(|update| update.rows.iter().map(|(fragment, _)| u64::from(*fragment)))
+            .collect();
+        let moved_or_removed: Vec<u64> = match &other_transaction.operation {
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                update_mode,
+                ..
+            } => {
+                let moves_rows = !new_fragments.is_empty()
+                    && matches!(update_mode, Some(UpdateMode::RewriteRows) | None);
+                removed_fragment_ids
+                    .iter()
+                    .copied()
+                    .chain(
+                        updated_fragments
+                            .iter()
+                            .filter(|_| moves_rows)
+                            .map(|fragment| fragment.id),
+                    )
+                    .collect()
+            }
+            Operation::Delete {
+                deleted_fragment_ids,
+                ..
+            } => deleted_fragment_ids.clone(),
+            Operation::Rewrite { groups, .. } => groups
+                .iter()
+                .flat_map(|group| group.old_fragments.iter().map(|fragment| fragment.id))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if moved_or_removed.iter().any(|id| addressed.contains(id)) {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+        Ok(())
     }
 
     fn check_delete_txn(

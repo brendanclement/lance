@@ -44,9 +44,10 @@ mod validate;
 pub(crate) mod test_support;
 
 pub use builder::{Transaction, TransactionBuilder};
-pub use cell_flag::{CarriedCellFlags, CellFlagChanges, CellFlagRegistration, CellFlagUpdate};
+pub use cell_flag::{CellFlagChanges, CellFlagMovedRows, CellFlagRegistration, CellFlagUpdate};
 pub use cell_flag_commit::{
-    derive_cell_flag_invalidations, ensure_operation_allowed_with_cell_flags,
+    derive_cell_flag_invalidations, ensure_cell_flags_registered_at_read_version,
+    ensure_operation_allowed_with_cell_flags,
 };
 pub use manifest_build::RANGE_SEGMENTS_CONFIG_KEY;
 pub use operation::{

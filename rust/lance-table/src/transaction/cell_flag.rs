@@ -34,28 +34,37 @@ pub struct CellFlagRegistration {
     pub mask_when_false: bool,
 }
 
-/// Flag state carried onto rows that a row-moving update wrote into a new
-/// fragment.
+/// Rows a row-moving update rewrote into one fragment it adds.
+///
+/// This maps addresses rather than carrying flag values: the commit copies the
+/// state each source row has at the head, so a flag changed by a transaction
+/// that committed after this update was staged still follows the row. Only
+/// ordinary flags are copied; dependent flags start false on moved rows.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CarriedCellFlags {
-    pub flag_id: u32,
+pub struct CellFlagMovedRows {
     /// Path of the first data file of the new fragment, which names it until
     /// the commit assigns its id.
     pub fragment_path: String,
-    /// Physical offsets in the new fragment whose flag is true.
+    /// Physical offsets in the new fragment that hold moved rows.
     pub offsets: RoaringBitmap,
+    /// Row address (fragment id in the upper 32 bits, physical offset in the
+    /// lower) each moved row had at the version the update read, one per
+    /// entry of `offsets` in ascending offset order.
+    pub source_row_addrs: Vec<u64>,
 }
 
-impl DeepSizeOf for CarriedCellFlags {
+impl DeepSizeOf for CellFlagMovedRows {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.fragment_path.deep_size_of_children(context) + self.offsets.serialized_size()
+        self.fragment_path.deep_size_of_children(context)
+            + self.offsets.serialized_size()
+            + self.source_row_addrs.deep_size_of_children(context)
     }
 }
 
 /// All cell flag changes of one transaction.
 ///
 /// Applied at commit in this order: `drops`, `registrations`,
-/// `derived_invalidations`, `updates`, then `carried`.
+/// `derived_invalidations`, `updates`, then `moved_rows`.
 #[derive(Debug, Clone, PartialEq, Default, DeepSizeOf)]
 pub struct CellFlagChanges {
     /// Caller-supplied updates, applied in order.
@@ -63,16 +72,17 @@ pub struct CellFlagChanges {
     pub registrations: Vec<CellFlagRegistration>,
     /// Ids of the flags to drop.
     pub drops: Vec<u32>,
-    /// Clears implied by this transaction's writes to the watched fields of
-    /// dependent flags. The commit recomputes them against the head on every
-    /// attempt, replacing whatever the caller supplied, so they are recorded
-    /// even where the flag was already false. Every entry has `value == false`.
+    /// Clears implied by this transaction's changes to the watched fields of
+    /// dependent flags, including clears that propagate from an upstream
+    /// dependent flag to the flags watching its output. The commit recomputes
+    /// them against the head on every attempt, replacing whatever the caller
+    /// supplied, so they are recorded even where the flag was already false.
+    /// Every entry has `value == false`.
     pub derived_invalidations: Vec<CellFlagUpdate>,
-    pub carried: Vec<CarriedCellFlags>,
-    /// Fragments that rows moved out of and whose flag state is carried by
-    /// `carried`. A row-moving update is refused on a fragment where an
-    /// ordinary flag has true rows unless the fragment is listed here.
-    pub carried_from_fragments: Vec<u64>,
+    /// Rows a row-moving update moved into new fragments. A row-moving update
+    /// is refused on a fragment where an ordinary flag has true rows unless
+    /// some entry here moves rows out of that fragment.
+    pub moved_rows: Vec<CellFlagMovedRows>,
 }
 
 impl CellFlagChanges {
@@ -81,11 +91,11 @@ impl CellFlagChanges {
             && self.registrations.is_empty()
             && self.drops.is_empty()
             && self.derived_invalidations.is_empty()
-            && self.carried.is_empty()
-            && self.carried_from_fragments.is_empty()
+            && self.moved_rows.is_empty()
     }
 
-    /// Whether any explicit update sets a flag to true.
+    /// Whether any explicit update sets a flag to true. Moved rows do not
+    /// count: they copy the head's state rather than values read earlier.
     pub fn sets_any_flag(&self) -> bool {
         self.updates.iter().any(|update| update.value)
     }

@@ -631,9 +631,7 @@ impl MergeInsertParams {
 struct PatchSink {
     /// Fragments that gained a data file, one entry per task.
     fragments: Mutex<Vec<Fragment>>,
-    /// Physical offsets each fragment had patched. Only populated under stable
-    /// row ids, which is the only thing that reads the row-version metadata
-    /// these correct.
+    /// Physical offsets each fragment had patched.
     offsets: Mutex<HashMap<u64, RoaringBitmap>>,
 }
 
@@ -653,9 +651,10 @@ pub(super) struct PatchedFragments {
     /// first, making the real commit version later. Handing these offsets to
     /// `Operation::Update`'s `updated_fragment_offsets` lets `build_manifest`
     /// re-stamp exactly the patched rows with the version the commit actually
-    /// got. Empty when the dataset does not use stable row ids, since nothing
-    /// reads the metadata then.
-    pub matched_offsets: UpdatedFragmentOffsets,
+    /// got, and lets the commit clear dependent cell flags on exactly those
+    /// rows. `None` when no row was patched, which is how a stored transaction
+    /// decodes, so the in-memory transaction compares equal to it.
+    pub matched_offsets: Option<UpdatedFragmentOffsets>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -1720,20 +1719,19 @@ impl MergeInsertJob {
                         .eq(RowAddress::address_range(metadata.id as u32).take(updated_rows));
 
                 // Record which offsets this fragment patched before the write
-                // paths below consume `_rowaddr`. Only stable row ids read the
-                // row-version metadata these drive, so skip the work otherwise.
-                if dataset.manifest.uses_stable_row_ids() {
-                    let offsets: RoaringBitmap = get_row_addr_iter(&batches)
-                        .map(|(row_addr, _)| RowAddress::from(row_addr).row_offset())
-                        .collect();
-                    patched
-                        .offsets
-                        .lock()
-                        .unwrap()
-                        .entry(metadata.id)
-                        .or_default()
-                        .extend(offsets);
-                }
+                // paths below consume `_rowaddr`. Stable row ids re-stamp their
+                // row-version metadata from these, and the commit clears
+                // dependent cell flags on exactly these rows.
+                let offsets: RoaringBitmap = get_row_addr_iter(&batches)
+                    .map(|(row_addr, _)| RowAddress::from(row_addr).row_offset())
+                    .collect();
+                patched
+                    .offsets
+                    .lock()
+                    .unwrap()
+                    .entry(metadata.id)
+                    .or_default()
+                    .extend(offsets);
 
                 if has_full_fragment_coverage {
                     // Exact, deletion-free coverage can be written directly because the
@@ -2049,7 +2047,9 @@ impl MergeInsertJob {
             offsets: matched_offsets,
         } = Arc::try_unwrap(patched).unwrap();
         let mut updated_fragments = updated_fragments.into_inner().unwrap();
-        let matched_offsets = matched_offsets.into_inner().unwrap();
+        let mut matched_offsets = matched_offsets.into_inner().unwrap();
+        // A stored transaction drops empty bitmaps, so drop them here too.
+        matched_offsets.retain(|_, offsets| !offsets.is_empty());
 
         // We keep track of all fields that are updated so we can prune the indices.
         // We could maybe be more precise since some fields are not modified in some
@@ -2098,7 +2098,8 @@ impl MergeInsertJob {
             updated_fragments,
             new_fragments,
             fields_modified: all_fields_updated.into_iter().collect(),
-            matched_offsets: UpdatedFragmentOffsets(matched_offsets),
+            matched_offsets: (!matched_offsets.is_empty())
+                .then_some(UpdatedFragmentOffsets(matched_offsets)),
         })
     }
 
@@ -2895,7 +2896,7 @@ impl MergeInsertJob {
                 // The version stamped above is a guess; carry the patched offsets
                 // so `build_manifest` can re-stamp them at the real commit
                 // version after a rebase.
-                updated_fragment_offsets: Some(matched_offsets),
+                updated_fragment_offsets: matched_offsets,
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
@@ -7853,6 +7854,70 @@ mod tests {
                     "key {key} has the wrong last-updated version"
                 );
             }
+        }
+
+        /// The commit outcome check compares the stored transaction with the
+        /// in-memory one, so a patch that matches nothing must not keep an
+        /// empty offset map, which decodes back as `None`.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_without_matches_stores_its_transaction() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("tag", DataType::Utf8, true),
+                Field::new("other", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0, 1])),
+                    Arc::new(StringArray::from(vec!["t"; 2])),
+                    Arc::new(StringArray::from(vec!["o"; 2])),
+                ],
+            )
+            .unwrap();
+            let ds = Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema.clone()),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap();
+            let source_schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("tag", DataType::Utf8, true),
+            ]));
+            let source = RecordBatch::try_new(
+                source_schema,
+                vec![
+                    Arc::new(UInt32Array::from(vec![7])),
+                    Arc::new(StringArray::from(vec!["patched"])),
+                ],
+            )
+            .unwrap();
+            let (committed, _) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .write_mode(MergeInsertWriteMode::RewriteColumns)
+                .try_build()
+                .unwrap()
+                .execute_batches(vec![source])
+                .await
+                .unwrap();
+            let stored = committed
+                .read_transaction_from_storage(&committed.manifest, &committed.manifest_location)
+                .await
+                .unwrap()
+                .unwrap();
+            let cached = committed.read_transaction().await.unwrap().unwrap();
+            assert!(matches!(
+                cached.operation,
+                Operation::Update {
+                    updated_fragment_offsets: None,
+                    ..
+                }
+            ));
+            assert_eq!(cached, stored);
         }
 
         /// The version `update_fragments` stamps into the row-version metadata is

@@ -492,7 +492,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 // Which rows were patched, so `build_manifest` re-stamps their
                 // `_row_last_updated_at_version` with the version this commit
                 // actually lands on rather than the one guessed above.
-                updated_fragment_offsets: Some(matched_offsets),
+                updated_fragment_offsets: matched_offsets,
             };
             let transaction = Transaction::new(dataset.manifest.version, operation, None);
 

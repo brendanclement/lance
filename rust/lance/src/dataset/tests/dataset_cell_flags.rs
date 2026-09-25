@@ -4,6 +4,7 @@
 //! Dependent cell flags end to end: registration, publication through a staged
 //! `DataReplacement`, and the clears that writes to the watched fields record.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, StringArray, record_batch};
@@ -11,6 +12,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::stream;
 use lance_core::Error;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::utils::tempfile::TempStdDir;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::feature_flags::FLAG_UNSTABLE_CELL_FLAGS;
 use rstest::rstest;
@@ -19,16 +21,21 @@ use crate::dataset::cell_flag::CellFlagOptions;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::schema_evolution::NewColumnTransform;
 use crate::dataset::transaction::{
-    CellFlagChanges, CellFlagUpdate, DataReplacementGroup, Operation, TransactionBuilder,
+    CellFlagChanges, CellFlagRegistration, CellFlagUpdate, DataReplacementGroup, Operation,
+    Transaction, TransactionBuilder, translate_config_updates,
 };
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
-use crate::dataset::write::{CommitBuilder, WriteParams};
-use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode};
+use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+use crate::dataset::{ColumnAlteration, MergeInsertBuilder, MergeInsertWriteMode, UpdateBuilder};
 use crate::{Dataset, Result};
 
 /// Two fragments of two articles each, with a `summary` column declared but
 /// never written, the way a computed column starts.
 async fn articles(stable_row_ids: bool) -> Dataset {
+    articles_at("memory://", stable_row_ids).await
+}
+
+async fn articles_at(uri: &str, stable_row_ids: bool) -> Dataset {
     let batch = record_batch!(
         ("id", Int32, [1, 2, 3, 4]),
         ("title", Utf8, ["t1", "t2", "t3", "t4"]),
@@ -38,7 +45,7 @@ async fn articles(stable_row_ids: bool) -> Dataset {
     let schema = batch.schema();
     let mut dataset = Dataset::write(
         RecordBatchIterator::new([Ok(batch)], schema),
-        "memory://",
+        uri,
         Some(WriteParams {
             max_rows_per_file: 2,
             enable_stable_row_ids: stable_row_ids,
@@ -125,24 +132,41 @@ fn set_true(flag_id: u32, rows: RowAddrTreeMap) -> Vec<CellFlagUpdate> {
     }]
 }
 
+fn replacement_txn(
+    read_version: u64,
+    replacements: Vec<DataReplacementGroup>,
+    updates: Vec<CellFlagUpdate>,
+) -> Transaction {
+    TransactionBuilder::new(read_version, Operation::DataReplacement { replacements })
+        .cell_flag_changes(CellFlagChanges {
+            updates,
+            ..Default::default()
+        })
+        .build()
+}
+
 /// Commit `replacements` staged against `dataset`'s version.
 async fn commit_replacement(
     dataset: &Dataset,
     replacements: Vec<DataReplacementGroup>,
     updates: Vec<CellFlagUpdate>,
 ) -> Result<Dataset> {
-    let transaction = TransactionBuilder::new(
-        dataset.manifest.version,
-        Operation::DataReplacement { replacements },
-    )
-    .cell_flag_changes(CellFlagChanges {
-        updates,
-        ..Default::default()
-    })
-    .build();
     CommitBuilder::new(Arc::new(dataset.clone()))
-        .execute(transaction)
+        .execute(replacement_txn(
+            dataset.manifest.version,
+            replacements,
+            updates,
+        ))
         .await
+}
+
+fn update_config() -> Operation {
+    Operation::UpdateConfig {
+        config_updates: None,
+        table_metadata_updates: None,
+        schema_metadata_updates: None,
+        field_metadata_updates: HashMap::new(),
+    }
 }
 
 /// The derived invalidations the transaction file of `dataset`'s version holds.
@@ -152,8 +176,9 @@ async fn recorded_invalidations(dataset: &Dataset) -> Vec<CellFlagUpdate> {
         .await
         .unwrap()
         .unwrap();
+    // The commit outcome check compares the two, so they must not diverge.
     let cached = dataset.read_transaction().await.unwrap().unwrap();
-    assert_eq!(cached.cell_flag_changes, transaction.cell_flag_changes);
+    assert_eq!(cached, transaction);
     transaction
         .cell_flag_changes
         .map(|changes| changes.derived_invalidations.clone())
@@ -388,20 +413,501 @@ async fn test_partial_merge_insert_clears_written_rows(
         .await
         .unwrap();
 
-    // Only stable row ids record which rows matched; otherwise the whole
-    // rewritten fragment is cleared.
+    // Only the matched row is cleared, with or without stable row ids.
     let mut expected = full(&[1]);
-    let written = if stable_row_ids {
-        expected.insert(0);
-        let mut written = RowAddrTreeMap::new();
-        written.insert(1);
-        written
-    } else {
-        full(&[0])
-    };
+    expected.insert(0);
+    let mut written = RowAddrTreeMap::new();
+    written.insert(1);
     assert_eq!(dataset.cell_flag_true_rows(flag_id).unwrap(), expected);
     assert_eq!(
         recorded_invalidations(&dataset).await,
         cleared(flag_id, written)
+    );
+}
+
+#[tokio::test]
+async fn test_clears_propagate_down_dependency_chains() {
+    let mut dataset = articles(false).await;
+    let translation = ArrowSchema::new(vec![ArrowField::new("translation", DataType::Utf8, true)]);
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(translation)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let masked_on = |sources: &[&str]| {
+        CellFlagOptions::default()
+            .with_clear_on_write(sources.iter().copied())
+            .with_mask_when_false(true)
+    };
+    let ready = dataset
+        .register_cell_flag("summary", "ready", masked_on(&["body"]))
+        .await
+        .unwrap()
+        .flag_id;
+    let translated = dataset
+        .register_cell_flag("translation", "ready", masked_on(&["summary"]))
+        .await
+        .unwrap()
+        .flag_id;
+    let groups = stage_all(&dataset, "summary", "s").await;
+    let dataset = commit_replacement(&dataset, groups, set_true(ready, full(&[0, 1])))
+        .await
+        .unwrap();
+    let groups = stage_all(&dataset, "translation", "t").await;
+    let dataset = commit_replacement(&dataset, groups, set_true(translated, full(&[0, 1])))
+        .await
+        .unwrap();
+
+    // Writing body masks summary on fragment 0, so the translation computed
+    // from it is stale there too.
+    let body = stage(&dataset, 0, "body", "b").await;
+    let dataset = commit_replacement(&dataset, vec![body], vec![])
+        .await
+        .unwrap();
+    for flag_id in [ready, translated] {
+        assert_eq!(dataset.cell_flag_true_rows(flag_id).unwrap(), full(&[1]));
+    }
+    let mut expected = cleared(ready, full(&[0]));
+    expected.extend(cleared(translated, full(&[0])));
+    expected.sort_by_key(|update| update.flag_id);
+    assert_eq!(recorded_invalidations(&dataset).await, expected);
+}
+
+#[tokio::test]
+async fn test_write_staged_before_registration_records_clear() {
+    let mut dataset = articles(false).await;
+    let read_version = dataset.manifest.version;
+    let staged_body = stage(&dataset, 0, "body", "b").await;
+
+    let flag_id = register_ready(&mut dataset).await;
+    let groups = stage_all(&dataset, "summary", "s").await;
+    let dataset = commit_replacement(&dataset, groups, set_true(flag_id, full(&[0, 1])))
+        .await
+        .unwrap();
+
+    // Staged before the flag existed, so only the head's registry knows it
+    // must clear.
+    let dataset = CommitBuilder::new(Arc::new(dataset))
+        .execute(replacement_txn(read_version, vec![staged_body], vec![]))
+        .await
+        .unwrap();
+    assert_eq!(dataset.cell_flag_true_rows(flag_id).unwrap(), full(&[1]));
+    assert_eq!(
+        recorded_invalidations(&dataset).await,
+        cleared(flag_id, full(&[0]))
+    );
+}
+
+#[tokio::test]
+async fn test_publication_needs_flag_registered_at_read_version() {
+    let mut dataset = articles(false).await;
+    let read = dataset.clone();
+    let staged = stage_all(&read, "summary", "stale").await;
+    let flag_id = register_ready(&mut dataset).await;
+    let registered_at = dataset.version().version;
+
+    let error = commit_replacement(&read, staged, set_true(flag_id, full(&[0, 1])))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::IncompatibleTransaction { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains(&format!(
+            "cell flag {flag_id} is set true, but it was not registered at version {}",
+            read.version().version
+        )),
+        "{error}"
+    );
+
+    // A replacement registered after the read is new to it in the same way.
+    let read = dataset.clone();
+    let staged = stage_all(&read, "summary", "stale").await;
+    let replaced = dataset
+        .replace_cell_flag(
+            "summary",
+            "ready",
+            CellFlagOptions::default().with_clear_on_write(["body"]),
+        )
+        .await
+        .unwrap();
+    let error = commit_replacement(&read, staged, set_true(replaced.flag_id, full(&[0, 1])))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::IncompatibleTransaction { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("was not registered"), "{error}");
+
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.version().version, registered_at + 1);
+    assert!(
+        dataset
+            .cell_flag_true_rows(replaced.flag_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn test_publication_needs_every_version_since_read() {
+    let mut dataset = articles(false).await;
+    let flag_id = register_ready(&mut dataset).await;
+    let read = dataset.clone();
+    let staged = stage_all(&read, "summary", "s").await;
+    dataset.update_config([("a", "1")]).await.unwrap();
+    let missing = dataset.version().version;
+    dataset.update_config([("b", "2")]).await.unwrap();
+
+    // Cleanup could remove a version whose transaction invalidated the rows.
+    let missing_location = dataset
+        .checkout_version(missing)
+        .await
+        .unwrap()
+        .manifest_location
+        .path
+        .clone();
+    dataset
+        .object_store
+        .delete(&missing_location)
+        .await
+        .unwrap();
+
+    let error = commit_replacement(&read, staged, set_true(flag_id, full(&[0, 1])))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::IncompatibleTransaction { .. }),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("could not all be loaded (missing: [{missing}])")),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_publication_needs_a_read_version() {
+    let mut dataset = articles(false).await;
+    let flag_id = register_ready(&mut dataset).await;
+    let staged = stage_all(&dataset, "summary", "s").await;
+    let error = CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(replacement_txn(0, staged, set_true(flag_id, full(&[0, 1]))))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(error.to_string().contains("read_version is 0"), "{error}");
+}
+
+#[tokio::test]
+async fn test_detached_and_batch_commits_are_refused() {
+    let mut dataset = articles(false).await;
+    register_ready(&mut dataset).await;
+    let config = |dataset: &Dataset| {
+        TransactionBuilder::new(
+            dataset.manifest.version,
+            Operation::UpdateConfig {
+                config_updates: Some(translate_config_updates(
+                    &HashMap::from([("k".to_string(), "v".to_string())]),
+                    &[],
+                )),
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+        )
+        .build()
+    };
+    let error = CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_detached(true)
+        .execute(config(&dataset))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("detached commits are not supported on datasets with cell flags"),
+        "{error}"
+    );
+
+    let append = TransactionBuilder::new(
+        dataset.manifest.version,
+        Operation::Append { fragments: vec![] },
+    )
+    .cell_flag_changes(CellFlagChanges {
+        drops: vec![1],
+        ..Default::default()
+    })
+    .build();
+    let Err(error) = CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute_batch(vec![append])
+        .await
+    else {
+        panic!("a batch commit with cell flag changes must fail");
+    };
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("batch commits cannot carry cell flag changes"),
+        "{error}"
+    );
+
+    // With every flag dropped nothing is left to track.
+    dataset.drop_cell_flag("summary", "ready").await.unwrap();
+    CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_detached(true)
+        .execute(config(&dataset))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_clones_keep_cell_flags() {
+    let test_dir = TempStdDir::default();
+    let uri = |name: &str| test_dir.join(name).to_str().unwrap().to_string();
+    let mut dataset = articles_at(&uri("source"), false).await;
+    let flag_id = register_ready(&mut dataset).await;
+    let groups = stage_all(&dataset, "summary", "s").await;
+    let mut dataset = commit_replacement(&dataset, groups, set_true(flag_id, full(&[0])))
+        .await
+        .unwrap();
+    let version = dataset.version().version;
+    dataset.tags().create("v", version).await.unwrap();
+
+    let shallow = dataset
+        .shallow_clone(&uri("shallow"), "v", None)
+        .await
+        .unwrap();
+    let deep = dataset.deep_clone(&uri("deep"), "v", None).await.unwrap();
+    for clone in [shallow, deep] {
+        assert_eq!(clone.manifest.cell_flags, dataset.manifest.cell_flags);
+        assert_eq!(clone.cell_flag_true_rows(flag_id).unwrap(), full(&[0]));
+        assert_ne!(
+            clone.manifest.reader_feature_flags & FLAG_UNSTABLE_CELL_FLAGS,
+            0
+        );
+        assert_ne!(
+            clone.manifest.writer_feature_flags & FLAG_UNSTABLE_CELL_FLAGS,
+            0
+        );
+    }
+}
+
+/// `summary.ready` staged against `dataset`, with field ids resolved there.
+fn ready_registration(dataset: &Dataset) -> Transaction {
+    let schema = dataset.schema();
+    let field_id = |name: &str| schema.field(name).unwrap().id;
+    TransactionBuilder::new(dataset.manifest.version, update_config())
+        .cell_flag_changes(CellFlagChanges {
+            registrations: vec![CellFlagRegistration {
+                field_id: field_id("summary"),
+                name: "ready".to_string(),
+                clear_on_write: vec![field_id("title"), field_id("body")],
+                mask_when_false: true,
+            }],
+            ..Default::default()
+        })
+        .build()
+}
+
+#[tokio::test]
+async fn test_registration_conflicts_with_concurrent_overwrite() {
+    let dataset = articles(false).await;
+    let schema = dataset.schema();
+    let field_id = |name: &str| schema.field(name).unwrap().id;
+    let registration = ready_registration(&dataset);
+
+    // The same field ids now name different columns.
+    let replacement = record_batch!(
+        ("sku", Utf8, ["a"]),
+        ("qty", Utf8, ["1"]),
+        ("name", Utf8, ["n"]),
+        ("note", Utf8, [None::<&str>])
+    )
+    .unwrap();
+    let overwritten = InsertBuilder::new(Arc::new(dataset.clone()))
+        .with_params(&WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        })
+        .execute(vec![replacement])
+        .await
+        .unwrap();
+    assert_eq!(
+        overwritten.schema().field("note").unwrap().id,
+        field_id("summary")
+    );
+
+    let error = CommitBuilder::new(Arc::new(dataset))
+        .execute(registration)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::IncompatibleTransaction { .. }),
+        "{error}"
+    );
+    let mut latest = overwritten;
+    latest.checkout_latest().await.unwrap();
+    assert!(latest.cell_flags().is_empty());
+}
+
+#[rstest]
+#[case::dropped_id_reused(false)]
+#[case::source_cast_to_new_id(true)]
+#[tokio::test]
+async fn test_registration_conflicts_with_concurrent_field_id_change(#[case] is_cast: bool) {
+    let dataset = articles(false).await;
+    let registration = ready_registration(&dataset);
+
+    let mut changed = dataset.clone();
+    if is_cast {
+        let title_id = dataset.schema().field("title").unwrap().id;
+        changed
+            .alter_columns(&[ColumnAlteration::new("title".into()).cast_to(DataType::LargeUtf8)])
+            .await
+            .unwrap();
+        assert_ne!(changed.schema().field("title").unwrap().id, title_id);
+    } else {
+        // No data file holds the dropped column, so its id goes to the next one.
+        let summary_id = dataset.schema().field("summary").unwrap().id;
+        changed.drop_columns(&["summary"]).await.unwrap();
+        let note = ArrowSchema::new(vec![ArrowField::new("note", DataType::Utf8, true)]);
+        changed
+            .add_columns(NewColumnTransform::AllNulls(Arc::new(note)), None, None)
+            .await
+            .unwrap();
+        assert_eq!(changed.schema().field("note").unwrap().id, summary_id);
+    }
+
+    let error = CommitBuilder::new(Arc::new(dataset))
+        .execute(registration)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "{error}"
+    );
+    changed.checkout_latest().await.unwrap();
+    assert!(changed.cell_flags().is_empty());
+}
+
+#[tokio::test]
+async fn test_registration_rebases_over_concurrent_add_columns() {
+    let dataset = articles(false).await;
+    let registration = ready_registration(&dataset);
+    let mut added = dataset.clone();
+    let extra = ArrowSchema::new(vec![ArrowField::new("extra", DataType::Utf8, true)]);
+    added
+        .add_columns(NewColumnTransform::AllNulls(Arc::new(extra)), None, None)
+        .await
+        .unwrap();
+
+    let registered = CommitBuilder::new(Arc::new(dataset))
+        .execute(registration)
+        .await
+        .unwrap();
+    let ready = registered.cell_flag("summary", "ready").unwrap();
+    assert!(ready.mask_when_false);
+    assert!(registered.schema().field("extra").is_some());
+}
+
+#[tokio::test]
+async fn test_creating_a_dataset_with_cell_flag_changes_is_refused() {
+    let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+    let transaction = TransactionBuilder::new(
+        0,
+        Operation::Overwrite {
+            fragments: vec![],
+            schema: LanceSchema::try_from(&schema).unwrap(),
+            config_upsert_values: None,
+            initial_bases: None,
+        },
+    )
+    .cell_flag_changes(CellFlagChanges {
+        drops: vec![1],
+        ..Default::default()
+    })
+    .build();
+    let error = CommitBuilder::new("memory://")
+        .execute(transaction)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be committed with Overwrite, which creates the dataset"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_flag_update_conflicts_with_concurrent_row_move() {
+    let mut dataset = articles(false).await;
+    let reviewed = dataset
+        .register_cell_flag("title", "reviewed", CellFlagOptions::default())
+        .await
+        .unwrap();
+    // Sets the flag on id 2, fragment 0 offset 1, as addressed at this version.
+    let mut row = RowAddrTreeMap::new();
+    row.insert(1);
+    let staged = TransactionBuilder::new(dataset.manifest.version, update_config())
+        .cell_flag_changes(CellFlagChanges {
+            updates: set_true(reviewed.flag_id, row),
+            ..Default::default()
+        })
+        .build();
+
+    // Moves id 2 into a new fragment.
+    UpdateBuilder::new(Arc::new(dataset.clone()))
+        .update_where("id = 2")
+        .unwrap()
+        .set("body", "'moved'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+
+    let error = CommitBuilder::new(Arc::new(dataset))
+        .execute(staged)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_stale_merge_conflicts_instead_of_being_refused() {
+    let mut dataset = articles(false).await;
+    let flag_id = register_ready(&mut dataset).await;
+    let mut stale = dataset.clone();
+    let groups = stage_all(&dataset, "summary", "s").await;
+    commit_replacement(&dataset, groups, set_true(flag_id, full(&[0, 1])))
+        .await
+        .unwrap();
+
+    // Built from the fragments before the publication, so it would appear to
+    // rewrite summary if checked against the head before the rebase.
+    let extra = ArrowSchema::new(vec![ArrowField::new("extra", DataType::Utf8, true)]);
+    let error = stale
+        .add_columns(NewColumnTransform::AllNulls(Arc::new(extra)), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "{error}"
     );
 }

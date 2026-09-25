@@ -14,7 +14,7 @@ use crate::format::pb;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::{
-    CarriedCellFlags, CellFlagChanges, CellFlagRegistration, CellFlagUpdate, DataOverlayGroup,
+    CellFlagChanges, CellFlagMovedRows, CellFlagRegistration, CellFlagUpdate, DataOverlayGroup,
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, UpdateMap,
     UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
     translate_schema_metadata_updates,
@@ -133,23 +133,22 @@ impl From<&CellFlagChanges> for pb::transaction::CellFlagChanges {
                 .iter()
                 .map(Into::into)
                 .collect(),
-            carried: changes
-                .carried
+            moved_rows: changes
+                .moved_rows
                 .iter()
-                .map(|carried| {
-                    let mut offsets = Vec::with_capacity(carried.offsets.serialized_size());
-                    carried
+                .map(|moved| {
+                    let mut offsets = Vec::with_capacity(moved.offsets.serialized_size());
+                    moved
                         .offsets
                         .serialize_into(&mut offsets)
                         .expect("RoaringBitmap serialization cannot fail");
-                    pb::transaction::cell_flag_changes::Carried {
-                        flag_id: carried.flag_id,
-                        fragment_path: carried.fragment_path.clone(),
+                    pb::transaction::cell_flag_changes::MovedRows {
+                        fragment_path: moved.fragment_path.clone(),
                         offsets,
+                        source_row_addrs: moved.source_row_addrs.clone(),
                     }
                 })
                 .collect(),
-            carried_from_fragments: changes.carried_from_fragments.clone(),
         }
     }
 }
@@ -180,25 +179,24 @@ impl TryFrom<pb::transaction::CellFlagChanges> for CellFlagChanges {
                 .into_iter()
                 .map(CellFlagUpdate::try_from)
                 .collect::<Result<_>>()?,
-            carried: message
-                .carried
+            moved_rows: message
+                .moved_rows
                 .into_iter()
-                .map(|carried| {
-                    let offsets = RoaringBitmap::deserialize_from(carried.offsets.as_slice())
+                .map(|moved| {
+                    let offsets = RoaringBitmap::deserialize_from(moved.offsets.as_slice())
                         .map_err(|error| {
                             Error::invalid_input(format!(
-                                "invalid carried offsets for cell flag {} on fragment {}: {error}",
-                                carried.flag_id, carried.fragment_path
+                                "invalid moved-row offsets for fragment file '{}': {error}",
+                                moved.fragment_path
                             ))
                         })?;
-                    Ok(CarriedCellFlags {
-                        flag_id: carried.flag_id,
-                        fragment_path: carried.fragment_path,
+                    Ok(CellFlagMovedRows {
+                        fragment_path: moved.fragment_path,
                         offsets,
+                        source_row_addrs: moved.source_row_addrs,
                     })
                 })
                 .collect::<Result<_>>()?,
-            carried_from_fragments: message.carried_from_fragments,
         })
     }
 }
@@ -943,6 +941,7 @@ mod tests {
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
     use crate::transaction::TransactionBuilder;
+    use lance_core::utils::address::RowAddress;
 
     #[test]
     fn test_cell_flag_changes_roundtrip() {
@@ -967,12 +966,14 @@ mod tests {
                 value: false,
                 rows,
             }],
-            carried: vec![CarriedCellFlags {
-                flag_id: 5,
+            moved_rows: vec![CellFlagMovedRows {
                 fragment_path: "data/new.lance".to_string(),
                 offsets: RoaringBitmap::from_iter([0_u32, 9]),
+                source_row_addrs: vec![
+                    RowAddress::new_from_parts(3, 0).into(),
+                    RowAddress::new_from_parts(3, 4).into(),
+                ],
             }],
-            carried_from_fragments: vec![3],
         };
         let operation = Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(

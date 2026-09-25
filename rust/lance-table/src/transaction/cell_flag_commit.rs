@@ -1,21 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Commit-time cell flag rules, evaluated against the head manifest.
+//! Commit-time cell flag rules.
 //!
 //! ```text
-//! ensure_operation_allowed_with_cell_flags  refuse what the registry cannot follow
-//! derive_cell_flag_invalidations            which rows a write clears
-//! apply_cell_flag_changes                   the next manifest's registry and state
+//! ensure_operation_allowed_with_cell_flags      refuse what the head's registry cannot follow
+//! ensure_cell_flags_registered_at_read_version  refuse values read before their flag existed
+//! derive_cell_flag_invalidations                which rows a transaction clears
+//! apply_cell_flag_changes                       the next manifest's registry and state
 //! ```
 //!
 //! All of it reads manifests only; nothing here does I/O.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::DataType;
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::{Field, LogicalType, Schema};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
@@ -46,6 +48,20 @@ fn top_level_field(schema: &Schema, field_id: i32) -> Option<&Field> {
     schema.fields.iter().find(|field| field.id == field_id)
 }
 
+/// Ids and logical types of `field` and all its descendants, sorted by id. A
+/// rename leaves it unchanged; dropping, adding or retyping a nested field
+/// does not.
+fn subtree_shape(field: &Field) -> Vec<(i32, &LogicalType)> {
+    let mut shape = Vec::new();
+    let mut stack = vec![field];
+    while let Some(field) = stack.pop() {
+        shape.push((field.id, &field.logical_type));
+        stack.extend(field.children.iter());
+    }
+    shape.sort_unstable_by_key(|(field_id, _)| *field_id);
+    shape
+}
+
 fn field_label(schema: &Schema, field_id: i32) -> String {
     match schema.field_path(field_id) {
         Ok(path) => format!("'{path}' (field id {field_id})"),
@@ -68,6 +84,19 @@ fn fragment_key(fragment_id: u64) -> Result<u32> {
             "fragment id {fragment_id} does not fit the 32 bits a cell flag row address holds"
         ))
     })
+}
+
+/// Whether an `Update` rewrites rows into new fragments, giving them new
+/// addresses, rather than rewriting columns in place.
+fn update_moves_rows(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Update {
+            update_mode,
+            new_fragments,
+            ..
+        } if !matches!(update_mode, Some(UpdateMode::RewriteColumns)) && !new_fragments.is_empty()
+    )
 }
 
 /// Cells an operation writes in place: `field_ids` over the rows `offsets`
@@ -155,18 +184,120 @@ fn physical_rows_of(fragment: &Fragment) -> Result<u32> {
     })
 }
 
-/// The clears implied by `txn`'s writes to the watched fields of the dependent
-/// flags registered at `head`.
+/// Union of the rows each flag is explicitly set true on.
+fn published_rows(updates: &[CellFlagUpdate]) -> HashMap<u32, RowAddrTreeMap> {
+    let mut published: HashMap<u32, RowAddrTreeMap> = HashMap::new();
+    for update in updates.iter().filter(|update| update.value) {
+        *published.entry(update.flag_id).or_default() |= &update.rows;
+    }
+    published
+}
+
+/// The dependent flags of `registry`, each after every dependent flag whose
+/// output it watches, so that clears propagate downstream in one pass.
+fn upstream_first(registry: &CellFlagRegistry) -> Result<Vec<&CellFlagDefinition>> {
+    let mut pending: Vec<&CellFlagDefinition> = registry
+        .definitions()
+        .iter()
+        .filter(|definition| definition.is_dependent())
+        .collect();
+    let mut ordered = Vec::with_capacity(pending.len());
+    let mut placed_outputs = HashSet::new();
+    while !pending.is_empty() {
+        let pending_before = pending.len();
+        pending.retain(|definition| {
+            let is_ready = definition.clear_on_write.iter().all(|source| {
+                placed_outputs.contains(source) || registry.dependent_flag(*source).is_none()
+            });
+            if is_ready {
+                ordered.push(*definition);
+                placed_outputs.insert(definition.field_id);
+            }
+            !is_ready
+        });
+        if pending.len() == pending_before {
+            // Registration refuses cycles, so only a corrupt registry has one.
+            return Err(Error::internal(format!(
+                "the dependencies of cell flags {:?} form a cycle",
+                pending
+                    .iter()
+                    .map(|definition| definition.flag_id)
+                    .collect::<Vec<_>>()
+            )));
+        }
+    }
+    Ok(ordered)
+}
+
+/// The rows of `fragment` that a replacement group writing the watched fields
+/// `written` publishes for `definition` without invalidating it: the rows the
+/// transaction sets the flag true on, narrowed to those where every other
+/// watched field the group writes is the output of a dependent flag published
+/// on the same rows. `None` when no row qualifies, e.g. because the group also
+/// writes a source nothing publishes.
+fn publication_exemption(
+    registry: &CellFlagRegistry,
+    definition: &CellFlagDefinition,
+    written: &BTreeSet<i32>,
+    published: &HashMap<u32, RowAddrTreeMap>,
+    fragment: u32,
+) -> Option<RowAddrSelection> {
+    let mut exempt = published.get(&definition.flag_id)?.get(&fragment)?.clone();
+    for field_id in written.iter().filter(|id| **id != definition.field_id) {
+        let upstream = registry.dependent_flag(*field_id)?;
+        let upstream_rows = published.get(&upstream.flag_id)?.get(&fragment)?;
+        exempt = match (exempt, upstream_rows) {
+            (exempt, RowAddrSelection::Full) => exempt,
+            (RowAddrSelection::Full, partial) => partial.clone(),
+            (RowAddrSelection::Partial(rows), RowAddrSelection::Partial(upstream_rows)) => {
+                RowAddrSelection::Partial(rows & upstream_rows)
+            }
+        };
+    }
+    Some(exempt)
+}
+
+/// `written` without `exempt`, or `None` when nothing remains.
+fn subtract_selection(
+    written: RowAddrSelection,
+    exempt: &RowAddrSelection,
+    fragment_id: u64,
+    head_fragments: &HashMap<u64, &Fragment>,
+) -> Result<Option<RowAddrSelection>> {
+    let remaining = match (written, exempt) {
+        (_, RowAddrSelection::Full) => return Ok(None),
+        (RowAddrSelection::Partial(written), RowAddrSelection::Partial(exempt)) => written - exempt,
+        (RowAddrSelection::Full, RowAddrSelection::Partial(exempt)) => {
+            let fragment = head_fragments.get(&fragment_id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "the transaction writes fragment {fragment_id}, which is not in the dataset"
+                ))
+            })?;
+            all_rows(physical_rows_of(fragment)?) - exempt
+        }
+    };
+    Ok((!remaining.is_empty()).then_some(RowAddrSelection::Partial(remaining)))
+}
+
+/// The clears `txn` implies for the dependent flags registered at `head`.
+///
+/// A dependent flag is cleared where the transaction changes a field it
+/// watches: an in-place write to a source or to its output, a change to
+/// whether a masking flag hides a source (setting an ordinary one, or
+/// registering or dropping any), or a clear of the upstream dependent
+/// flag whose output is one of its sources. The last makes clears propagate
+/// down chains of dependent flags.
 ///
 /// Uses the head registry rather than the read version's, so a flag
 /// registered after the write was staged is still cleared. Never looks at flag
 /// state: a write is recorded even where the flag is already false, which is
 /// what lets a concurrent publisher that read before the write notice it.
 ///
-/// A `DataReplacement` that sets a flag true is its publication, so the rows
-/// it assigns in a group that writes the flag's output are not recorded
-/// against that flag. Its other rows in that fragment are: their output value
-/// was overwritten without being published.
+/// A `DataReplacement` that sets a flag true publishes it, so the rows it
+/// assigns in a group that writes the flag's output are not recorded against
+/// that flag, unless the group also writes a source that is not published on
+/// those rows. The flag's other rows in that fragment are recorded: their
+/// output value was overwritten without being published.
 pub fn derive_cell_flag_invalidations(
     head: &Manifest,
     txn: &Transaction,
@@ -174,12 +305,11 @@ pub fn derive_cell_flag_invalidations(
     let Some(registry) = head.cell_flags.as_deref() else {
         return Ok(Vec::new());
     };
-    let dependent: Vec<&CellFlagDefinition> = registry
+    if !registry
         .definitions()
         .iter()
-        .filter(|definition| definition.is_dependent())
-        .collect();
-    if dependent.is_empty() {
+        .any(CellFlagDefinition::is_dependent)
+    {
         return Ok(Vec::new());
     }
     let fields_modified: Vec<i32> = match &txn.operation {
@@ -196,92 +326,128 @@ pub fn derive_cell_flag_invalidations(
         _ => Vec::new(),
     };
     let writes = written_cells(&txn.operation, &fields_modified);
-    if writes.is_empty() {
+    let changes = txn.cell_flag_changes.as_deref();
+    let updates = changes.map_or(&[][..], |changes| changes.updates.as_slice());
+    // Registering or dropping a masking flag changes what its field reads as
+    // on every row.
+    let remasked: HashSet<i32> = changes
+        .map(|changes| {
+            let registered = changes
+                .registrations
+                .iter()
+                .filter(|registration| registration.mask_when_false)
+                .map(|registration| registration.field_id);
+            let dropped = changes
+                .drops
+                .iter()
+                .filter_map(|flag_id| registry.definition(*flag_id))
+                .filter(|definition| definition.mask_when_false)
+                .map(|definition| definition.field_id);
+            registered.chain(dropped).collect()
+        })
+        .unwrap_or_default();
+    if writes.is_empty() && updates.is_empty() && remasked.is_empty() {
         return Ok(Vec::new());
     }
 
     let ancestors = top_level_ancestors(&head.schema);
-    let top_of = |id: &i32| ancestors.get(id).copied().unwrap_or(*id);
+    let top_of = |id: i32| ancestors.get(&id).copied().unwrap_or(id);
     let head_fragments: HashMap<u64, &Fragment> = head
         .fragments
         .iter()
         .map(|fragment| (fragment.id, fragment))
         .collect();
-    let published = txn
-        .cell_flag_changes
-        .as_deref()
-        .map(published_rows)
-        .unwrap_or_default();
+    let published = published_rows(updates);
+    let mut every_row = RowAddrTreeMap::new();
+    if !remasked.is_empty() {
+        for fragment in head.fragments.iter() {
+            every_row.insert_fragment(fragment_key(fragment.id)?);
+        }
+    }
 
-    let mut invalidations = Vec::new();
-    for definition in dependent {
+    let mut cleared: BTreeMap<u32, RowAddrTreeMap> = BTreeMap::new();
+    // What each processed flag passes downstream: its clears plus the rows the
+    // transaction explicitly sets it false on.
+    let mut stale: HashMap<u32, RowAddrTreeMap> = HashMap::new();
+    for definition in upstream_first(registry)? {
         let watched: HashSet<i32> = definition.watched_field_ids().collect();
         let mut rows = RowAddrTreeMap::new();
         for write in &writes {
-            let writes_watched = write
+            let written: BTreeSet<i32> = write
                 .field_ids
                 .iter()
-                .any(|id| *id >= 0 && watched.contains(&top_of(id)));
-            if !writes_watched {
+                .filter(|id| **id >= 0)
+                .map(|id| top_of(*id))
+                .filter(|id| watched.contains(id))
+                .collect();
+            if written.is_empty() {
                 continue;
             }
             let fragment = fragment_key(write.fragment_id)?;
-            let mut written = match write.offsets {
+            let mut selection = match write.offsets {
                 Some(offsets) => RowAddrSelection::Partial(offsets.clone()),
                 None => RowAddrSelection::Full,
             };
-            let publishes_output = write.is_replacement
-                && write
-                    .field_ids
-                    .iter()
-                    .any(|id| *id >= 0 && top_of(id) == definition.field_id);
-            if publishes_output
-                && let Some(assigned) = published
-                    .get(&definition.flag_id)
-                    .and_then(|assigned| assigned.get(&fragment))
+            if write.is_replacement
+                && written.contains(&definition.field_id)
+                && let Some(exempt) =
+                    publication_exemption(registry, definition, &written, &published, fragment)
             {
-                written = match (assigned, head_fragments.get(&write.fragment_id)) {
-                    (RowAddrSelection::Full, _) => continue,
-                    (RowAddrSelection::Partial(assigned), Some(head_fragment)) => {
-                        match physical_rows_of(head_fragment) {
-                            Ok(count) => RowAddrSelection::Partial(all_rows(count) - assigned),
-                            // Unknown size: record the whole fragment. The state
-                            // is unaffected since updates apply after clears.
-                            Err(_) => RowAddrSelection::Full,
-                        }
-                    }
-                    (RowAddrSelection::Partial(_), None) => RowAddrSelection::Full,
-                };
+                match subtract_selection(selection, &exempt, write.fragment_id, &head_fragments)? {
+                    Some(remaining) => selection = remaining,
+                    None => continue,
+                }
             }
-            let mut written_rows = RowAddrTreeMap::new();
-            insert_selection(&mut written_rows, fragment, written);
-            rows |= written_rows;
+            insert_selection(&mut rows, fragment, selection);
         }
+        for source in &definition.clear_on_write {
+            if let Some(upstream) = registry.dependent_flag(*source)
+                && let Some(upstream_rows) = stale.get(&upstream.flag_id)
+            {
+                rows |= upstream_rows;
+            }
+            if remasked.contains(source) {
+                rows |= &every_row;
+            }
+            // Setting an ordinary masking flag changes what its field reads
+            // as. A dependent one changes only through the writes and clears
+            // handled above.
+            for update in updates.iter().filter(|update| {
+                registry.definition(update.flag_id).is_some_and(|flag| {
+                    flag.field_id == *source && flag.mask_when_false && !flag.is_dependent()
+                })
+            }) {
+                rows |= &update.rows;
+            }
+        }
+        let mut passed_on = rows.clone();
+        for update in updates
+            .iter()
+            .filter(|update| update.flag_id == definition.flag_id && !update.value)
+        {
+            passed_on |= &update.rows;
+        }
+        stale.insert(definition.flag_id, passed_on);
         if !rows.is_empty() {
-            invalidations.push(CellFlagUpdate {
-                flag_id: definition.flag_id,
-                value: false,
-                rows,
-            });
+            cleared.insert(definition.flag_id, rows);
         }
     }
-    Ok(invalidations)
-}
-
-/// Union of the rows each flag is explicitly set true on.
-fn published_rows(changes: &CellFlagChanges) -> HashMap<u32, RowAddrTreeMap> {
-    let mut published: HashMap<u32, RowAddrTreeMap> = HashMap::new();
-    for update in changes.updates.iter().filter(|update| update.value) {
-        *published.entry(update.flag_id).or_default() |= &update.rows;
-    }
-    published
+    Ok(cleared
+        .into_iter()
+        .map(|(flag_id, rows)| CellFlagUpdate {
+            flag_id,
+            value: false,
+            rows,
+        })
+        .collect())
 }
 
 /// Refuse a transaction whose operation or cell flag changes the head's
 /// registry cannot follow.
 ///
-/// Runs on every commit attempt against the head, so it also catches writes
-/// staged before the first flag was registered.
+/// Runs on every commit attempt against the head, after the transaction is
+/// rebased onto it, so it also catches writes staged before the first flag was
+/// registered while leaving staleness to the conflict resolver.
 pub fn ensure_operation_allowed_with_cell_flags(head: &Manifest, txn: &Transaction) -> Result<()> {
     let registry = head
         .cell_flags
@@ -300,6 +466,38 @@ pub fn ensure_operation_allowed_with_cell_flags(head: &Manifest, txn: &Transacti
     Ok(())
 }
 
+/// Refuse a transaction that sets a flag true which was not registered at the
+/// version it read.
+///
+/// Its values were computed from that version, and writes committed between
+/// it and the registration recorded nothing against the flag, so no later
+/// check could see them. This also covers a flag replaced after the read,
+/// since the replacement has a new id.
+pub fn ensure_cell_flags_registered_at_read_version(
+    read_manifest: &Manifest,
+    txn: &Transaction,
+) -> Result<()> {
+    let Some(changes) = txn.cell_flag_changes.as_deref() else {
+        return Ok(());
+    };
+    let registry = read_manifest.cell_flags.as_deref();
+    let Some(update) = changes.updates.iter().find(|update| {
+        update.value
+            && registry.is_none_or(|registry| registry.definition(update.flag_id).is_none())
+    }) else {
+        return Ok(());
+    };
+    Err(Error::incompatible_transaction_source(
+        format!(
+            "cell flag {} is set true, but it was not registered at version {}, which this \
+             transaction read: writes committed between that version and the registration \
+             recorded nothing against the flag, so the values cannot be validated",
+            update.flag_id, read_manifest.version
+        )
+        .into(),
+    ))
+}
+
 fn ensure_changes_allowed(
     head: &Manifest,
     operation: &Operation,
@@ -314,11 +512,10 @@ fn ensure_changes_allowed(
              operation, not {name}"
         )));
     }
-    if (!changes.carried.is_empty() || !changes.carried_from_fragments.is_empty())
-        && !matches!(operation, Operation::Update { .. })
-    {
+    if !changes.moved_rows.is_empty() && !update_moves_rows(operation) {
         return Err(Error::not_supported(format!(
-            "carried cell flag state can only be committed with an Update operation, not {name}"
+            "moved cell flag rows can only be committed with an Update that moves rows into \
+             new fragments, not {name}"
         )));
     }
     if !changes.updates.is_empty()
@@ -361,6 +558,60 @@ fn refuse(
         operation.name(),
         flag_label(&head.schema, definition)
     ))
+}
+
+/// A `Merge` or `Project` replaces the schema. Refuse one that drops a flagged
+/// field, changes its nested fields, or makes a masked output non-nullable.
+fn ensure_flagged_fields_kept(
+    head: &Manifest,
+    registry: &CellFlagRegistry,
+    operation: &Operation,
+    schema: &Schema,
+) -> Result<()> {
+    let flagged: BTreeSet<i32> = registry.referenced_field_ids().collect();
+    for field_id in flagged {
+        let definition = registry
+            .definitions()
+            .iter()
+            .find(|definition| {
+                definition.field_id == field_id || definition.clear_on_write.contains(&field_id)
+            })
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "no cell flag refers to flagged field id {field_id}"
+                ))
+            })?;
+        let label = field_label(&head.schema, field_id);
+        let Some(field) = top_level_field(schema, field_id) else {
+            return Err(refuse(
+                head,
+                operation,
+                definition,
+                &format!("it drops {label} or changes its id; drop the flag first"),
+            ));
+        };
+        if top_level_field(&head.schema, field_id)
+            .is_some_and(|head_field| subtree_shape(head_field) != subtree_shape(field))
+        {
+            return Err(refuse(
+                head,
+                operation,
+                definition,
+                &format!("it changes the nested fields of {label}"),
+            ));
+        }
+        if !field.nullable && registry.masking_flag(field_id).is_some() {
+            return Err(refuse(
+                head,
+                operation,
+                definition,
+                &format!(
+                    "masked cells read as NULL, so the masked output {label} must stay nullable"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_operation_allowed(
@@ -430,35 +681,9 @@ fn ensure_operation_allowed(
         Operation::Merge {
             fragments, schema, ..
         } => {
-            for field_id in &flagged {
-                match top_level_field(schema, *field_id) {
-                    None => {
-                        return Err(refuse(
-                            head,
-                            operation,
-                            flag_on_field(*field_id),
-                            &format!(
-                                "the merge removes {} or changes its id",
-                                field_label(&head.schema, *field_id)
-                            ),
-                        ));
-                    }
-                    Some(field)
-                        if !field.nullable && registry.masking_flag(*field_id).is_some() =>
-                    {
-                        return Err(refuse(
-                            head,
-                            operation,
-                            flag_on_field(*field_id),
-                            &format!(
-                                "the merge makes the masked output {} non-nullable",
-                                field_label(&head.schema, *field_id)
-                            ),
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
+            // With the flagged subtrees unchanged, every leaf under them is in
+            // the head schema, so the head's ancestry maps the merge's files.
+            ensure_flagged_fields_kept(head, registry, operation, schema)?;
             let head_fragments: HashMap<u64, &Fragment> = head
                 .fragments
                 .iter()
@@ -493,37 +718,7 @@ fn ensure_operation_allowed(
             Ok(())
         }
         Operation::Project { schema, .. } => {
-            for field_id in &flagged {
-                match top_level_field(schema, *field_id) {
-                    None => {
-                        return Err(refuse(
-                            head,
-                            operation,
-                            flag_on_field(*field_id),
-                            &format!(
-                                "the projection drops {}; drop the flag first",
-                                field_label(&head.schema, *field_id)
-                            ),
-                        ));
-                    }
-                    Some(field)
-                        if !field.nullable && registry.masking_flag(*field_id).is_some() =>
-                    {
-                        return Err(refuse(
-                            head,
-                            operation,
-                            flag_on_field(*field_id),
-                            &format!(
-                                "masked cells read as NULL, so the masked output {} must stay \
-                                 nullable",
-                                field_label(&head.schema, *field_id)
-                            ),
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
-            Ok(())
+            ensure_flagged_fields_kept(head, registry, operation, schema)
         }
         Operation::CreateIndex { new_indices, .. } => {
             for index in new_indices {
@@ -548,25 +743,29 @@ fn ensure_operation_allowed(
         Operation::Update {
             removed_fragment_ids,
             updated_fragments,
-            new_fragments,
-            update_mode,
             ..
-        } => {
-            let moves_rows = !matches!(update_mode, Some(UpdateMode::RewriteColumns))
-                && !new_fragments.is_empty();
-            if !moves_rows {
-                return Ok(());
-            }
-            let carried_from: HashSet<u64> = txn
+        } if update_moves_rows(operation) => {
+            let moved_from: HashSet<u64> = txn
                 .cell_flag_changes
                 .as_deref()
-                .map(|changes| changes.carried_from_fragments.iter().copied().collect())
+                .map(|changes| {
+                    changes
+                        .moved_rows
+                        .iter()
+                        .flat_map(|moved| {
+                            moved
+                                .source_row_addrs
+                                .iter()
+                                .map(|addr| u64::from(RowAddress::from(*addr).fragment_id()))
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             let sources = removed_fragment_ids
                 .iter()
                 .copied()
                 .chain(updated_fragments.iter().map(|fragment| fragment.id))
-                .filter(|fragment_id| !carried_from.contains(fragment_id));
+                .filter(|fragment_id| !moved_from.contains(fragment_id));
             for fragment_id in sources {
                 let Ok(fragment) = fragment_key(fragment_id) else {
                     continue;
@@ -581,7 +780,7 @@ fn ensure_operation_allowed(
                         definition,
                         &format!(
                             "the update moves rows out of fragment {fragment_id}, where the flag \
-                             is true, without carrying the flag's state"
+                             is true, without moving the flag's state"
                         ),
                     ));
                 }
@@ -894,6 +1093,113 @@ fn state_mut(registry: &mut CellFlagRegistry, flag_id: u32) -> &mut RowAddrTreeM
     Arc::make_mut(registry.states_mut().entry(flag_id).or_default())
 }
 
+/// Copy the head's state of every ordinary flag from each moved row's source
+/// address to its new one, returning the flags that changed. Dependent flags
+/// are not copied, so moved rows start unassigned for them.
+fn apply_moved_rows(
+    registry: &mut CellFlagRegistry,
+    changes: &CellFlagChanges,
+    operation: &Operation,
+    head: &Manifest,
+    fragment_list: &[Fragment],
+) -> Result<BTreeSet<u32>> {
+    let Operation::Update {
+        removed_fragment_ids,
+        updated_fragments,
+        ..
+    } = operation
+    else {
+        return Err(Error::internal(format!(
+            "moved cell flag rows reached the manifest build of a {} operation",
+            operation.name()
+        )));
+    };
+    let rewritten: HashSet<u64> = removed_fragment_ids
+        .iter()
+        .copied()
+        .chain(updated_fragments.iter().map(|fragment| fragment.id))
+        .collect();
+    let head_fragment_ids: HashSet<u64> =
+        head.fragments.iter().map(|fragment| fragment.id).collect();
+    let new_fragments: HashMap<&str, &Fragment> = fragment_list
+        .iter()
+        .filter(|fragment| !head_fragment_ids.contains(&fragment.id))
+        .filter_map(|fragment| {
+            fragment
+                .files
+                .first()
+                .map(|file| (file.path.as_str(), fragment))
+        })
+        .collect();
+    let ordinary: Vec<u32> = registry
+        .definitions()
+        .iter()
+        .filter(|definition| !definition.is_dependent())
+        .map(|definition| definition.flag_id)
+        .collect();
+    let head_states = head.cell_flags.as_deref().map(CellFlagRegistry::states);
+
+    let mut touched = BTreeSet::new();
+    for moved in &changes.moved_rows {
+        let path = &moved.fragment_path;
+        let fragment = new_fragments.get(path.as_str()).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "moved cell flag rows name fragment file '{path}', which is not the first data \
+                 file of a fragment this transaction adds"
+            ))
+        })?;
+        if moved.offsets.len() != moved.source_row_addrs.len() as u64 {
+            return Err(Error::invalid_input(format!(
+                "moved cell flag rows for fragment file '{path}' list {} offsets but {} source \
+                 row addresses",
+                moved.offsets.len(),
+                moved.source_row_addrs.len()
+            )));
+        }
+        let fragment_id = fragment_key(fragment.id)?;
+        let physical_rows = physical_rows_of(fragment)?;
+        if let Some(max) = moved.offsets.max()
+            && max >= physical_rows
+        {
+            return Err(Error::invalid_input(format!(
+                "moved cell flag rows name offset {max} of fragment file '{path}', which has \
+                 {physical_rows} physical rows"
+            )));
+        }
+        if let Some(source) = moved
+            .source_row_addrs
+            .iter()
+            .map(|addr| u64::from(RowAddress::from(*addr).fragment_id()))
+            .find(|source| !rewritten.contains(source))
+        {
+            return Err(Error::invalid_input(format!(
+                "moved cell flag rows for fragment file '{path}' come from fragment {source}, \
+                 which the update does not rewrite"
+            )));
+        }
+        for flag_id in &ordinary {
+            let Some(state) = head_states.and_then(|states| states.get(flag_id)) else {
+                continue;
+            };
+            let carried: RoaringBitmap = moved
+                .offsets
+                .iter()
+                .zip(&moved.source_row_addrs)
+                .filter(|(_, source)| state.contains(**source))
+                .map(|(offset, _)| offset)
+                .collect();
+            if carried.is_empty() {
+                continue;
+            }
+            let mut rows = RowAddrTreeMap::new();
+            rows.insert_bitmap(fragment_id, carried);
+            *state_mut(registry, *flag_id) |= &rows;
+            touched.insert(*flag_id);
+        }
+    }
+    Ok(touched)
+}
+
 impl Transaction {
     /// Apply this transaction's cell flag changes to `manifest`, the manifest
     /// it is building, in the order [`CellFlagChanges`] documents.
@@ -967,11 +1273,13 @@ impl Transaction {
         }
 
         if let Some(changes) = changes {
+            let mut invalidated: HashMap<u32, RowAddrTreeMap> = HashMap::new();
             for invalidation in &changes.derived_invalidations {
                 // A flag dropped in this transaction has nothing left to clear.
                 if registry.definition(invalidation.flag_id).is_none() {
                     continue;
                 }
+                *invalidated.entry(invalidation.flag_id).or_default() |= &invalidation.rows;
                 let Some(state) = registry.states().get(&invalidation.flag_id) else {
                     continue;
                 };
@@ -994,6 +1302,23 @@ impl Transaction {
                             &self.operation,
                         )?;
                     }
+                    // Updates apply after the clears, so without this the
+                    // publication would hide the change that invalidates it.
+                    if let Some(invalidated) = invalidated.get(&update.flag_id) {
+                        let overlap = update.rows.clone() & invalidated;
+                        if !overlap.is_empty() {
+                            return Err(Error::invalid_input(format!(
+                                "{} is set true on rows of fragments {:?} that this transaction \
+                                 also invalidates for it: it writes a field the flag watches \
+                                 there without publishing it, or clears a flag upstream of it",
+                                flag_label(&manifest.schema, definition),
+                                overlap
+                                    .iter()
+                                    .map(|(fragment, _)| *fragment)
+                                    .collect::<Vec<_>>()
+                            )));
+                        }
+                    }
                     *state_mut(&mut registry, update.flag_id) |= &update.rows;
                 } else if let Some(state) = registry.states().get(&update.flag_id) {
                     let kept = clear_rows(state, &update.rows, &fragments)?;
@@ -1002,39 +1327,14 @@ impl Transaction {
                 touched.insert(update.flag_id);
             }
 
-            if !changes.carried.is_empty() {
-                let head_fragment_ids: HashSet<u64> =
-                    head.fragments.iter().map(|fragment| fragment.id).collect();
-                let new_fragments: HashMap<&str, &Fragment> = fragment_list
-                    .iter()
-                    .filter(|fragment| !head_fragment_ids.contains(&fragment.id))
-                    .filter_map(|fragment| {
-                        fragment
-                            .files
-                            .first()
-                            .map(|file| (file.path.as_str(), fragment))
-                    })
-                    .collect();
-                for carried in &changes.carried {
-                    if registry.definition(carried.flag_id).is_none() {
-                        continue;
-                    }
-                    let fragment = new_fragments
-                        .get(carried.fragment_path.as_str())
-                        .ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "carried state of cell flag {} names fragment file '{}', which \
-                                 is not the first data file of a fragment this transaction adds",
-                                carried.flag_id, carried.fragment_path
-                            ))
-                        })?;
-                    let fragment_id = fragment_key(fragment.id)?;
-                    let mut rows = RowAddrTreeMap::new();
-                    rows.insert_bitmap(fragment_id, carried.offsets.clone());
-                    validate_rows(&rows, true, carried.flag_id, &fragments)?;
-                    *state_mut(&mut registry, carried.flag_id) |= &rows;
-                    touched.insert(carried.flag_id);
-                }
+            if !changes.moved_rows.is_empty() {
+                touched.extend(apply_moved_rows(
+                    &mut registry,
+                    changes,
+                    &self.operation,
+                    head,
+                    &fragment_list,
+                )?);
             }
         }
 
@@ -1062,7 +1362,7 @@ mod tests {
     use crate::format::{DataFile, DataStorageFormat};
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{
-        CarriedCellFlags, DataOverlayGroup, RewriteGroup, TransactionBuilder,
+        CellFlagMovedRows, DataOverlayGroup, RewriteGroup, TransactionBuilder,
     };
     use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
     use rstest::rstest;
@@ -1500,6 +1800,233 @@ mod tests {
         );
     }
 
+    /// `title.fresh` watches summary, the output of `summary.ready`, which
+    /// watches body; `body.hidden` is an ordinary masking flag. `fresh` is
+    /// registered first, so its id sorts before its upstream's.
+    fn chained_manifest() -> Manifest {
+        commit(
+            &manifest(),
+            &register_txn(
+                1,
+                vec![
+                    registration_of(TITLE, "fresh", &[SUMMARY], false),
+                    registration_of(SUMMARY, "ready", &[BODY], true),
+                    registration_of(BODY, "hidden", &[], true),
+                ],
+            ),
+        )
+        .unwrap()
+    }
+
+    const FRESH: u32 = 1;
+    const READY: u32 = 2;
+    const HIDDEN: u32 = 3;
+
+    #[test]
+    fn derive_propagates_clears_down_dependency_chains() {
+        let head = chained_manifest();
+        let write = Transaction::new(
+            2,
+            rewrite_columns(
+                vec![BODY as u32],
+                Some(StdHashMap::from([(
+                    0,
+                    RoaringBitmap::from_iter([2_u32, 5]),
+                )])),
+            ),
+            None,
+        );
+        let written = rows(&[(0, Some(&[2, 5]))]);
+        assert_eq!(
+            derive_cell_flag_invalidations(&head, &write).unwrap(),
+            vec![
+                CellFlagUpdate {
+                    flag_id: FRESH,
+                    value: false,
+                    rows: written.clone(),
+                },
+                CellFlagUpdate {
+                    flag_id: READY,
+                    value: false,
+                    rows: written,
+                },
+            ]
+        );
+
+        // An explicit clear of ready reaches fresh, and unmasking body is a
+        // change to what ready's source reads as.
+        let explicit = TransactionBuilder::new(2, update_config())
+            .cell_flag_changes(CellFlagChanges {
+                updates: vec![
+                    CellFlagUpdate {
+                        flag_id: READY,
+                        value: false,
+                        rows: rows(&[(1, Some(&[3]))]),
+                    },
+                    CellFlagUpdate {
+                        flag_id: HIDDEN,
+                        value: true,
+                        rows: rows(&[(1, Some(&[4]))]),
+                    },
+                ],
+                ..Default::default()
+            })
+            .build();
+        assert_eq!(
+            derive_cell_flag_invalidations(&head, &explicit).unwrap(),
+            vec![
+                CellFlagUpdate {
+                    flag_id: FRESH,
+                    value: false,
+                    rows: rows(&[(1, Some(&[3, 4]))]),
+                },
+                CellFlagUpdate {
+                    flag_id: READY,
+                    value: false,
+                    rows: rows(&[(1, Some(&[4]))]),
+                },
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case::drop_mask_on_source(
+        CellFlagChanges { drops: vec![HIDDEN], ..Default::default() },
+        vec![FRESH, READY]
+    )]
+    #[case::replace_masking_upstream(
+        CellFlagChanges {
+            drops: vec![READY],
+            registrations: vec![registration_of(SUMMARY, "ready", &[BODY], true)],
+            ..Default::default()
+        },
+        vec![FRESH]
+    )]
+    #[case::register_unmasked(
+        CellFlagChanges { registrations: vec![registration_of(BODY, "seen", &[], false)], ..Default::default() },
+        vec![]
+    )]
+    fn derive_clears_watchers_of_remasked_sources(
+        #[case] changes: CellFlagChanges,
+        #[case] cleared: Vec<u32>,
+    ) {
+        let head = chained_manifest();
+        let txn = TransactionBuilder::new(2, update_config())
+            .cell_flag_changes(changes)
+            .build();
+        let expected: Vec<CellFlagUpdate> = cleared
+            .into_iter()
+            .map(|flag_id| CellFlagUpdate {
+                flag_id,
+                value: false,
+                rows: rows(&[(0, None), (1, None)]),
+            })
+            .collect();
+        assert_eq!(
+            derive_cell_flag_invalidations(&head, &txn).unwrap(),
+            expected
+        );
+        commit(&head, &txn).unwrap();
+    }
+
+    #[rstest]
+    #[case::chained_outputs(
+        vec![SUMMARY, TITLE],
+        Some(rows(&[(0, None)])),
+        Some(rows(&[(0, None)])),
+        None
+    )]
+    #[case::chained_partial(
+        vec![SUMMARY, TITLE],
+        Some(rows(&[(0, Some(&[0, 1, 2, 3, 4]))])),
+        Some(rows(&[(0, Some(&[0, 1, 2]))])),
+        None
+    )]
+    #[case::downstream_beyond_upstream(
+        vec![SUMMARY, TITLE],
+        Some(rows(&[(0, Some(&[0, 1, 2, 3, 4]))])),
+        Some(rows(&[(0, Some(&[0, 5]))])),
+        Some("'fresh'")
+    )]
+    #[case::upstream_unpublished(vec![SUMMARY, TITLE], None, Some(rows(&[(0, None)])), Some("'fresh'"))]
+    #[case::writes_own_source(vec![BODY, SUMMARY], Some(rows(&[(0, None)])), None, Some("'ready'"))]
+    fn publication_exempts_only_published_inputs(
+        #[case] fields: Vec<i32>,
+        #[case] ready_rows: Option<RowAddrTreeMap>,
+        #[case] fresh_rows: Option<RowAddrTreeMap>,
+        #[case] refused_flag: Option<&str>,
+    ) {
+        let head = chained_manifest();
+        let updates = [(FRESH, &fresh_rows), (READY, &ready_rows)]
+            .into_iter()
+            .filter_map(|(flag_id, rows)| {
+                rows.clone().map(|rows| CellFlagUpdate {
+                    flag_id,
+                    value: true,
+                    rows,
+                })
+            })
+            .collect();
+        let txn = TransactionBuilder::new(2, replacement(0, column_file("f", fields)))
+            .cell_flag_changes(CellFlagChanges {
+                updates,
+                ..Default::default()
+            })
+            .build();
+        match refused_flag {
+            Some(flag) => {
+                let error = commit(&head, &txn).unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+                assert!(
+                    error.to_string().contains("also invalidates for it"),
+                    "{error}"
+                );
+                assert!(error.to_string().contains(flag), "{error}");
+            }
+            None => {
+                let next = commit(&head, &txn).unwrap();
+                for (flag_id, expected) in [(FRESH, fresh_rows), (READY, ready_rows)] {
+                    let state = registry_of(&next)
+                        .states()
+                        .get(&flag_id)
+                        .map(|state| state.as_ref().clone());
+                    assert_eq!(state, expected, "flag {flag_id}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn publication_needs_the_flag_registered_at_the_read_version() {
+        let set = |value| {
+            TransactionBuilder::new(1, update_config())
+                .cell_flag_changes(CellFlagChanges {
+                    updates: vec![CellFlagUpdate {
+                        flag_id: 2,
+                        value,
+                        rows: rows(&[(0, None)]),
+                    }],
+                    ..Default::default()
+                })
+                .build()
+        };
+        let before_registration = manifest();
+        let error = ensure_cell_flags_registered_at_read_version(&before_registration, &set(true))
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::IncompatibleTransaction { .. }),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("cell flag 2 is set true, but it was not registered at version 1"),
+            "{error}"
+        );
+        ensure_cell_flags_registered_at_read_version(&before_registration, &set(false)).unwrap();
+        ensure_cell_flags_registered_at_read_version(&flagged_manifest(), &set(true)).unwrap();
+    }
+
     #[test]
     fn apply_normalizes_full_fragments_and_drops_empty_state() {
         let head = commit(
@@ -1577,18 +2104,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn apply_carries_state_onto_new_fragments() {
-        let head = flagged_manifest();
-        // Id 0 is the placeholder the commit replaces with a fresh id.
+    fn row_address(fragment_id: u32, offset: u32) -> u64 {
+        RowAddress::new_from_parts(fragment_id, offset).into()
+    }
+
+    /// Moves rows of fragment 0 into a new three-row fragment `moved.lance`.
+    fn moving_update(moved_rows: Vec<CellFlagMovedRows>) -> Transaction {
         let mut moved = fragment(0);
         moved.files[0].path = "moved.lance".to_string();
         moved.physical_rows = Some(3);
-        let update = TransactionBuilder::new(
+        TransactionBuilder::new(
             3,
             Operation::Update {
-                removed_fragment_ids: vec![0],
-                updated_fragments: vec![],
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![fragment(0)],
                 new_fragments: vec![moved],
                 fields_modified: vec![],
                 compacted_sstables: vec![],
@@ -1599,26 +2128,72 @@ mod tests {
             },
         )
         .cell_flag_changes(CellFlagChanges {
-            carried: vec![CarriedCellFlags {
-                flag_id: 2,
-                fragment_path: "moved.lance".to_string(),
-                offsets: RoaringBitmap::from_iter([0_u32, 2]),
-            }],
-            carried_from_fragments: vec![0],
+            moved_rows,
             ..Default::default()
         })
-        .build();
+        .build()
+    }
+
+    fn moved_rows(path: &str, offsets: &[u32], sources: &[u64]) -> CellFlagMovedRows {
+        CellFlagMovedRows {
+            fragment_path: path.to_string(),
+            offsets: RoaringBitmap::from_iter(offsets.iter().copied()),
+            source_row_addrs: sources.to_vec(),
+        }
+    }
+
+    #[test]
+    fn apply_moves_ordinary_state_from_the_head() {
+        // A clear committed after the update was staged: the move must not
+        // bring the old value back.
+        let head = flagged_manifest();
+        let clear = TransactionBuilder::new(3, update_config())
+            .cell_flag_changes(CellFlagChanges {
+                updates: vec![CellFlagUpdate {
+                    flag_id: 2,
+                    value: false,
+                    rows: rows(&[(0, Some(&[1]))]),
+                }],
+                ..Default::default()
+            })
+            .build();
+        let head = commit(&head, &clear).unwrap();
+
+        let update = moving_update(vec![moved_rows(
+            "moved.lance",
+            &[0, 1, 2],
+            &[row_address(0, 0), row_address(0, 1), row_address(0, 5)],
+        )]);
         let next = commit(&head, &update).unwrap();
         // The new fragment takes the next id after the high-water mark.
+        let everything_but_one: Vec<u32> = (0..ROWS as u32).filter(|offset| *offset != 1).collect();
         assert_eq!(
             registry_of(&next).states().get(&2).unwrap().as_ref(),
-            &rows(&[(1, None), (2, Some(&[0, 2]))])
+            &rows(&[
+                (0, Some(&everything_but_one)),
+                (1, None),
+                (2, Some(&[0, 2]))
+            ])
         );
-        // Dependent flags are not carried: moved rows start unassigned.
+        // Dependent flags are not moved: moved rows start unassigned.
         assert_eq!(
             registry_of(&next).states().get(&1).unwrap().as_ref(),
-            &rows(&[(1, None)])
+            &rows(&[(0, None), (1, None)])
         );
+    }
+
+    #[rstest]
+    #[case::unknown_file(moved_rows("other.lance", &[0], &[0]), "not the first data file")]
+    #[case::count_mismatch(moved_rows("moved.lance", &[0, 1], &[0]), "list 2 offsets but 1 source")]
+    #[case::offset_out_of_range(moved_rows("moved.lance", &[3], &[0]), "offset 3 of fragment file")]
+    #[case::source_not_rewritten(
+        moved_rows("moved.lance", &[0, 1], &[row_address(0, 0), row_address(1, 0)]),
+        "come from fragment 1, which the update does not rewrite"
+    )]
+    fn apply_rejects_invalid_moved_rows(#[case] moved: CellFlagMovedRows, #[case] expected: &str) {
+        let error = commit(&flagged_manifest(), &moving_update(vec![moved])).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(expected), "{error}");
     }
 
     #[rstest]
@@ -1874,16 +2449,75 @@ mod tests {
         ensure_operation_allowed_with_cell_flags(&manifest(), &txn).unwrap();
     }
 
+    fn project_without_lang() -> Operation {
+        let mut schema = schema();
+        schema.mut_field_by_id(META).unwrap().children.clear();
+        Operation::Project {
+            schema,
+            preserves_nullability: true,
+        }
+    }
+
+    fn merge_extending_meta() -> Operation {
+        let mut schema = schema();
+        let mut script = schema.field("meta.lang").unwrap().clone();
+        script.name = "script".to_string();
+        script.id = 20;
+        schema.mut_field_by_id(META).unwrap().children.push(script);
+        let mut extended = fragment(0);
+        extended.files.push(column_file("script.lance", vec![20]));
+        Operation::Merge {
+            fragments: vec![extended, fragment(1)],
+            schema,
+            preserves_nullability: true,
+        }
+    }
+
+    #[rstest]
+    #[case::project_drops_nested_source(project_without_lang())]
+    #[case::merge_adds_nested_source(merge_extending_meta())]
+    fn nested_changes_to_a_watched_struct_are_refused(#[case] operation: Operation) {
+        let head = commit(
+            &manifest(),
+            &register_txn(1, vec![registration_of(SUMMARY, "ready", &[META], false)]),
+        )
+        .unwrap();
+        let error =
+            ensure_operation_allowed_with_cell_flags(&head, &Transaction::new(2, operation, None))
+                .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("it changes the nested fields of 'meta' (field id 4)"),
+            "{error}"
+        );
+    }
+
     #[test]
-    fn row_moving_update_is_allowed_when_state_is_carried_or_dependent() {
+    fn row_moving_update_is_allowed_when_state_moves_or_is_dependent() {
         let head = flagged_manifest();
-        let carried = TransactionBuilder::new(3, row_moving_update(0))
+        let moving = TransactionBuilder::new(3, row_moving_update(0))
             .cell_flag_changes(CellFlagChanges {
-                carried_from_fragments: vec![0],
+                moved_rows: vec![moved_rows("base-0.lance", &[0], &[row_address(0, 4)])],
                 ..Default::default()
             })
             .build();
-        ensure_operation_allowed_with_cell_flags(&head, &carried).unwrap();
+        ensure_operation_allowed_with_cell_flags(&head, &moving).unwrap();
+
+        // Rows moved out of another fragment do not cover fragment 0.
+        let elsewhere = TransactionBuilder::new(3, row_moving_update(0))
+            .cell_flag_changes(CellFlagChanges {
+                moved_rows: vec![moved_rows("base-0.lance", &[0], &[row_address(1, 4)])],
+                ..Default::default()
+            })
+            .build();
+        let error = ensure_operation_allowed_with_cell_flags(&head, &elsewhere).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error.to_string().contains("moves rows out of fragment 0"),
+            "{error}"
+        );
 
         // Only the dependent flag is true: moving rows just unassigns it.
         let clear_reviewed = TransactionBuilder::new(3, update_config())
@@ -1912,10 +2546,15 @@ mod tests {
         CellFlagChanges { drops: vec![1], ..Default::default() },
         "not Update"
     )]
-    #[case::carried_on_replacement(
+    #[case::moved_rows_on_replacement(
         replacement(0, summary_file("s")),
-        CellFlagChanges { carried_from_fragments: vec![0], ..Default::default() },
-        "only be committed with an Update operation"
+        CellFlagChanges { moved_rows: vec![moved_rows("m.lance", &[0], &[0])], ..Default::default() },
+        "only be committed with an Update that moves rows"
+    )]
+    #[case::moved_rows_on_in_place_update(
+        rewrite_columns(vec![BODY as u32], None),
+        CellFlagChanges { moved_rows: vec![moved_rows("m.lance", &[0], &[0])], ..Default::default() },
+        "only be committed with an Update that moves rows"
     )]
     #[case::updates_on_append(
         Operation::Append { fragments: vec![] },

@@ -10,11 +10,18 @@
 //!
 //! A flag registered with `clear_on_write` sources is *dependent*: any write to
 //! a source, or to the flag's own field, clears the flag for the written rows
-//! in the same commit. Such a flag becomes true only through a
-//! `DataReplacement` that writes its field and carries a
-//! [`CellFlagUpdate`](crate::dataset::transaction::CellFlagUpdate) setting it,
-//! committed through [`CommitBuilder`]. A flag without sources is *ordinary*:
-//! only explicit updates change it.
+//! in the same commit. When a source is itself the output of a dependent flag,
+//! clearing that flag clears this one on the same rows, so clears follow
+//! chains of computed fields. Changing which cells of a source read as NULL,
+//! by registering or dropping a masking flag on it or by setting an ordinary
+//! masking flag, clears the flag on the affected rows as well. A dependent
+//! flag becomes true only through a `DataReplacement` that writes its field
+//! and carries a [`CellFlagUpdate`](crate::dataset::transaction::CellFlagUpdate)
+//! setting it, committed through [`CommitBuilder`] with the version the
+//! values were computed from as its read version; the flag must already be
+//! registered there. A flag without sources is *ordinary*: only explicit
+//! updates change it, and a row-moving update keeps its state only for the
+//! rows it lists in `moved_rows`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
