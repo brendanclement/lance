@@ -38,6 +38,7 @@ pub struct CellFlagRegistration {
     pub name: String,
     /// Ids of top-level source fields. Non-empty makes the flag dependent.
     pub clear_on_write: Vec<i32>,
+    /// Mask the output field where the flag is false. Needs `clear_on_write`.
     pub mask_when_false: bool,
 }
 

@@ -276,7 +276,9 @@ message CellFlagDefinition {
    * clear of the dependent flag whose output is one of these fields.
    */
   repeated int32 clear_on_write = 4;
-  // Reads return NULL for the output field wherever the flag is false.
+  /* Reads return NULL for the output field wherever the flag is false. Only a
+   * dependent flag (non-empty clear_on_write) may mask.
+   */
   bool mask_when_false = 5;
 }
 

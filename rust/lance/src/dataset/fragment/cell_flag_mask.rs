@@ -9,7 +9,8 @@
 //! a value. Internal writers that re-read rows through it (`UpdateJob`,
 //! `merge_insert` rewriting unmatched rows, `add_columns`, copy-through with
 //! `read_physical_slice`) therefore write masked cells back as NULL. That is
-//! intended: a false flag means the cell has no value.
+//! safe because only dependent flags mask: a false flag means the cell has no
+//! value, and only a publication, which writes new values, sets it true.
 
 use std::sync::Arc;
 

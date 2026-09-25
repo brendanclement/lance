@@ -39,7 +39,8 @@ pub struct CellFlagDefinition {
     /// output field itself, clears the flag for the written rows, and so does
     /// a clear of the dependent flag whose output is one of the sources.
     pub clear_on_write: Vec<i32>,
-    /// Reads return NULL for the output field wherever the flag is false.
+    /// Reads return NULL for the output field wherever the flag is false. Only
+    /// a dependent flag may mask.
     pub mask_when_false: bool,
 }
 
@@ -216,6 +217,13 @@ impl TryFrom<pb::CellFlagDefinition> for CellFlagDefinition {
             return Err(Error::invalid_input(format!(
                 "cell flag {} on field id {} has an empty name",
                 message.flag_id, message.field_id
+            )));
+        }
+        if message.mask_when_false && message.clear_on_write.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "cell flag '{}' (flag id {}) on field id {} masks its field but has no \
+                 clear_on_write sources; only dependent flags may mask",
+                message.name, message.flag_id, message.field_id
             )));
         }
         Ok(Self::new(
@@ -401,13 +409,20 @@ mod tests {
         orphan_state.states[0].flag_id = 9;
         let mut unsorted = valid.clone();
         unsorted.definitions.reverse();
-        let mut unnamed = valid;
+        let mut unnamed = valid.clone();
         unnamed.definitions[0].name.clear();
+        let mut ordinary_mask = valid;
+        ordinary_mask.definitions[1].mask_when_false = true;
         for (message, expected) in [
             (stale_allocator, "must exceed every registered id"),
             (orphan_state, "which is not registered"),
             (unsorted, "strictly increasing ids"),
             (unnamed, "has an empty name"),
+            (
+                ordinary_mask,
+                "cell flag 'reviewed' (flag id 2) on field id 1 masks its field but has no \
+                 clear_on_write sources",
+            ),
         ] {
             let error = CellFlagRegistry::try_from(message).unwrap_err();
             assert!(matches!(error, Error::InvalidInput { .. }), "{error}");

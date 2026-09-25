@@ -299,9 +299,8 @@ fn subtract_selection(
 /// The clears `txn` implies for the dependent flags registered at `head`.
 ///
 /// A dependent flag is cleared where the transaction changes a field it
-/// watches: an in-place write to a source or to its output, a change to
-/// whether a masking flag hides a source (setting an ordinary one, or
-/// registering or dropping any), or a clear of the upstream dependent
+/// watches: an in-place write to a source or to its output, registering or
+/// dropping a masking flag on a source, or a clear of the upstream dependent
 /// flag whose output is one of its sources. The last makes clears propagate
 /// down chains of dependent flags.
 ///
@@ -456,16 +455,6 @@ pub fn derive_cell_flag_invalidations(
             }
             if remasked.contains(source) {
                 rows |= &every_row;
-            }
-            // Setting an ordinary masking flag changes what its field reads
-            // as. A dependent one changes only through the writes and clears
-            // handled above.
-            for update in updates.iter().filter(|update| {
-                registry.definition(update.flag_id).is_some_and(|flag| {
-                    flag.field_id == *source && flag.mask_when_false && !flag.is_dependent()
-                })
-            }) {
-                rows |= &update.rows;
             }
         }
         let mut passed_on = rows.clone();
@@ -1037,13 +1026,16 @@ fn validate_registration(
         }
     }
     if registration.mask_when_false {
-        if let Some(existing) = registry.masking_flag(field_id) {
-            return Err(Error::invalid_input(format!(
-                "cannot register masking cell flag '{name}': {} is already masked by '{}' \
-                 (flag id {})",
-                field_label(schema, field_id),
-                existing.name,
-                existing.flag_id
+        // A masking flag is dependent, and a field has at most one dependent
+        // flag, so it also has at most one masking flag.
+        if registration.clear_on_write.is_empty() {
+            return Err(Error::not_supported(format!(
+                "cannot register masking cell flag '{name}' on {} without clear_on_write \
+                 sources: row-moving writes and in-place re-reads read through the masked scan \
+                 and write back NULL, so the value an ordinary masking flag hides would be \
+                 discarded; only a dependent flag, which a publication sets true together \
+                 with its values, may mask",
+                field_label(schema, field_id)
             )));
         }
         if !output.nullable {
@@ -1278,8 +1270,8 @@ fn validate_moved_rows_written_fields(schema: &Schema, written_fields: &[i32]) -
 /// [`CellFlagChanges::pairs_flags_with_read_values`]), so none is missed.
 /// Every other change can only clear the flag, and false is safe with any
 /// value. Ordinary flags follow the row as the head has them, keeping a
-/// concurrent explicit update; that needs the update to copy the stored values
-/// of the fields they mask, not the masked NULLs.
+/// concurrent explicit update; they never mask, so the values the update read
+/// through the masked scan are the stored ones.
 fn apply_moved_rows(
     registry: &mut CellFlagRegistry,
     changes: &CellFlagChanges,
@@ -2018,8 +2010,9 @@ mod tests {
     }
 
     /// `title.fresh` watches summary, the output of `summary.ready`, which
-    /// watches body; `body.hidden` is an ordinary masking flag. `fresh` is
-    /// registered first, so its id sorts before its upstream's.
+    /// watches body, the output of `body.hidden`, which masks body and watches
+    /// meta. `fresh` is registered first, so its id sorts before its
+    /// upstream's.
     fn chained_manifest() -> Manifest {
         commit(
             &manifest(),
@@ -2028,7 +2021,7 @@ mod tests {
                 vec![
                     registration_of(TITLE, "fresh", &[SUMMARY], false),
                     registration_of(SUMMARY, "ready", &[BODY], true),
-                    registration_of(BODY, "hidden", &[], true),
+                    registration_of(BODY, "hidden", &[META], true),
                 ],
             ),
         )
@@ -2056,22 +2049,18 @@ mod tests {
         let written = rows(&[(0, Some(&[2, 5]))]);
         assert_eq!(
             derive_cell_flag_invalidations(&head, &write).unwrap(),
-            vec![
-                CellFlagUpdate {
-                    flag_id: FRESH,
+            [FRESH, READY, HIDDEN]
+                .into_iter()
+                .map(|flag_id| CellFlagUpdate {
+                    flag_id,
                     value: false,
                     rows: written.clone(),
-                },
-                CellFlagUpdate {
-                    flag_id: READY,
-                    value: false,
-                    rows: written,
-                },
-            ]
+                })
+                .collect::<Vec<_>>()
         );
 
-        // An explicit clear of ready reaches fresh, and unmasking body is a
-        // change to what ready's source reads as.
+        // An explicit clear of ready reaches fresh, and one of hidden, whose
+        // output ready watches, reaches both.
         let explicit = TransactionBuilder::new(2, update_config())
             .cell_flag_changes(CellFlagChanges {
                 updates: vec![
@@ -2082,7 +2071,7 @@ mod tests {
                     },
                     CellFlagUpdate {
                         flag_id: HIDDEN,
-                        value: true,
+                        value: false,
                         rows: rows(&[(1, Some(&[4]))]),
                     },
                 ],
@@ -2492,11 +2481,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::unknown(None, &[HIDDEN])]
+    #[case::unknown(None, &[])]
     #[case::none_written(Some(vec![]), &[FRESH, READY, HIDDEN])]
     #[case::unwatched_field(Some(vec![ID]), &[FRESH, READY, HIDDEN])]
-    #[case::upstream_source(Some(vec![BODY]), &[HIDDEN])]
-    #[case::upstream_output(Some(vec![SUMMARY]), &[HIDDEN])]
+    #[case::first_source(Some(vec![META]), &[])]
+    #[case::upstream_output(Some(vec![BODY]), &[])]
+    #[case::middle_output(Some(vec![SUMMARY]), &[HIDDEN])]
     #[case::downstream_output(Some(vec![TITLE]), &[READY, HIDDEN])]
     fn moved_rows_keep_a_dependent_flag_only_with_its_upstream(
         #[case] written_fields: Option<Vec<i32>>,
@@ -2539,11 +2529,19 @@ mod tests {
     #[case::source_is_output(registration_of(BODY, "x", &[BODY], false), true, "cannot also be one of its")]
     #[case::nested_source(registration_of(BODY, "x", &[LANG], false), true, "source 'meta.lang' (field id 5) is not a top-level")]
     #[case::second_dependent(registration_of(SUMMARY, "other", &[ID], false), true, "already has a dependent flag")]
-    #[case::second_mask(registration_of(SUMMARY, "other", &[], true), true, "is already masked by")]
+    #[case::ordinary_mask(
+        registration_of(TITLE, "x", &[], true),
+        false,
+        "on 'title' (field id 1) without clear_on_write sources: row-moving writes and in-place \
+         re-reads read through the masked scan and write back NULL, so the value an ordinary \
+         masking flag hides would be discarded"
+    )]
+    #[case::second_mask(registration_of(SUMMARY, "other", &[ID], true), true, "already has a dependent flag")]
     #[case::cycle(registration_of(TITLE, "x", &[SUMMARY], false), true, "cyclic")]
-    #[case::non_nullable_mask(registration_of(ID, "x", &[], true), true, "is not nullable")]
-    #[case::nested_type_mask(registration_of(TAGS, "x", &[], true), false, "masking supports only")]
-    #[case::blob_mask(registration_of(BLOB, "x", &[], true), false, "(blob)")]
+    #[case::non_nullable_mask(registration_of(ID, "x", &[TITLE], true), true, "is not nullable")]
+    #[case::list_mask(registration_of(TAGS, "x", &[TITLE], true), false, "masking supports only")]
+    #[case::struct_mask(registration_of(META, "x", &[TITLE], true), false, "masking supports only")]
+    #[case::blob_mask(registration_of(BLOB, "x", &[TITLE], true), false, "(blob)")]
     fn registration_validation_errors(
         #[case] registration: CellFlagRegistration,
         #[case] is_invalid_input: bool,
@@ -2577,7 +2575,7 @@ mod tests {
         index.fields = vec![SUMMARY];
         let error = commit_with_indices(
             &manifest(),
-            &register_txn(1, vec![registration_of(SUMMARY, "ready", &[], true)]),
+            &register_txn(1, vec![registration_of(SUMMARY, "ready", &[BODY], true)]),
             vec![index],
         )
         .unwrap_err();
@@ -2588,7 +2586,7 @@ mod tests {
         legacy.data_storage_format = DataStorageFormat::new(ConcreteFileVersion::V1);
         let error = commit(
             &legacy,
-            &register_txn(1, vec![registration_of(SUMMARY, "ready", &[], true)]),
+            &register_txn(1, vec![registration_of(SUMMARY, "ready", &[BODY], true)]),
         )
         .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");

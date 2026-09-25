@@ -12,21 +12,21 @@
 //! a source, or to the flag's own field, clears the flag for the written rows
 //! in the same commit. When a source is itself the output of a dependent flag,
 //! clearing that flag clears this one on the same rows, so clears follow
-//! chains of computed fields. Changing which cells of a source read as NULL,
-//! by registering or dropping a masking flag on it or by setting an ordinary
-//! masking flag, clears the flag on the affected rows as well. A dependent
-//! flag becomes true only through a `DataReplacement` that writes its field
-//! and carries a [`CellFlagUpdate`](crate::dataset::transaction::CellFlagUpdate)
-//! setting it, committed through [`CommitBuilder`] with the version the
-//! values were computed from as its read version; the flag must already be
-//! registered there. In such a publication, every row of a replaced fragment
-//! that the transaction does not assign must be copied unchanged from the
-//! read snapshot, as read through Lance. Lance treats those rows as logically
+//! chains of computed fields. Registering or dropping a masking flag on a
+//! source changes which of its cells read as NULL, so it clears the flag on
+//! every row. A dependent flag becomes true only through a `DataReplacement`
+//! that writes its field and carries a
+//! [`CellFlagUpdate`](crate::dataset::transaction::CellFlagUpdate) setting it,
+//! committed through [`CommitBuilder`] with the version the values were
+//! computed from as its read version; the flag must already be registered
+//! there. In such a publication, every row of a replaced fragment that the
+//! transaction does not assign must be copied unchanged from the read
+//! snapshot, as read through Lance. Lance treats those rows as logically
 //! unchanged for invalidation, and as physically written for conflict
 //! detection, so an incremental refresh keeps the rows an earlier one
 //! completed. [`PublicationReport`] describes how concurrent transactions are
 //! checked. A flag without sources is *ordinary*: only explicit updates
-//! change it.
+//! change it, and it cannot mask its field.
 //!
 //! A row-moving update gives the rows it writes new addresses, so their state
 //! moves with them only for the rows it lists in `moved_rows`.
@@ -36,6 +36,71 @@
 //! flag upstream of it. Other row-moving writes, such as a `merge_insert` that
 //! rewrites whole rows, are refused where an ordinary flag is true, and leave
 //! the moved rows unassigned for dependent flags.
+//!
+//! A refresh from registration to publication:
+//!
+//! ```
+//! # use std::sync::Arc;
+//! # use arrow_array::RecordBatch;
+//! # use futures::stream;
+//! # use lance::{Dataset, Result};
+//! # use lance::dataset::cell_flag::{CellFlagOptions, DeferralReason};
+//! # use lance::dataset::transaction::{
+//! #     CellFlagChanges, CellFlagUpdate, Operation, TransactionBuilder,
+//! # };
+//! # use lance::dataset::{CommitBuilder, DependencyConflictPolicy, UpdateBuilder};
+//! # use lance_select::RowAddrTreeMap;
+//! # async fn example(mut dataset: Dataset, summaries: RecordBatch) -> Result<()> {
+//! // `summary` is computed from `title` and `body` and reads NULL until published.
+//! let ready = dataset
+//!     .register_cell_flag(
+//!         "summary",
+//!         "ready",
+//!         CellFlagOptions::default()
+//!             .with_clear_on_write(["title", "body"])
+//!             .with_mask_when_false(true),
+//!     )
+//!     .await?;
+//!
+//! // A refresh reads a snapshot, computes one value per physical row of fragment 0
+//! // outside Lance, and stages them as a full-fragment file.
+//! let read = dataset.clone();
+//! let output = read.schema().project(&["summary"])?;
+//! let fragment = read.get_fragment(0).expect("fragment 0 exists");
+//! let group = fragment
+//!     .write_columns(stream::iter([Ok(summaries)]), &output)
+//!     .await?;
+//! let mut computed = RowAddrTreeMap::new();
+//! computed.insert_fragment(0);
+//! let publication = TransactionBuilder::new(
+//!     read.version().version,
+//!     Operation::DataReplacement { replacements: vec![group] },
+//! )
+//! .cell_flag_changes(CellFlagChanges {
+//!     updates: vec![CellFlagUpdate { flag_id: ready.flag_id, value: true, rows: computed }],
+//!     ..Default::default()
+//! })
+//! .build();
+//!
+//! // Publish what is still valid and learn what to redo.
+//! let result = CommitBuilder::new(Arc::new(read))
+//!     .with_dependency_conflict_policy(DependencyConflictPolicy::Skip)
+//!     .execute_with_report(publication)
+//!     .await?;
+//! let recompute = result.report.deferred_rows_of(ready.flag_id, DeferralReason::InputChanged);
+//! let reuse = result.report.reusable_rows(ready.flag_id);
+//! # let _ = (recompute, reuse);
+//!
+//! // An ordinary write to a source clears the flag in its own commit.
+//! UpdateBuilder::new(Arc::new(result.dataset))
+//!     .update_where("id = 7")?
+//!     .set("body", "'new body'")?
+//!     .build()?
+//!     .execute()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -65,10 +130,14 @@ pub struct CellFlagOptions {
     /// flag's own field, clears the flag for the written rows. Empty makes an
     /// ordinary flag.
     pub clear_on_write: Vec<String>,
-    /// Reads return NULL for the flag's field wherever the flag is false. The
-    /// field must be a nullable scalar and must not be indexed. While such a
-    /// flag is registered, MemWAL (LSM) reads over the dataset fail: MemWAL
-    /// rows carry no flag state to mask them with.
+    /// Reads return NULL for the flag's field wherever the flag is false. Needs
+    /// `clear_on_write` sources: writes that re-read rows through the masked
+    /// scan, such as a row-moving update, write masked cells back as NULL,
+    /// which only a dependent flag tolerates, since a publication sets it true
+    /// together with fresh values. The field must be a nullable scalar and must
+    /// not be indexed. While such a flag is registered, MemWAL (LSM) reads
+    /// over the dataset fail: MemWAL rows carry no flag state to mask them
+    /// with.
     pub mask_when_false: bool,
 }
 
