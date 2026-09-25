@@ -973,6 +973,29 @@ fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) 
     Ok(())
 }
 
+/// Refuse to index `column` (field id `field_id`) when a cell flag masks it:
+/// the index would hold the stored values, while reads return NULL wherever
+/// the flag is false. The commit refuses it too; this fails before any build.
+pub(crate) fn ensure_unmasked_index_field(
+    dataset: &Dataset,
+    field_id: i32,
+    column: &str,
+) -> Result<()> {
+    let Some(flag) = dataset
+        .manifest
+        .cell_flags
+        .as_deref()
+        .and_then(|registry| registry.masking_flag(field_id))
+    else {
+        return Ok(());
+    };
+    Err(Error::not_supported(format!(
+        "CreateIndex: column '{column}' (field id {field_id}) is masked by cell flag '{}' \
+         (flag id {}), so an index on it would serve the values the flag masks",
+        flag.name, flag.flag_id
+    )))
+}
+
 /// Detect vector segments while preserving the legacy pre-details fallback.
 ///
 /// Older vector segments may not have `VectorIndexDetails` in the manifest, so
@@ -2268,6 +2291,7 @@ impl DatasetIndexExt for Dataset {
                 "CreateIndex: column '{column}' does not exist"
             )));
         };
+        ensure_unmasked_index_field(self, field.id, column)?;
 
         let segments = segments
             .into_iter()
@@ -3797,7 +3821,17 @@ impl DatasetIndexInternalExt for Dataset {
         // entry has a bitmap; if any are missing, we leave the entry absent
         // so the optimizer treats coverage as unknown.
         let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
+        let cell_flags = self.manifest.cell_flags.as_deref();
         for index in indices.iter().filter(|idx| {
+            // Commits refuse such an index, but should one exist, it holds stored
+            // values where reads return NULL, so the filter must read the column.
+            let is_masked = idx.keyed_field().is_some_and(|field_id| {
+                cell_flags.is_some_and(|registry| registry.masking_flag(field_id).is_some())
+            });
+            if is_masked {
+                return false;
+            }
+
             // Check if this is an FTS index by looking at index details
             let is_fts_index = if let Some(details) = &idx.index_details {
                 IndexDetails(details.clone()).supports_fts()

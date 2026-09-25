@@ -536,6 +536,21 @@ impl LsmScanner {
 
     /// Create the execution plan.
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        // Memtable and SSTable rows carry no cell flag state, so their cells
+        // cannot be masked the way the base table's are.
+        if let BaseSource::Table(base_table) = &self.base
+            && let Some((field, flag)) = base_table
+                .cell_flags()
+                .iter()
+                .filter(|flag| flag.mask_when_false)
+                .find_map(|flag| Some((base_table.schema().field_by_id(flag.field_id)?, flag)))
+        {
+            return Err(Error::not_supported(format!(
+                "LSM scan: field '{}' (field id {}) is masked by cell flag '{}' (flag id {}), \
+                 and MemWAL rows carry no cell flag state to mask it with",
+                field.name, field.id, flag.name, flag.flag_id
+            )));
+        }
         // Dispatch by builder state, mirroring `Scanner::create_plan` and
         // `MemTableScanner::create_plan`: vector search, then full-text search,
         // then the (point-lookup or union) plain scan.

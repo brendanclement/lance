@@ -63,7 +63,7 @@ async fn articles_at(uri: &str, stable_row_ids: bool) -> Dataset {
     dataset
 }
 
-async fn register_ready(dataset: &mut Dataset) -> u32 {
+pub(super) async fn register_ready(dataset: &mut Dataset) -> u32 {
     let ready = dataset
         .register_cell_flag(
             "summary",
@@ -116,7 +116,7 @@ async fn stage_all(dataset: &Dataset, column: &str, prefix: &str) -> Vec<DataRep
     groups
 }
 
-fn full(fragment_ids: &[u32]) -> RowAddrTreeMap {
+pub(super) fn full(fragment_ids: &[u32]) -> RowAddrTreeMap {
     let mut rows = RowAddrTreeMap::new();
     for fragment_id in fragment_ids {
         rows.insert_fragment(*fragment_id);
@@ -124,7 +124,7 @@ fn full(fragment_ids: &[u32]) -> RowAddrTreeMap {
     rows
 }
 
-fn set_true(flag_id: u32, rows: RowAddrTreeMap) -> Vec<CellFlagUpdate> {
+pub(super) fn set_true(flag_id: u32, rows: RowAddrTreeMap) -> Vec<CellFlagUpdate> {
     vec![CellFlagUpdate {
         flag_id,
         value: true,
@@ -146,7 +146,7 @@ fn replacement_txn(
 }
 
 /// Commit `replacements` staged against `dataset`'s version.
-async fn commit_replacement(
+pub(super) async fn commit_replacement(
     dataset: &Dataset,
     replacements: Vec<DataReplacementGroup>,
     updates: Vec<CellFlagUpdate>,
