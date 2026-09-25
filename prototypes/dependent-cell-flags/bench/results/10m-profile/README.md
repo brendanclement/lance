@@ -8,6 +8,7 @@ with no benchmark running. This is not a paired run and yields no regression rat
 | File | Content |
 |---|---|
 | `proto.top-of-stack.txt`, `base.top-of-stack.txt` | The heading and first 60 entries of `Sort by top of stack` from each `sample` report, with the Rust symbols demangled by `c++filt` (counts and libraries unchanged) |
+| `proto.top-of-stack.all.txt`, `base.top-of-stack.all.txt` | Added later from the same reports and demangled the same way: the heading and every entry of `Sort by top of stack` (281 in `proto`, 276 in `base`). The first 61 lines equal the excerpts above |
 | `proto.harness.log`, `base.harness.log` | The harness's stdout for each profiled process |
 
 The full `sample` reports (about 6 MB each) and the JSONL records are not committed.
@@ -40,9 +41,10 @@ scan, `populated` `warm` first (1,500 scans of about 24 ms), so both profiles co
 
 ## Frames compared
 
-Counts from `Sort by top of stack`. Shares are of the non-wait samples: all listed entries except
-`__psynch_cvwait`, `kevent`, `__psynch_mutexwait`, `__ulock_wait` and `__ulock_wait2` (idle
-worker threads).
+Counts from `*.top-of-stack.all.txt`. Wait samples are the idle-thread frames `__psynch_cvwait`,
+`kevent`, `__psynch_mutexwait`, `__ulock_wait` and `__ulock_wait2`; every other entry counts as
+non-wait, and shares are of the non-wait total. The table lists every frame with at least 1% of
+the non-wait samples in either build.
 
 | Frame | `proto` samples | share | `base` samples | share |
 |---|---|---|---|---|
@@ -57,14 +59,32 @@ worker threads).
 | `fsst::validate_offsets` | 1,415 | 2.3% | 1,338 | 2.3% |
 | `DecodeMiniBlockTask::decode` | 1,372 | 2.2% | 1,135 | 2.0% |
 | `core::str::from_utf8` | 1,340 | 2.1% | 1,273 | 2.2% |
+| `mach_absolute_time` | 1,056 | 1.7% | 1,735 | 3.0% |
 | `BinaryMiniBlockDecompressor::decompress` | 994 | 1.6% | 970 | 1.7% |
+| `_platform_memset_pattern16` | 878 | 1.4% | 966 | 1.7% |
+| `__open` | 820 | 1.3% | 716 | 1.2% |
+| `<deduplicated_symbol>` (`libsystem_malloc`) | 784 | 1.2% | 810 | 1.4% |
+| `_free` | 726 | 1.2% | 242 | 0.4% |
+| `__psynch_cvsignal` | 713 | 1.1% | 732 | 1.3% |
 | Non-wait samples | 62,830 | | 58,090 | |
 | Wait samples | 280,143 | | 268,687 | |
 
-Cell flag code in the call graphs (`grep -E 'CellFlag|cell_flag_mask|resolve_cells|merge_overlays'`;
-a plain `cell_flag` search matches the binary name on every line): `proto` has two entries of one
-sample each, `CellFlagMasks::resolve` and `FragmentReader::resolve_cells` (the prototype's wrapper
-around `merge_overlays`); `base` has three one-sample entries in `FragmentReader::merge_overlays`.
+The totals, from this directory:
+
+```sh
+awk '$1 ~ /^(__psynch_cvwait|kevent|__psynch_mutexwait|__ulock_wait|__ulock_wait2)$/ { w += $NF; next }
+  NR > 1 { n += $NF } END { print n " non-wait, " w " wait" }' proto.top-of-stack.all.txt
+```
+
+The same six frames lead in both builds. Every listed share differs between the builds by at most
+0.8 percentage points except `mach_absolute_time` (1.3 points lower in `proto`); `_free` differs by
+0.7 points, 2.8 times its `base` share.
+
+Cell flag code in the call graphs of the full reports
+(`grep -E 'CellFlag|cell_flag_mask|resolve_cells|merge_overlays'`; a plain `cell_flag` search
+matches the binary name on every line): `proto` has two entries of one sample each,
+`CellFlagMasks::resolve` and `FragmentReader::resolve_cells` (the prototype's wrapper around
+`merge_overlays`); `base` has three one-sample entries in `FragmentReader::merge_overlays`.
 
 ## Harness medians while profiling
 

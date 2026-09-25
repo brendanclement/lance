@@ -49,7 +49,8 @@ cp rust/lance/benches/cell_flags_regression.rs /abs/lance-baseline/rust/lance/be
 # harness = false
 ```
 
-The prototype worktree is a checkout of this branch, whose Rust code equals `26388225a`:
+The prototype worktree is a checkout of this branch, whose code equals `26388225a` (`4aaa8280c`
+later changed only the `PublicationReport` rustdoc):
 
 ```bash
 git worktree add --detach /abs/lance-proto brendan/dependency-aware-cell-flags
@@ -74,6 +75,7 @@ Paired runs are the only runs whose baseline/prototype ratios mean anything. Sca
 ```bash
 cd /abs/lance-proto
 BASELINE_WORKTREE=/abs/lance-baseline BENCH_DATA_DIR=/abs/bench-data \
+RESULTS_DIR=/abs/results/1m-repeat \
   prototypes/dependent-cell-flags/bench/run_paired.sh 1m
 ```
 
@@ -93,8 +95,9 @@ writes:
 - `results/<scale>/analysis.md` and the `REPORT.md` section named after the results directory
   (`results:<scale>`, or the last component of `RESULTS_DIR`)
 
-It refuses to write into a results directory that already holds rounds. Any preset value can be
-overridden: `ROUNDS`, `BENCH_SAMPLES`, `BENCH_READ_SAMPLES`, `BENCH_WARMUP`, `BENCH_WORKLOADS`,
+It refuses to write into a results directory that already holds rounds; in a checkout of this
+branch every `results/<scale>` does, so set `RESULTS_DIR` to a new directory. Any preset value can
+be overridden: `ROUNDS`, `BENCH_SAMPLES`, `BENCH_READ_SAMPLES`, `BENCH_WARMUP`, `BENCH_WORKLOADS`,
 `BENCH_SCALE_ROWS`, `BENCH_ROWS_PER_FRAGMENT`, `BENCH_UDF_ITERS`, `BENCH_CONFLICT_KS` and
 `BENCH_PUBLISH_KS`. The script also reads these:
 
@@ -156,13 +159,16 @@ Both harnesses read the same variables (`BenchConfig` in `cell_flags_common/mod.
 Every run used the same baseline worktree at `e3671b2f5` (outside any checkout, with the harness
 files above), passed as `BASELINE_WORKTREE`, and an absolute `BENCH_DATA_DIR`. `$READS` stands for
 `scan_summary_full,filter_summary_is_null_count,count_summary_vs_star,filter_id_range_project_summary,take_random_1k`,
-and `RESULTS_DIR` for the absolute path of `results/<run>`. *Nested* means the prototype was the
-worktree under `/Users/brendan/code/lance`, so its binaries got doubled rustflags; the committed
-`run_paired.sh` refuses such builds, so those runs can be repeated only as clean builds.
+and `RESULTS_DIR` for the absolute path of `results/<run>`. The table records the original
+invocations. Every `results/<run>` now holds rounds, which `run_paired.sh` refuses to overwrite
+(exit status 2), so a repeat needs a new `RESULTS_DIR`, whose name becomes its `REPORT.md` section.
+*Nested* means the prototype was the worktree under `/Users/brendan/code/lance`, so its binaries
+got doubled rustflags; the committed `run_paired.sh` refuses such builds, so those runs can be
+repeated only as clean builds.
 
 | Run | Prototype checkout | Invocation |
 |---|---|---|
-| `smoke` | `e63e41628` (harness before the final hardening), outside any checkout | `BENCH_RUN_NICE=15 run_paired.sh smoke` |
+| `smoke` | `e63e41628` (prototype code before the final hardening; same harness), outside any checkout | `BENCH_RUN_NICE=15 run_paired.sh smoke` |
 | `smoke-final` | `21601f894`, nested | `RESULTS_DIR=… run_paired.sh smoke` |
 | `1m` | `21601f894`, nested | `run_paired.sh 1m` |
 | `10m` | `21601f894`, nested | `run_paired.sh 10m` |
@@ -187,8 +193,10 @@ A checkout of this branch has the clean runs' code and driver (their `env.json` 
   commits. The loop wrote a partial `env.json` by hand and no `BENCH_GIT_SHA`; see
   `results/10m-reads-layout-control/README.md`. The script records the full environment and
   checks rustflags.
-- The recorded analyses (`results/*/analysis.md`) keep `analyze.py`'s old heading,
-  `Results: <scale>`. The `REPORT.md` sections come from `regenerate_report.sh`.
+- The recorded analyses (`results/*/analysis.md`) keep the headings they were written with:
+  `analyze.py`'s old `Results: <scale>` for `smoke`, `smoke-final`, `1m` and `10m`, hand-written
+  ones for the rest. Below the heading each matches `analyze.py`'s output. The `REPORT.md` sections
+  and their headings come from `regenerate_report.sh`.
 - `smoke` predates the final code and has no `REPORT.md` section.
 - `results/10m-profile/` is a sampling profile, not a benchmark run; its `README.md` has the
   command.

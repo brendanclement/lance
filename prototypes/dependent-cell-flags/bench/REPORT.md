@@ -62,16 +62,21 @@ unrelated-field updates 0.98× / 1.11× (`1m`: 1.16× / 1.20×), dense updates 1
   rounds) measured 0.99–1.04× on the same reads, with per-round ratios of 0.95–1.10×; the prototype
   with `fragment.rs` reverted (`10m-reads-variant-fragment-reverted`, baseline first) measured
   1.02–1.06×. The clean geometric mean exceeds the layout control by 2.6–7.7% per full-column
-  workload (median 4.7%). The masking code for a dataset without flags is one `Option` check per
-  fragment open. A sampling profile of the nested build (`results/10m-profile/`) shows the same top
-  frames in both builds with similar shares, and cell flag code in 2 of 62,830 non-wait samples; no
-  clean-build binary was profiled. **An open regression, not attributed to a cause: profile the
-  clean build with hardware counters.**
+  workload (median 4.7%). On a dataset without flags, the prototype's read path adds an `Option`
+  check per fragment open and per read call, an `Option<Arc<CellFlagMasks>>` field on
+  `FragmentReader`, a registry check per index in `scalar_index_info` and an optional registry in
+  the manifest decode; the variant kept only the last two. A sampling profile of the nested build
+  (`results/10m-profile/`) has the same six leading non-wait frames in both builds and cell flag
+  code in 2 of its 62,830 non-wait samples; of the 18 frames with at least 1% of the non-wait
+  samples in either build, all but `mach_absolute_time` (1.7% against 3.0%) differ in share by at
+  most 0.8 percentage points, though `_free` is 1.2% against 0.4%. No clean-build binary was
+  profiled. **An open regression, not attributed to a cause: profile the clean build with hardware
+  counters.**
 - **Flag costs, 1M** (`1m`, 3 rounds, flags vs no flags in one build): sparse `UpdateBuilder`
   1.11× (one output) / 1.15× (two sharing an input); unrelated-field update 1.16× / 1.20× (flag
   state moves with the rows); dense update 1.53× / 1.48× with manifest 2.8 KB → 336 KB / 502 KB;
   partial `merge_insert` 1.03× / 0.98×; clean refresh +0.8%; publication after 0–64 unrelated
-  commits 1.00–1.08×. At 10M (`10m`, one round): sparse 1.15× / 1.19×, unrelated-field 1.13× /
+  commits 1.00–1.07×. At 10M (`10m`, one round): sparse 1.15× / 1.19×, unrelated-field 1.13× /
   1.16×, clean refresh +0.6%, publication after K 1.00–1.08×. The clean-build flag round is in the
   caveat above.
 - **Masked reads, final mask builder**: all flags true 0.93–1.04× (`1m-reads-maskfix` 0.93–1.00×,
@@ -95,7 +100,7 @@ unrelated-field updates 0.98× / 1.11× (`1m`: 1.16× / 1.20×), dense updates 1
   0.57 ms).
 - **Flag state size**: with 1% of rows invalidated the manifest grows from 7 KB to 88 KB (one flag)
   / 148 KB (two) at 1M rows (`1m`) and is 858 KB for the one-flag read table at 10M rows (`10m`);
-  fresh-session opens go from 0.08–0.09 ms to 0.13–0.15 ms (`1m`, 1% and 10% invalidated).
+  fresh-session opens go from 0.09 ms to 0.13–0.15 ms (`1m`, 1% and 10% invalidated).
 
 <!-- BEGIN results:smoke-final -->
 ## Smoke: 100k rows, prototype `21601f894` (nested build)
