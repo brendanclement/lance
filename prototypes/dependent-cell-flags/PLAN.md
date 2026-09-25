@@ -1,6 +1,6 @@
 # Dependency-aware cell flags: implementation plan
 
-Baseline: `origin/main` at `e3671b2f5730eea927a088a42cbf30e273edc43c`. Branch: `codex/dependency-aware-cell-flags`.
+Baseline: `origin/main` at `e3671b2f5730eea927a088a42cbf30e273edc43c`. Branch: `brendan/dependency-aware-cell-flags`.
 
 Design input: `option-d-dependent-cell-flags.md` (Weston's option D) and the reference PR
 [#8655](https://github.com/lance-format/lance/pull/8655) at head `488aecce5`. #8655 is a draft on
@@ -33,6 +33,9 @@ UDF, compaction remap, or bindings.
   the written rows, except the flag's own publication.
 - Dependent flags start unassigned (false) and become true only through a publication: a
   `DataReplacement` whose files carry the output field for the assigned fragments.
+- Only dependent flags may mask. Writers that re-read rows through the masked scan write masked
+  cells back as NULL, which is harmless only when the flag can become true again solely through a
+  publication that writes new values.
 - A publication validates, for every assigned row, that no transaction in `(read_version, head]`
   invalidated the row, and that no transaction wrote the group's output fields in that fragment
   (the file's full physical footprint). Registration drop/replace fences publishers.
