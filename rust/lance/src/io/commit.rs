@@ -45,7 +45,7 @@ use lance_table::io::commit::{
 use lance_table::io::manifest::read_manifest;
 use lance_table::transaction::{
     CellFlagChanges, derive_cell_flag_invalidations, ensure_cell_flags_registered_at_read_version,
-    ensure_operation_allowed_with_cell_flags,
+    ensure_operation_allowed_with_cell_flags, ensure_row_move_saw_flag_registrations,
 };
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
@@ -1499,9 +1499,10 @@ fn record_derived_cell_flag_invalidations(
     Ok(())
 }
 
-/// A transaction that sets cell flags true is checked against every version
-/// since it read. One missing from that range, for example removed by cleanup,
-/// could hide a write that invalidated what it publishes.
+/// A transaction that pairs true cell flags with values it read is checked
+/// against every version since it read. One missing from that range, for
+/// example removed by cleanup, could hide a write that invalidated what it
+/// publishes, or a publication that the values it copied predate.
 fn ensure_saw_every_version_since_read(
     read_version: u64,
     head_version: u64,
@@ -1579,14 +1580,14 @@ pub(crate) async fn commit_transaction(
 
     let mut transaction = transaction.clone();
 
-    let sets_cell_flags = transaction
+    let pairs_cell_flags_with_read_values = transaction
         .cell_flag_changes
         .as_deref()
-        .is_some_and(CellFlagChanges::sets_any_flag);
-    if sets_cell_flags && read_version == 0 {
+        .is_some_and(CellFlagChanges::pairs_flags_with_read_values);
+    if pairs_cell_flags_with_read_values && read_version == 0 {
         return Err(Error::invalid_input(
-            "a transaction that sets cell flags must name the version its values were read \
-             at, but its read_version is 0",
+            "a transaction that sets cell flags, or keeps them on rows it moves, must name the \
+             version its values were read at, but its read_version is 0",
         ));
     }
     ensure_cell_flags_registered_at_read_version(&read_version_dataset.manifest, &transaction)?;
@@ -1636,8 +1637,13 @@ pub(crate) async fn commit_transaction(
         }
         // After the rebase, so a stale transaction fails as a conflict rather
         // than being refused for differences a concurrent commit introduced.
+        ensure_row_move_saw_flag_registrations(
+            &read_version_dataset.manifest,
+            &dataset.manifest,
+            &transaction,
+        )?;
         ensure_operation_allowed_with_cell_flags(&dataset.manifest, &transaction)?;
-        if sets_cell_flags {
+        if pairs_cell_flags_with_read_values {
             ensure_saw_every_version_since_read(
                 read_version,
                 dataset.manifest.version,

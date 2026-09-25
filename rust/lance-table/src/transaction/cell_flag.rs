@@ -9,7 +9,7 @@
 
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_select::RowAddrTreeMap;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::format::CellFlagRegistry;
 
@@ -42,7 +42,8 @@ pub struct CellFlagRegistration {
 /// flags are always copied. A dependent flag is copied only when
 /// [`CellFlagChanges::moved_rows_written_fields`] is known and names none of
 /// its watched fields, and every dependent flag upstream of it is copied too;
-/// otherwise it starts false on the moved rows.
+/// otherwise it starts false on the moved rows. The update deletes the source
+/// rows, so the commit clears every flag there.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellFlagMovedRows {
     /// Path of the first data file of the new fragment, which names it until
@@ -51,16 +52,18 @@ pub struct CellFlagMovedRows {
     /// Physical offsets in the new fragment that hold moved rows.
     pub offsets: RoaringBitmap,
     /// Row address (fragment id in the upper 32 bits, physical offset in the
-    /// lower) each moved row had at the version the update read, one per
-    /// entry of `offsets` in ascending offset order.
-    pub source_row_addrs: Vec<u64>,
+    /// lower) each moved row had at the version the update read, paired with
+    /// `offsets` by rank: the n-th smallest address is the source of the n-th
+    /// smallest offset. Rows whose sources are not in ascending order take
+    /// several entries for one fragment.
+    pub source_row_addrs: RoaringTreemap,
 }
 
 impl DeepSizeOf for CellFlagMovedRows {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.fragment_path.deep_size_of_children(context)
             + self.offsets.serialized_size()
-            + self.source_row_addrs.deep_size_of_children(context)
+            + self.source_row_addrs.serialized_size()
     }
 }
 
@@ -104,10 +107,20 @@ impl CellFlagChanges {
             && self.moved_rows_written_fields.is_none()
     }
 
-    /// Whether any explicit update sets a flag to true. Moved rows do not
-    /// count: they copy the head's state rather than values read earlier.
+    /// Whether any explicit update sets a flag to true.
     pub fn sets_any_flag(&self) -> bool {
         self.updates.iter().any(|update| update.value)
+    }
+
+    /// Whether the commit may pair a true flag with values this transaction
+    /// read at its read version: it sets a flag true, or it moves rows and
+    /// declares the fields it wrote there, which keeps the head's state of the
+    /// dependent flags it did not invalidate on values it copied. The commit
+    /// must then see every version since the read, or it could miss the
+    /// publication that made that state disagree with the copied values.
+    pub fn pairs_flags_with_read_values(&self) -> bool {
+        self.sets_any_flag()
+            || (!self.moved_rows.is_empty() && self.moved_rows_written_fields.is_some())
     }
 
     /// Whether an explicit update sets a flag that `registry` defines as

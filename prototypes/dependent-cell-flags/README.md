@@ -46,7 +46,9 @@ producing wrong results:
 - Creating any index on a masked output field. Registering a masking flag on an indexed field.
 - Row-moving writes that cannot carry flag state (`merge_insert` in `RewriteRows` mode, raw staged
   `Update` operations) on fragments where an *ordinary* flag is true. Dependent flags on moved rows
-  fall back to unassigned, which is safe but loses completed work.
+  fall back to unassigned, which is safe but loses completed work. A row-moving write staged before
+  that flag was registered fails with a retryable conflict instead, so `UpdateBuilder` retries and
+  moves the state.
 - Masked outputs that are non-nullable, nested, list/struct, blob, or on legacy (v1) storage.
 - Assigning a dependent flag true outside a `DataReplacement` that writes its output.
 - `Skip` through `CommitBuilder::execute` (it cannot return the report); use

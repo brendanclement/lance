@@ -24,7 +24,7 @@ UDF, compaction remap, or bindings.
 | Refresh conflicts | `TransactionRebase` (`io/commit/conflict_resolver.rs`): a cell-flag preamble in `check_txn` plus per-group handling in `check_data_replacement_txn`; `finish` trims deferred groups/rows for DataReplacement and never changes `read_version`. |
 | Conflict policy + report | `CommitBuilder::with_dependency_conflict_policy(DependencyConflictPolicy::{Reject, Skip})` and `CommitBuilder::execute_with_report` returning a `PublicationReport` (`rust/lance/src/dataset/write/commit.rs`). |
 | Masking | `FileFragment::open` resolves masking flags for projected top-level fields; `FragmentReader` nulls masked cells right after the overlay merge in both read funnels (`new_read_impl`, `read_ranges`), before deletions, filters, aggregates and projection. |
-| Row-moving update | `UpdateJob` (`write/update.rs`) records `CellFlagMovedRows` (old address -> new row) and the fields it wrote; the commit copies the head state of ordinary flags, and of dependent flags whose watched fields were not written, onto the moved rows. |
+| Row-moving update | `UpdateJob` (`write/update.rs`) records `CellFlagMovedRows` (new offsets paired by rank with a treemap of old addresses) and the fields it wrote; the commit copies the head state of ordinary flags, and of dependent flags whose watched fields were not written, onto the moved rows, and clears every flag at the old addresses. Keeping dependent state requires every version since the read to be loadable. |
 
 ## Semantics
 

@@ -23,7 +23,7 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_file::datatypes::Fields;
 use lance_select::RowAddrTreeMap;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -142,10 +142,16 @@ impl From<&CellFlagChanges> for pb::transaction::CellFlagChanges {
                         .offsets
                         .serialize_into(&mut offsets)
                         .expect("RoaringBitmap serialization cannot fail");
+                    let mut source_row_addrs =
+                        Vec::with_capacity(moved.source_row_addrs.serialized_size());
+                    moved
+                        .source_row_addrs
+                        .serialize_into(&mut source_row_addrs)
+                        .expect("RoaringTreemap serialization into a Vec cannot fail");
                     pb::transaction::cell_flag_changes::MovedRows {
                         fragment_path: moved.fragment_path.clone(),
                         offsets,
-                        source_row_addrs: moved.source_row_addrs.clone(),
+                        source_row_addrs,
                     }
                 })
                 .collect(),
@@ -195,10 +201,19 @@ impl TryFrom<pb::transaction::CellFlagChanges> for CellFlagChanges {
                                 moved.fragment_path
                             ))
                         })?;
+                    let source_row_addrs =
+                        RoaringTreemap::deserialize_from(moved.source_row_addrs.as_slice())
+                            .map_err(|error| {
+                                Error::invalid_input(format!(
+                                    "invalid moved-row source addresses for fragment file \
+                                     '{}': {error}",
+                                    moved.fragment_path
+                                ))
+                            })?;
                     Ok(CellFlagMovedRows {
                         fragment_path: moved.fragment_path,
                         offsets,
-                        source_row_addrs: moved.source_row_addrs,
+                        source_row_addrs,
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -950,6 +965,7 @@ mod tests {
     use crate::format::overlay::OverlayCoverage;
     use crate::transaction::TransactionBuilder;
     use lance_core::utils::address::RowAddress;
+    use rstest::rstest;
 
     #[test]
     fn test_cell_flag_changes_roundtrip() {
@@ -977,10 +993,10 @@ mod tests {
             moved_rows: vec![CellFlagMovedRows {
                 fragment_path: "data/new.lance".to_string(),
                 offsets: RoaringBitmap::from_iter([0_u32, 9]),
-                source_row_addrs: vec![
-                    RowAddress::new_from_parts(3, 0).into(),
-                    RowAddress::new_from_parts(3, 4).into(),
-                ],
+                source_row_addrs: RoaringTreemap::from_iter([
+                    u64::from(RowAddress::new_from_parts(3, 0)),
+                    u64::from(RowAddress::new_from_parts(3, 4)),
+                ]),
             }],
             moved_rows_written_fields: Some(vec![2, 5]),
         };
@@ -1023,8 +1039,39 @@ mod tests {
         assert_eq!(Transaction::try_from(message).unwrap(), plain);
     }
 
-    #[test]
-    fn test_cell_flag_changes_rejects_corrupt_rows() {
+    const CORRUPT_BITMAP: [u8; 12] = [1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0];
+
+    #[rstest]
+    #[case::update_rows(
+        pb::transaction::CellFlagChanges {
+            updates: vec![pb::transaction::cell_flag_changes::Update {
+                flag_id: 6,
+                value: true,
+                rows: CORRUPT_BITMAP.to_vec(),
+            }],
+            ..Default::default()
+        },
+        "invalid rows in cell flag update for flag 6"
+    )]
+    #[case::moved_row_sources(
+        pb::transaction::CellFlagChanges {
+            moved_rows: vec![pb::transaction::cell_flag_changes::MovedRows {
+                fragment_path: "data/new.lance".to_string(),
+                offsets: {
+                    let mut offsets = Vec::new();
+                    RoaringBitmap::from_iter([0_u32]).serialize_into(&mut offsets).unwrap();
+                    offsets
+                },
+                source_row_addrs: CORRUPT_BITMAP.to_vec(),
+            }],
+            ..Default::default()
+        },
+        "invalid moved-row source addresses for fragment file 'data/new.lance'"
+    )]
+    fn test_cell_flag_changes_rejects_corrupt_rows(
+        #[case] changes: pb::transaction::CellFlagChanges,
+        #[case] expected: &str,
+    ) {
         let message = pb::Transaction {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
@@ -1033,24 +1080,12 @@ mod tests {
                     replacements: vec![],
                 },
             )),
-            cell_flag_changes: Some(pb::transaction::CellFlagChanges {
-                updates: vec![pb::transaction::cell_flag_changes::Update {
-                    flag_id: 6,
-                    value: true,
-                    rows: vec![1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0],
-                }],
-                ..Default::default()
-            }),
+            cell_flag_changes: Some(changes),
             ..Default::default()
         };
         let error = Transaction::try_from(message).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains("invalid rows in cell flag update for flag 6"),
-            "{error}"
-        );
+        assert!(error.to_string().contains(expected), "{error}");
     }
 
     #[test]

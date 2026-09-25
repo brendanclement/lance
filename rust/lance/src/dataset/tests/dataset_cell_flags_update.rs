@@ -123,17 +123,18 @@ async fn published_articles(stable_row_ids: bool, reviewed_ids: &[i32]) -> (Data
     let dataset = if reviewed_ids.is_empty() {
         dataset
     } else {
-        set_reviewed(&dataset, &flags, reviewed_ids).await
+        set_reviewed(&dataset, flags.reviewed, reviewed_ids).await
     };
     (dataset, flags)
 }
 
-/// Commit, against `dataset`'s version, setting `reviewed` on `ids`.
-async fn set_reviewed(dataset: &Dataset, flags: &Flags, ids: &[i32]) -> Dataset {
+/// Commit, against `dataset`'s version, setting the ordinary flag `reviewed`
+/// on `ids`.
+async fn set_reviewed(dataset: &Dataset, reviewed: u32, ids: &[i32]) -> Dataset {
     let rows = row_addrs_of(dataset, ids).await;
     let transaction = TransactionBuilder::new(dataset.manifest.version, update_config())
         .cell_flag_changes(CellFlagChanges {
-            updates: set_true(flags.reviewed, rows),
+            updates: set_true(reviewed, rows),
             ..Default::default()
         })
         .build();
@@ -303,7 +304,7 @@ async fn test_update_moves_flags_whose_watched_fields_it_does_not_set(
     let sources: Vec<u64> = changes
         .moved_rows
         .iter()
-        .flat_map(|moved| moved.source_row_addrs.iter().copied())
+        .flat_map(|moved| moved.source_row_addrs.iter())
         .collect();
     assert_eq!(sources, updated.map(original_addr));
 }
@@ -379,7 +380,10 @@ async fn test_update_records_moved_rows_only_when_flags_are_registered(
         .unwrap();
     assert_eq!(changes.moved_rows.len(), 1);
     assert_eq!(
-        changes.moved_rows[0].source_row_addrs,
+        changes.moved_rows[0]
+            .source_row_addrs
+            .iter()
+            .collect::<Vec<_>>(),
         vec![original_addr(2)]
     );
 
@@ -419,7 +423,7 @@ async fn test_update_moves_flags_of_rows_moved_before(#[values(false, true)] sta
     let sources: Vec<u64> = changes
         .moved_rows
         .iter()
-        .flat_map(|moved| moved.source_row_addrs.iter().copied())
+        .flat_map(|moved| moved.source_row_addrs.iter())
         .collect();
     assert_eq!(sources, vec![original_addr(3), moved_before]);
     let addrs = addrs_by_id(&dataset).await;
@@ -448,7 +452,7 @@ async fn test_update_moves_ordinary_flag_set_after_its_read(
     #[values(false, true)] stable_row_ids: bool,
 ) {
     let (stale, flags) = flagged_articles(stable_row_ids).await;
-    let head = set_reviewed(&stale, &flags, &[2]).await;
+    let head = set_reviewed(&stale, flags.reviewed, &[2]).await;
 
     // Explicit flag updates do not conflict with the update, which copies the
     // state the head has, not the state it read.
@@ -518,17 +522,20 @@ async fn test_update_retries_over_concurrent_publication(
     assert_eq!(masked(&dataset, "summary", flags.summary).await, expected);
 }
 
-/// Every column of the fixture for id 2, unchanged but for `views`, so the
-/// write rewrites the whole row.
-fn upsert_of_id_2() -> RecordBatch {
+/// Every column of the published fixture for `id`, unchanged but for `views`,
+/// so the write rewrites the whole row.
+fn upsert_of(id: i32) -> RecordBatch {
+    let language = ["en", "fr", "en", "de", "en", "fr"][(id - 1) as usize];
+    let (title, body) = (format!("t{id}"), format!("b{id}"));
+    let (summary, translation) = (published("s", id), published("t", id));
     record_batch!(
-        ("id", Int32, [2]),
-        ("title", Utf8, ["t2"]),
-        ("body", Utf8, ["b2"]),
-        ("language", Utf8, ["fr"]),
-        ("views", Int32, [21]),
-        ("summary", Utf8, ["s-0-1"]),
-        ("translation", Utf8, ["t-0-1"])
+        ("id", Int32, [id]),
+        ("title", Utf8, [title.as_str()]),
+        ("body", Utf8, [body.as_str()]),
+        ("language", Utf8, [language]),
+        ("views", Int32, [id * 10 + 1]),
+        ("summary", Utf8, [summary.as_str()]),
+        ("translation", Utf8, [translation.as_str()])
     )
     .unwrap()
 }
@@ -543,8 +550,9 @@ enum StatelessRowMove {
     StagedUpdate,
 }
 
-/// Move id 2, fragment 0 offset 1, into a new fragment with `write`.
-async fn move_id_2(dataset: &Dataset, write: StatelessRowMove) -> Result<Dataset> {
+/// Move `id`, still at its original address, into a new fragment with
+/// `write`.
+async fn move_row(dataset: &Dataset, id: i32, write: StatelessRowMove) -> Result<Dataset> {
     match write {
         StatelessRowMove::MergeInsert => {
             let mut builder =
@@ -554,7 +562,7 @@ async fn move_id_2(dataset: &Dataset, write: StatelessRowMove) -> Result<Dataset
                 .when_not_matched(WhenNotMatched::DoNothing);
             let (dataset, _) = builder
                 .try_build()?
-                .execute_batches(vec![upsert_of_id_2()])
+                .execute_batches(vec![upsert_of(id)])
                 .await?;
             Ok(dataset.as_ref().clone())
         }
@@ -565,20 +573,24 @@ async fn move_id_2(dataset: &Dataset, write: StatelessRowMove) -> Result<Dataset
             };
             let appended = InsertBuilder::new(Arc::new(dataset.clone()))
                 .with_params(&append)
-                .execute_uncommitted(vec![upsert_of_id_2()])
+                .execute_uncommitted(vec![upsert_of(id)])
                 .await?;
             let Operation::Append { fragments } = appended.operation else {
                 panic!("an insert stages an Append, not {:?}", appended.operation);
             };
-            let source = dataset
-                .get_fragment(0)
+            let source = RowAddress::from(original_addr(id));
+            let (removed_fragment_ids, updated_fragments) = match dataset
+                .get_fragment(source.fragment_id() as usize)
                 .unwrap()
-                .extend_deletions([1])
+                .extend_deletions([source.row_offset()])
                 .await?
-                .unwrap();
+            {
+                Some(updated) => (vec![], vec![updated.metadata().clone()]),
+                None => (vec![u64::from(source.fragment_id())], vec![]),
+            };
             let operation = Operation::Update {
-                removed_fragment_ids: vec![],
-                updated_fragments: vec![source.metadata().clone()],
+                removed_fragment_ids,
+                updated_fragments,
                 new_fragments: fragments,
                 fields_modified: vec![],
                 compacted_sstables: vec![],
@@ -602,7 +614,7 @@ async fn test_stateless_row_move_is_refused_where_an_ordinary_flag_is_true(
     #[values(false, true)] stable_row_ids: bool,
 ) {
     let (dataset, _) = published_articles(stable_row_ids, &[2]).await;
-    let error = move_id_2(&dataset, write).await.unwrap_err();
+    let error = move_row(&dataset, 2, write).await.unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }), "{error}");
     assert!(
         error.to_string().contains(
@@ -625,7 +637,7 @@ async fn test_stateless_row_move_unassigns_dependent_flags(
 ) {
     // The ordinary flag is true only on a fragment the write does not touch.
     let (dataset, flags) = published_articles(stable_row_ids, &[4]).await;
-    let dataset = move_id_2(&dataset, write).await.unwrap();
+    let dataset = move_row(&dataset, 2, write).await.unwrap();
 
     let transaction = dataset.read_transaction().await.unwrap().unwrap();
     assert!(
@@ -663,4 +675,142 @@ async fn test_stateless_row_move_unassigns_dependent_flags(
         true_ids(&dataset, flags.reviewed).await,
         BTreeSet::from([4])
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_update_leaves_no_flag_state_where_it_moved_rows_from(
+    #[values(StatelessRowMove::MergeInsert, StatelessRowMove::StagedUpdate)]
+    write: StatelessRowMove,
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    // id 2 holds the only true ordinary flag of fragment 0.
+    let (dataset, flags) = published_articles(stable_row_ids, &[2]).await;
+    let dataset = update(&dataset, "id = 2", "views", "views + 1").await;
+    let moved_to = addrs_by_id(&dataset).await[&2];
+    assert_eq!(RowAddress::from(moved_to).fragment_id(), 3);
+    for flag_id in [flags.reviewed, flags.summary, flags.translation] {
+        let true_rows = dataset.cell_flag_true_rows(flag_id).unwrap();
+        assert!(true_rows.contains(moved_to), "flag {flag_id}");
+        assert!(!true_rows.contains(original_addr(2)), "flag {flag_id}");
+    }
+
+    // Nothing true is left in fragment 0, so a write that cannot move state
+    // may move its other row.
+    let dataset = move_row(&dataset, 1, write).await.unwrap();
+    assert_ne!(
+        RowAddress::from(addrs_by_id(&dataset).await[&1]).fragment_id(),
+        0
+    );
+    // The moved row is all of its new fragment.
+    assert_eq!(
+        dataset.cell_flag_true_rows(flags.reviewed).unwrap(),
+        full(&[3])
+    );
+}
+
+#[tokio::test]
+async fn test_update_keeping_dependent_flags_needs_every_version_since_read() {
+    let (stale, flags) = flagged_articles(false).await;
+    let groups = stage_all(&stale, "summary", "s").await;
+    let publication = commit_replacement(&stale, groups, set_true(flags.summary, full(&[0, 1, 2])))
+        .await
+        .unwrap();
+    let mut head = publication.clone();
+    head.update_config([("a", "1")]).await.unwrap();
+
+    // Cleanup could remove the publication's version. Without it the update
+    // would copy the published flags onto the unpublished values it read.
+    let missing = publication.version().version;
+    head.object_store
+        .delete(&publication.manifest_location.path)
+        .await
+        .unwrap();
+    let error = update_builder(&stale, "id = 2", "views", "views + 1")
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::IncompatibleTransaction { .. }),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("could not all be loaded (missing: [{missing}])")),
+        "{error}"
+    );
+    let mut latest = stale.clone();
+    latest.checkout_latest().await.unwrap();
+    assert_eq!(latest.version().version, head.version().version);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_row_move_retries_over_flag_registered_after_its_read(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let stale = articles(stable_row_ids).await;
+    let mut dataset = stale.clone();
+    let reviewed = dataset
+        .register_cell_flag("title", "reviewed", CellFlagOptions::default())
+        .await
+        .unwrap()
+        .flag_id;
+    let head = set_reviewed(&dataset, reviewed, &[2]).await;
+
+    // The update read no flag, so it lists no moved rows: committing would
+    // leave the flag behind on the row it deletes.
+    let error = update_builder(&stale, "id = 2", "views", "views + 1")
+        .conflict_retries(0)
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::TooMuchWriteContention { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("Attempted 0 retries"), "{error}");
+    let error = move_row(&stale, 2, StatelessRowMove::StagedUpdate)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains(&format!(
+            "the Update moves rows out of fragment 0 without their cell flag state, and cell \
+             flag 'reviewed' (flag id {reviewed}) on 'title' (field id 1) is true there but was \
+             registered after version {}",
+            stale.version().version
+        )),
+        "{error}"
+    );
+    // A merge_insert retries too, and from the latest version is refused,
+    // since it never moves flag state.
+    let error = move_row(&stale, 2, StatelessRowMove::MergeInsert)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("moves rows out of fragment 0, where the flag is true"),
+        "{error}"
+    );
+    let mut latest = stale.clone();
+    latest.checkout_latest().await.unwrap();
+    assert_eq!(latest.version().version, head.version().version);
+
+    // The retry reads the registration and moves the flag with the row.
+    let dataset = update(&stale, "id = 2", "views", "views + 1").await;
+    assert_eq!(dataset.version().version, head.version().version + 1);
+    let moved_to = addrs_by_id(&dataset).await[&2];
+    assert_eq!(RowAddress::from(moved_to).fragment_id(), 3);
+    assert_eq!(dataset.cell_flag_true_rows(reviewed).unwrap(), full(&[3]));
 }

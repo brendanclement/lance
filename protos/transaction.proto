@@ -62,16 +62,19 @@ message Transaction {
     /* Rows a row-moving update rewrote into a fragment it adds, named by the
      * path of its first data file because fragment ids are assigned at
      * commit. `offsets` is a portable RoaringBitmap of physical offsets in
-     * that fragment; `source_row_addrs` holds the row address each of those
-     * rows had before the move, in ascending offset order. The commit copies
-     * the head's state of every ordinary flag from each source row, and of
-     * every dependent flag whose watched fields `moved_rows_written_fields`
-     * does not name.
+     * that fragment; `source_row_addrs` is a portable RoaringTreemap of the
+     * row addresses those rows had before the move, paired with `offsets` by
+     * rank. Sources out of ascending order take several entries for one
+     * fragment. The commit copies the head's state of every ordinary flag
+     * from each source row, and of every dependent flag whose watched fields
+     * `moved_rows_written_fields` does not name, then clears every flag on
+     * the source rows, which the update deletes.
      */
     message MovedRows {
+      reserved 3;
       string fragment_path = 1;
       bytes offsets = 2;
-      repeated uint64 source_row_addrs = 3;
+      bytes source_row_addrs = 4;
     }
     // Top-level field ids, wrapped so that an empty list differs from none.
     message WrittenFields {

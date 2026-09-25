@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{CellFlagDefinition, Fragment};
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::dataset::transaction::{
     CellFlagChanges, CellFlagMovedRows, CellFlagRegistration, Operation, TransactionBuilder,
@@ -321,12 +321,13 @@ impl Dataset {
 /// Pair every row a row-moving update wrote into `new_fragments` with the
 /// address it was read from, for the commit to move its flag state.
 ///
-/// `source_row_addrs` lists the read addresses in write order: the new
-/// fragments in order, each from its first offset, hold exactly the rows the
-/// update read.
+/// `source_row_addrs` yields the `source_row_count` read addresses in write
+/// order: the new fragments in order, each from its first offset, hold exactly
+/// the rows the update read.
 pub(crate) fn moved_cell_flag_rows(
     new_fragments: &[Fragment],
-    source_row_addrs: Vec<u64>,
+    source_row_count: u64,
+    mut source_row_addrs: impl Iterator<Item = Result<u64>>,
 ) -> Result<Vec<CellFlagMovedRows>> {
     // Ids are assigned at commit, so fragments are named by position here.
     let mut row_counts = Vec::with_capacity(new_fragments.len());
@@ -345,35 +346,160 @@ pub(crate) fn moved_cell_flag_rows(
         row_counts.push(physical_rows);
     }
     let written_rows: u64 = row_counts.iter().copied().map(u64::from).sum();
-    if written_rows != source_row_addrs.len() as u64 {
+    if written_rows != source_row_count {
         return Err(Error::internal(format!(
-            "the update wrote {written_rows} rows into {} new fragments but read {} rows, so the \
-             moved rows cannot be matched to the addresses they were read from",
+            "the update wrote {written_rows} rows into {} new fragments but read \
+             {source_row_count} rows, so the moved rows cannot be matched to the addresses they \
+             were read from",
             new_fragments.len(),
-            source_row_addrs.len()
         )));
     }
-    let mut source_row_addrs = source_row_addrs.into_iter();
-    new_fragments
-        .iter()
-        .zip(row_counts)
-        .enumerate()
-        .map(|(position, (fragment, physical_rows))| {
-            let first_file = fragment.files.first().ok_or_else(|| {
-                Error::internal(format!(
-                    "new fragment {position} written by the update has no data file"
-                ))
-            })?;
-            let mut offsets = RoaringBitmap::new();
-            offsets.insert_range(0..physical_rows);
-            Ok(CellFlagMovedRows {
-                fragment_path: first_file.path.clone(),
-                offsets,
-                source_row_addrs: source_row_addrs
-                    .by_ref()
-                    .take(physical_rows as usize)
-                    .collect(),
+    let mut moved_rows = Vec::with_capacity(new_fragments.len());
+    let mut paired_rows = 0_u64;
+    for (position, (fragment, physical_rows)) in new_fragments.iter().zip(row_counts).enumerate() {
+        let first_file = fragment.files.first().ok_or_else(|| {
+            Error::internal(format!(
+                "new fragment {position} written by the update has no data file"
+            ))
+        })?;
+        let empty_entry = || CellFlagMovedRows {
+            fragment_path: first_file.path.clone(),
+            offsets: RoaringBitmap::new(),
+            source_row_addrs: RoaringTreemap::new(),
+        };
+        let mut entry = empty_entry();
+        let mut previous_source = None;
+        for offset in 0..physical_rows {
+            let Some(source) = source_row_addrs.next() else {
+                return Err(Error::internal(format!(
+                    "the update read {source_row_count} rows, but only {paired_rows} source \
+                     addresses could be listed"
+                )));
+            };
+            let source = source?;
+            paired_rows += 1;
+            // Offsets and sources pair by rank, so a source below the one
+            // before it starts another entry.
+            if previous_source.is_some_and(|previous| source <= previous) {
+                moved_rows.push(std::mem::replace(&mut entry, empty_entry()));
+            }
+            previous_source = Some(source);
+            entry
+                .offsets
+                .try_push(offset)
+                .and_then(|()| entry.source_row_addrs.try_push(source))
+                .map_err(|_| {
+                    Error::internal(format!(
+                        "offset {offset} or source address {source} of new fragment {position} \
+                         is not above the ones listed before it"
+                    ))
+                })?;
+        }
+        if !entry.offsets.is_empty() {
+            moved_rows.push(entry);
+        }
+    }
+    Ok(moved_rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use lance_core::utils::address::RowAddress;
+    use lance_file::version::ConcreteFileVersion;
+    use rstest::rstest;
+
+    use super::*;
+
+    fn addr(fragment_id: u32, offset: u32) -> u64 {
+        RowAddress::new_from_parts(fragment_id, offset).into()
+    }
+
+    fn new_fragment(path: &str, physical_rows: usize) -> Fragment {
+        Fragment::new(0)
+            .with_file(path, vec![0], vec![0], ConcreteFileVersion::V2_0, None)
+            .with_physical_rows(physical_rows)
+    }
+
+    /// `(fragment_path, offsets, sources)` of each entry.
+    fn entries(moved_rows: &[CellFlagMovedRows]) -> Vec<(&str, Vec<u32>, Vec<u64>)> {
+        moved_rows
+            .iter()
+            .map(|moved| {
+                (
+                    moved.fragment_path.as_str(),
+                    moved.offsets.iter().collect(),
+                    moved.source_row_addrs.iter().collect(),
+                )
             })
-        })
-        .collect()
+            .collect()
+    }
+
+    #[rstest]
+    #[case::split_across_fragments(
+        &[2, 3],
+        vec![addr(0, 1), addr(0, 4), addr(1, 0), addr(1, 2), addr(2, 7)],
+        vec![
+            ("a.lance", vec![0, 1], vec![addr(0, 1), addr(0, 4)]),
+            ("b.lance", vec![0, 1, 2], vec![addr(1, 0), addr(1, 2), addr(2, 7)]),
+        ]
+    )]
+    #[case::descending_source_starts_an_entry(
+        &[3, 1],
+        vec![addr(3, 0), addr(1, 5), addr(1, 6), addr(0, 2)],
+        vec![
+            ("a.lance", vec![0], vec![addr(3, 0)]),
+            ("a.lance", vec![1, 2], vec![addr(1, 5), addr(1, 6)]),
+            ("b.lance", vec![0], vec![addr(0, 2)]),
+        ]
+    )]
+    fn moved_rows_pair_offsets_with_sources_in_write_order(
+        #[case] physical_rows: &[usize],
+        #[case] sources: Vec<u64>,
+        #[case] expected: Vec<(&str, Vec<u32>, Vec<u64>)>,
+    ) {
+        let fragments: Vec<Fragment> = ["a.lance", "b.lance"]
+            .into_iter()
+            .zip(physical_rows)
+            .map(|(path, rows)| new_fragment(path, *rows))
+            .collect();
+        let moved_rows = moved_cell_flag_rows(
+            &fragments,
+            sources.len() as u64,
+            sources.into_iter().map(Ok),
+        )
+        .unwrap();
+        assert_eq!(entries(&moved_rows), expected);
+    }
+
+    #[rstest]
+    #[case::fewer_rows_read(
+        vec![new_fragment("a.lance", 2), new_fragment("b.lance", 3)],
+        4,
+        "the update wrote 5 rows into 2 new fragments but read 4 rows"
+    )]
+    #[case::fewer_sources_listed(
+        vec![new_fragment("a.lance", 2), new_fragment("b.lance", 3)],
+        5,
+        "the update read 5 rows, but only 4 source addresses could be listed"
+    )]
+    #[case::unknown_row_count(
+        vec![new_fragment("a.lance", 2), Fragment::new(0).with_file("b.lance", vec![0], vec![0], ConcreteFileVersion::V2_0, None)],
+        4,
+        "new fragment 1 written by the update has no physical row count"
+    )]
+    #[case::no_data_file(
+        vec![new_fragment("a.lance", 2), Fragment::new(0).with_physical_rows(2)],
+        4,
+        "new fragment 1 written by the update has no data file"
+    )]
+    fn moved_rows_that_cannot_be_paired_are_an_error(
+        #[case] fragments: Vec<Fragment>,
+        #[case] source_row_count: u64,
+        #[case] expected: &str,
+    ) {
+        let sources = (0..4).map(|offset| Ok(addr(0, offset)));
+        let error = moved_cell_flag_rows(&fragments, source_row_count, sources).unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }), "{error}");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }

@@ -564,8 +564,11 @@ impl UpdateJob {
         // stage (`then`, `buffered`, the writer) keeps batch and row order, so
         // the new fragments hold the rows in capture order. The row id
         // rechunk above relies on the same.
-        let source_row_addrs = captured_row_ids.row_addrs_in_capture_order(row_id_index)?;
-        let moved_rows = moved_cell_flag_rows(new_fragments, source_row_addrs)?;
+        let moved_rows = moved_cell_flag_rows(
+            new_fragments,
+            captured_row_ids.num_rows(),
+            captured_row_ids.row_addrs_in_capture_order(row_id_index)?,
+        )?;
         let schema = self.dataset.schema();
         let mut written_fields = self
             .updates
