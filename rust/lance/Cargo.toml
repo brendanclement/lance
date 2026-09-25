@@ -332,5 +332,13 @@ harness = false
 name = "hamming"
 harness = false
 
+[[bench]]
+name = "cell_flags_regression"
+harness = false
+
+[[bench]]
+name = "dependent_cell_flags"
+harness = false
+
 [lints]
 workspace = true
