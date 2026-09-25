@@ -1,0 +1,15 @@
+diff --git a/rust/lance/src/dataset.rs b/rust/lance/src/dataset.rs
+index ec9f113cd..00def55d4 100644
+--- a/rust/lance/src/dataset.rs
++++ b/rust/lance/src/dataset.rs
+@@ -4390,3 +4390,10 @@ async fn has_any_entry(object_store: &ObjectStore, prefix: &Path) -> Result<bool
+ 
+ #[cfg(test)]
+ mod tests;
++
++/// Layout control for the cell flag prototype benchmarks: an unused function,
++/// so the only difference from the baseline build is code placement.
++#[doc(hidden)]
++pub fn __cell_flag_benchmark_layout_control(value: u64) -> u64 {
++    std::hint::black_box(value).wrapping_mul(0x9E37_79B9_7F4A_7C15)
++}
