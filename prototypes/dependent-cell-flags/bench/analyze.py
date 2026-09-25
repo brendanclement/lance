@@ -811,6 +811,14 @@ def section_all(groups):
     return "\n".join(lines)
 
 
+def display_path(results_dir):
+    """`results_dir` relative to this script's directory when it is inside it."""
+    try:
+        return results_dir.resolve().relative_to(Path(__file__).resolve().parent)
+    except ValueError:
+        return results_dir
+
+
 def analyze(results_dir):
     records, env, runs = load(results_dir)
     if not records:
@@ -819,7 +827,7 @@ def analyze(results_dir):
     groups = Groups(records)
     parts = [
         f"## Results: {scale}",
-        f"Source: `{results_dir}`",
+        f"Source: `{display_path(results_dir)}`",
         section_environment(env, runs, records),
         section_regression(groups),
         section_flag_overhead(groups),
