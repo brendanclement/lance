@@ -33,7 +33,7 @@ use lance_file::version::LanceFileVersion;
 
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
-use lance_select::RowAddrTreeMap;
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
@@ -52,6 +52,7 @@ use roaring::RoaringBitmap;
 
 use super::ObjectStore;
 use crate::Dataset;
+use crate::dataset::cell_flag::{DependencyConflictPolicy, PublicationReport};
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
@@ -1529,6 +1530,17 @@ fn ensure_saw_every_version_since_read(
     ))
 }
 
+/// Whether a publication's rebase deferred every group, leaving nothing to
+/// commit.
+fn deferred_everything(transaction: &Transaction, report: &PublicationReport) -> bool {
+    matches!(&transaction.operation, Operation::DataReplacement { replacements } if replacements.is_empty())
+        && !report.deferred_groups.is_empty()
+        && transaction
+            .cell_flag_changes
+            .as_deref()
+            .is_none_or(|changes| changes.updates.iter().all(|update| update.rows.is_empty()))
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
@@ -1542,6 +1554,38 @@ pub(crate) async fn commit_transaction(
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let (manifest, location, _) = commit_transaction_with_report(
+        dataset,
+        object_store,
+        commit_handler,
+        transaction,
+        write_config,
+        commit_config,
+        retry_timeout,
+        manifest_naming_scheme,
+        affected_rows,
+        DependencyConflictPolicy::Reject,
+    )
+    .await?;
+    Ok((manifest, location))
+}
+
+/// [`commit_transaction`] under `policy`, also reporting what a publication
+/// committed and deferred. When every group is deferred nothing is written,
+/// and the head's manifest and location are returned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn commit_transaction_with_report(
+    dataset: &Dataset,
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+    commit_config: &CommitConfig,
+    retry_timeout: Duration,
+    manifest_naming_scheme: ManifestNamingScheme,
+    affected_rows: Option<&RowAddrTreeMap>,
+    policy: DependencyConflictPolicy,
+) -> Result<(Manifest, ManifestLocation, PublicationReport)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
@@ -1590,6 +1634,10 @@ pub(crate) async fn commit_transaction(
         ));
     }
     ensure_cell_flags_registered_at_read_version(&read_version_dataset.manifest, &transaction)?;
+    if policy == DependencyConflictPolicy::Skip {
+        conflict_resolver::ensure_skip_eligible(&read_version_dataset.manifest, &transaction)?;
+    }
+    let mut report = PublicationReport::new(read_version);
     // Every concurrent version checked across attempts, in order.
     let mut seen_versions: Vec<u64> = Vec::new();
 
@@ -1623,17 +1671,26 @@ pub(crate) async fn commit_transaction(
             // Use small amount of backoff to handle transactions that all
             // started at exact same time better.
 
-            let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+            let mut rebase = TransactionRebase::try_new_with_policy(
+                &original_dataset,
+                transaction,
+                affected_rows,
+                policy,
+            )
+            .await?;
 
             for (other_version, other_transaction) in other_transactions.iter() {
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 
-            transaction = rebase.finish(&dataset).await?;
+            let deferrals;
+            (transaction, deferrals) = rebase.finish_with_report(&dataset).await?;
+            report.check_deferred_groups(&other_transactions);
+            report.record(deferrals);
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
         }
+        report.checked_version = dataset.manifest.version;
         // After the rebase, so a stale transaction fails as a conflict rather
         // than being refused for differences a concurrent commit introduced.
         ensure_operation_allowed_with_cell_flags(&dataset.manifest, &transaction)?;
@@ -1643,6 +1700,13 @@ pub(crate) async fn commit_transaction(
                 dataset.manifest.version,
                 &seen_versions,
             )?;
+        }
+        if deferred_everything(&transaction, &report) {
+            return Ok((
+                dataset.manifest.as_ref().clone(),
+                dataset.manifest_location.clone(),
+                report,
+            ));
         }
         // Before encoding, so the transaction file records the clears.
         record_derived_cell_flag_invalidations(&dataset.manifest, &mut transaction)?;
@@ -1745,7 +1809,8 @@ pub(crate) async fn commit_transaction(
                     commit_config.skip_auto_cleanup,
                 )
                 .await;
-                return Ok((manifest, manifest_location));
+                report.record_commit(manifest.version, &transaction);
+                return Ok((manifest, manifest_location, report));
             }
             Err(CommitError::CommitConflict) => {
                 // The store may have applied this attempt's write and still
@@ -1777,7 +1842,8 @@ pub(crate) async fn commit_transaction(
                             commit_config.skip_auto_cleanup,
                         )
                         .await;
-                        return Ok((committed_manifest, location));
+                        report.record_commit(committed_manifest.version, &transaction);
+                        return Ok((committed_manifest, location, report));
                     }
                     // Confirmed loss: another writer owns the version (or,
                     // for handlers that detect conflicts before writing,
@@ -1850,7 +1916,8 @@ pub(crate) async fn commit_transaction(
                         if commit_handler.propagate_commit_error_after_success() {
                             return Err(err);
                         }
-                        return Ok((committed_manifest, location));
+                        report.record_commit(committed_manifest.version, &transaction);
+                        return Ok((committed_manifest, location, report));
                     }
                     CommitOutcome::Foreign | CommitOutcome::Absent => {
                         // The attempt certainly did not land; its

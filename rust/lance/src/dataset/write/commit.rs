@@ -13,13 +13,14 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
-use crate::io::commit::default_commit_retry_timeout;
+use crate::io::commit::{commit_transaction_with_report, default_commit_retry_timeout};
 use crate::{
     Dataset, Error, Result,
     dataset::{
         ManifestWriteConfig, ReadParams,
         builder::DatasetBuilder,
-        commit_detached_transaction, commit_new_dataset, commit_transaction,
+        cell_flag::{DependencyConflictPolicy, PublicationReport, PublicationResult},
+        commit_detached_transaction, commit_new_dataset,
         refs::Refs,
         transaction::{Operation, Transaction},
     },
@@ -54,6 +55,7 @@ pub struct CommitBuilder<'a> {
     timeout: Option<Duration>,
     /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
     migration_next_row_id: Option<u64>,
+    dependency_conflict_policy: DependencyConflictPolicy,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -78,6 +80,7 @@ impl<'a> CommitBuilder<'a> {
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
+            dependency_conflict_policy: DependencyConflictPolicy::default(),
         }
     }
 
@@ -277,7 +280,76 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Choose what a publication, a `DataReplacement` that sets dependent cell
+    /// flags true, does when a transaction committed since its read version
+    /// makes some of its rows or groups stale or unsafe to install. See
+    /// [`crate::dataset::cell_flag::PublicationReport`] for the rules.
+    ///
+    /// [`DependencyConflictPolicy::Skip`] needs [`Self::execute_with_report`],
+    /// which returns what was deferred.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{CommitBuilder, DependencyConflictPolicy};
+    /// # use lance::dataset::cell_flag::DeferralReason;
+    /// # use lance::dataset::transaction::Transaction;
+    /// # use lance_select::RowAddrTreeMap;
+    /// # async fn example(
+    /// #     dataset: Arc<Dataset>,
+    /// #     publication: Transaction,
+    /// #     flag_id: u32,
+    /// # ) -> Result<RowAddrTreeMap> {
+    /// let result = CommitBuilder::new(dataset)
+    ///     .with_dependency_conflict_policy(DependencyConflictPolicy::Skip)
+    ///     .execute_with_report(publication)
+    ///     .await?;
+    /// let to_recompute = result
+    ///     .report
+    ///     .deferred_rows_of(flag_id, DeferralReason::InputChanged);
+    /// # Ok(to_recompute)
+    /// # }
+    /// ```
+    pub fn with_dependency_conflict_policy(mut self, policy: DependencyConflictPolicy) -> Self {
+        self.dependency_conflict_policy = policy;
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
+        if self.dependency_conflict_policy == DependencyConflictPolicy::Skip {
+            return Err(Error::invalid_input(
+                "DependencyConflictPolicy::Skip can commit part of a publication, and only \
+                 CommitBuilder::execute_with_report returns which part; use it instead of \
+                 CommitBuilder::execute",
+            ));
+        }
+        Ok(self.execute_with_timeout(transaction).await?.dataset)
+    }
+
+    /// Like [`Self::execute`], also returning a [`PublicationReport`]: what a
+    /// publication committed and what it deferred under the policy set with
+    /// [`Self::with_dependency_conflict_policy`]. When every group is
+    /// deferred, nothing is committed and the returned dataset is the head
+    /// the commit was checked against.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::CommitBuilder;
+    /// # use lance::dataset::transaction::Transaction;
+    /// # async fn example(dataset: Arc<Dataset>, publication: Transaction) -> Result<bool> {
+    /// let result = CommitBuilder::new(dataset)
+    ///     .execute_with_report(publication)
+    ///     .await?;
+    /// let committed = result.report.committed_version == Some(result.dataset.version().version);
+    /// # Ok(committed)
+    /// # }
+    /// ```
+    pub async fn execute_with_report(self, transaction: Transaction) -> Result<PublicationResult> {
+        self.execute_with_timeout(transaction).await
+    }
+
+    async fn execute_with_timeout(self, transaction: Transaction) -> Result<PublicationResult> {
         let timeout = self.timeout;
         if let Some(t) = timeout
             && t.is_zero()
@@ -303,7 +375,7 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+    async fn execute_inner(self, transaction: Transaction) -> Result<PublicationResult> {
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -428,6 +500,20 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
+        let is_rebased = dest.dataset().is_some() && !self.detached;
+        if self.dependency_conflict_policy == DependencyConflictPolicy::Skip && !is_rebased {
+            return Err(Error::invalid_input(format!(
+                "DependencyConflictPolicy::Skip needs a commit that is rebased onto the head of an \
+                 existing dataset, not a {} commit of {}",
+                if self.detached {
+                    "detached"
+                } else {
+                    "creating"
+                },
+                transaction.operation.name()
+            )));
+        }
+        let mut report = PublicationReport::new(transaction.read_version);
         let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
@@ -446,7 +532,7 @@ impl<'a> CommitBuilder<'a> {
                 )
                 .await?
             } else {
-                commit_transaction(
+                let (manifest, location, rebased_report) = commit_transaction_with_report(
                     dataset,
                     object_store.as_ref(),
                     commit_handler.as_ref(),
@@ -456,8 +542,11 @@ impl<'a> CommitBuilder<'a> {
                     self.retry_timeout,
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
+                    self.dependency_conflict_policy,
                 )
-                .await?
+                .await?;
+                report = rebased_report;
+                (manifest, location)
             }
         } else if self.detached {
             // I think we may eventually want this, and we can probably handle it, but leaving a TODO for now
@@ -479,6 +568,11 @@ impl<'a> CommitBuilder<'a> {
             .await?
         };
 
+        if !is_rebased {
+            report.checked_version = transaction.read_version;
+            report.record_commit(manifest.version, &transaction);
+        }
+
         info!(
             target: TRACE_DATASET_EVENTS,
             event=DATASET_COMMITTED_EVENT,
@@ -498,14 +592,15 @@ impl<'a> CommitBuilder<'a> {
                 } else {
                     Default::default()
                 };
-                Ok(Dataset {
+                let dataset = Dataset {
                     manifest: Arc::new(manifest),
                     manifest_location,
                     session,
                     fragment_bitmap,
                     base_object_stores,
                     ..dataset.as_ref().clone()
-                })
+                };
+                Ok(PublicationResult { dataset, report })
             }
             WriteDestination::Uri(uri) => {
                 let refs = Refs::new(
@@ -518,7 +613,7 @@ impl<'a> CommitBuilder<'a> {
                     },
                 );
 
-                Ok(Dataset {
+                let dataset = Dataset {
                     object_store,
                     base: base_path,
                     uri: uri.to_string(),
@@ -534,7 +629,8 @@ impl<'a> CommitBuilder<'a> {
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
                     base_object_stores: Default::default(),
-                })
+                };
+                Ok(PublicationResult { dataset, report })
             }
         }
     }

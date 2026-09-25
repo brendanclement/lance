@@ -35,6 +35,14 @@ use crate::dataset::transaction::{
 use crate::dataset::write::CommitBuilder;
 use crate::{Dataset, Error, Result};
 
+mod publication;
+
+pub use publication::{
+    DeferralReason, DeferredGroup, DeferredRows, DependencyConflictPolicy, PublicationReport,
+    PublicationResult,
+};
+pub(crate) use publication::{PublicationDeferrals, invalidated_rows};
+
 /// How a cell flag reacts to writes and reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CellFlagOptions {

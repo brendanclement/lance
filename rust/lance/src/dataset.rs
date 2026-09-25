@@ -118,6 +118,7 @@ mod utils;
 pub(crate) mod versions;
 pub mod write;
 
+pub use cell_flag::{DependencyConflictPolicy, PublicationReport, PublicationResult};
 pub use data_file::DataFileTarget;
 pub use data_file_part::DataFilePart;
 
