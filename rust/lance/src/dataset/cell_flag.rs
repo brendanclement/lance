@@ -123,7 +123,7 @@ pub use publication::{
     DeferralReason, DeferredGroup, DeferredRows, DependencyConflictPolicy, PublicationReport,
     PublicationResult,
 };
-pub(crate) use publication::{PublicationDeferrals, invalidated_rows, removed_fragments};
+pub(crate) use publication::{PublicationDeferrals, input_changed_rows, removed_fragments};
 
 /// How a cell flag reacts to writes and reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
