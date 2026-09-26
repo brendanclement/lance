@@ -340,5 +340,9 @@ harness = false
 name = "dependent_cell_flags"
 harness = false
 
+[[bench]]
+name = "cell_flags_scan_counters"
+harness = false
+
 [lints]
 workspace = true
