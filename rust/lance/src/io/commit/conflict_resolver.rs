@@ -174,17 +174,21 @@ impl<'a> TransactionRebase<'a> {
             transaction,
             affected_rows,
             DependencyConflictPolicy::Reject,
+            &dataset.manifest,
         )
         .await
     }
 
     /// Like [`Self::try_new`], with `policy` deciding what a publication does
-    /// with rows and groups a concurrent transaction made unsafe.
+    /// with rows and groups a concurrent transaction made unsafe, and `head`,
+    /// the latest version loaded, resolving the cell flags concurrent
+    /// transactions set that were registered after the read version.
     pub(crate) async fn try_new_with_policy(
         dataset: &Dataset,
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
         policy: DependencyConflictPolicy,
+        head: &Manifest,
     ) -> Result<Self> {
         let mut rebase =
             Self::try_new_without_cell_flags(dataset, transaction, affected_rows).await?;
@@ -204,6 +208,7 @@ impl<'a> TransactionRebase<'a> {
         if publishes {
             rebase.cell_flags.publication = publication::Publication::try_new(
                 &read_dataset.manifest,
+                head,
                 &rebase.transaction,
                 &rebase.initial_fragments,
                 policy,

@@ -2049,7 +2049,7 @@ impl Refresh {
     /// computed from its input as this file holds it, or as `read` shows it
     /// when the file does not write the input, unless `reused` holds its
     /// value and the file does not also assign the input there. Other
-    /// offsets are copied.
+    /// offsets are copied, so an output given none is written unassigned.
     async fn stage(
         &mut self,
         read: &Dataset,
@@ -2092,6 +2092,9 @@ impl Refresh {
             }
             file.insert(column.to_string(), column_values);
 
+            if offsets.is_empty() {
+                continue;
+            }
             let mut rows = RowAddrTreeMap::new();
             if offsets.len() == physical_rows as usize {
                 rows.insert_fragment(fragment_id);
@@ -3674,6 +3677,311 @@ async fn test_flag_registered_after_the_read_is_resolved(#[case] registration: L
     assert_eq!(
         column_values(&done, "translation", None).await[0],
         (1, Some(translated.to_string()))
+    );
+}
+
+/// The flags registered after the refresh of
+/// [`test_late_flag_on_an_unrelated_output_changes_no_input`] reads.
+#[derive(Debug, Clone, Copy)]
+enum LateFlags {
+    /// Keywords', which the head knows.
+    Keywords,
+    /// Keywords', dropped again before the publication commits, so that no
+    /// registry the check has knows it.
+    KeywordsDropped,
+    /// Summary's and then keywords', which the head knows.
+    SummaryAndKeywords,
+}
+
+impl LateFlags {
+    fn columns(self) -> &'static [&'static str] {
+        match self {
+            Self::Keywords | Self::KeywordsDropped => &["keywords"],
+            Self::SummaryAndKeywords => &["summary", "keywords"],
+        }
+    }
+}
+
+/// Where the competitor of
+/// [`test_late_flag_on_an_unrelated_output_changes_no_input`] publishes
+/// summary. Its file on fragment 0 writes summary either way.
+#[derive(Debug, Clone, Copy)]
+enum SummaryPublished {
+    /// On id 3, of fragment 0.
+    SameFragment,
+    /// On id 4, of fragment 1, so that fragment 0's summaries are only copied.
+    OtherFragment,
+}
+
+/// How the refresh of [`test_late_flag_on_an_unrelated_output_changes_no_input`]
+/// commits, after the competitor.
+#[derive(Debug, Clone, Copy)]
+enum LateCommit {
+    Reject,
+    Skip,
+    /// Under `Skip`, with the competitor committed while the first attempt
+    /// writes its manifest. That attempt deferred fragment 0's group to a
+    /// translation of id 3 published before the late registrations, so only
+    /// the check of the deferred group sees the competitor.
+    SkipAfterDeferral,
+}
+
+impl LateCommit {
+    fn policy(self) -> DependencyConflictPolicy {
+        match self {
+            Self::Reject => Reject,
+            Self::Skip | Self::SkipAfterDeferral => Skip,
+        }
+    }
+}
+
+/// Translation is computed from summary. After the refresh reads, keywords,
+/// and possibly summary, which were plain there, get dependent flags,
+/// unmasked, so that registering them clears nothing. A competitor's
+/// file on fragment 0 writes summary and keywords: it publishes id 1's
+/// keywords, and summary on id 3 or only on fragment 1. The read version's
+/// registry does not know the keywords flag, but the head's resolves it
+/// unless it was dropped again, and then no flag's output but summary's can
+/// be summary: its flag, which the competitor also publishes, is the field's
+/// only dependent flag. Either way the staged translations of ids 1 and 2
+/// keep their input: they are published, or stay reusable in their deferred
+/// group, alongside the competitor's values and flags.
+#[rstest]
+#[case::keywords_reject(
+    LateFlags::Keywords,
+    SummaryPublished::SameFragment,
+    LateCommit::Reject
+)]
+#[case::keywords_skip(LateFlags::Keywords, SummaryPublished::SameFragment, LateCommit::Skip)]
+#[case::keywords_dropped_reject(
+    LateFlags::KeywordsDropped,
+    SummaryPublished::SameFragment,
+    LateCommit::Reject
+)]
+#[case::keywords_dropped_copied_skip(
+    LateFlags::KeywordsDropped,
+    SummaryPublished::OtherFragment,
+    LateCommit::Skip
+)]
+#[case::summary_and_keywords_skip(
+    LateFlags::SummaryAndKeywords,
+    SummaryPublished::SameFragment,
+    LateCommit::Skip
+)]
+#[case::summary_and_keywords_copied_reject(
+    LateFlags::SummaryAndKeywords,
+    SummaryPublished::OtherFragment,
+    LateCommit::Reject
+)]
+#[case::keywords_after_deferral(
+    LateFlags::Keywords,
+    SummaryPublished::SameFragment,
+    LateCommit::SkipAfterDeferral
+)]
+#[case::summary_and_keywords_after_deferral(
+    LateFlags::SummaryAndKeywords,
+    SummaryPublished::SameFragment,
+    LateCommit::SkipAfterDeferral
+)]
+#[tokio::test]
+async fn test_late_flag_on_an_unrelated_output_changes_no_input(
+    #[case] late: LateFlags,
+    #[case] summary_published: SummaryPublished,
+    #[case] commit: LateCommit,
+) {
+    let after_deferral = matches!(commit, LateCommit::SkipAfterDeferral);
+    let mut read = computed_outputs(
+        3,
+        &[
+            ("summary", "body"),
+            ("translation", "summary"),
+            ("keywords", "body"),
+        ],
+    )
+    .await;
+    for column in late.columns() {
+        read.drop_cell_flag(column, "ready").await.unwrap();
+    }
+    let translation = flag_of(&read, "translation");
+    let mut refresh = Refresh::default();
+    refresh
+        .stage(&read, 0, &[("translation", &[0, 1])], &StagedValues::new())
+        .await;
+    if after_deferral {
+        // Installed, so that the first attempt writes a manifest.
+        refresh
+            .stage(
+                &read,
+                1,
+                &[("translation", &[0, 1, 2])],
+                &StagedValues::new(),
+            )
+            .await;
+    }
+    let mut registered = read.clone();
+    let deferred_at = if after_deferral {
+        let mut newer = Refresh::default();
+        newer
+            .stage(&read, 0, &[("translation", &[2])], &StagedValues::new())
+            .await;
+        registered = newer.publish(&read, Reject).await.unwrap().dataset;
+        Some(registered.version().version)
+    } else {
+        None
+    };
+    for column in late.columns() {
+        registered
+            .register_cell_flag(
+                column,
+                "ready",
+                CellFlagOptions::default().with_clear_on_write(["body"]),
+            )
+            .await
+            .unwrap();
+        assert!(recorded_invalidations(&registered).await.is_empty());
+    }
+    let (summaries_of_fragment_0, summaries_of_fragment_1): (&[u32], &[u32]) =
+        match summary_published {
+            SummaryPublished::SameFragment => (&[2], &[]),
+            SummaryPublished::OtherFragment => (&[], &[0]),
+        };
+    let mut competitor = Refresh::default();
+    competitor
+        .stage(
+            &registered,
+            0,
+            &[("summary", summaries_of_fragment_0), ("keywords", &[0])],
+            &StagedValues::new(),
+        )
+        .await;
+    if !summaries_of_fragment_1.is_empty() {
+        competitor
+            .stage(
+                &registered,
+                1,
+                &[("summary", summaries_of_fragment_1), ("keywords", &[])],
+                &StagedValues::new(),
+            )
+            .await;
+    }
+    let competed_at = registered.version().version + 1;
+    let is_dropped = matches!(late, LateFlags::KeywordsDropped);
+    let mut commit_builder =
+        CommitBuilder::new(Arc::new(read.clone())).with_dependency_conflict_policy(commit.policy());
+    let handler = if after_deferral {
+        let handler = Arc::new(CommitsCompetitorFirst {
+            inner: read.commit_handler.clone(),
+            competitor: Mutex::new(Some((
+                Arc::new(registered.clone()),
+                competitor.transaction(&registered),
+            ))),
+        });
+        commit_builder = commit_builder.with_commit_handler(handler.clone());
+        Some(handler)
+    } else {
+        let mut competed = competitor
+            .publish(&registered, Reject)
+            .await
+            .unwrap()
+            .dataset;
+        if is_dropped {
+            competed.drop_cell_flag("keywords", "ready").await.unwrap();
+            assert!(recorded_invalidations(&competed).await.is_empty());
+        }
+        None
+    };
+    let checked_version = if is_dropped {
+        competed_at + 1
+    } else {
+        competed_at
+    };
+
+    let result = commit_builder
+        .execute_with_report(refresh.transaction(&read))
+        .await
+        .unwrap();
+    if let Some(handler) = handler {
+        assert!(handler.competitor.lock().unwrap().is_none());
+    }
+    let head = &result.dataset;
+    let competed = head.checkout_version(competed_at).await.unwrap();
+    let summary_cleared = match summary_published {
+        SummaryPublished::SameFragment => rows(&[(0, &[2])]),
+        SummaryPublished::OtherFragment => rows(&[(1, &[0])]),
+    };
+    assert_eq!(
+        recorded_invalidations(&competed).await,
+        cleared(translation, summary_cleared)
+    );
+    let report = &result.report;
+    let staged = rows(&[(0, &[0, 1])]);
+    let (published_rows, deferred_groups) = match deferred_at {
+        None => (staged.clone(), vec![]),
+        Some(deferred_at) => (
+            full(&[1]),
+            vec![DeferredGroup {
+                fragment_id: 0,
+                data_file: refresh.groups[0].1.clone(),
+                reason: NewerResult,
+                conflicting_version: deferred_at,
+                valid_rows: vec![published(translation, staged.clone())],
+            }],
+        ),
+    };
+    assert_eq!(
+        *report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version,
+            committed_version: Some(checked_version + 1),
+            published: vec![published(translation, published_rows.clone())],
+            deferred_rows: vec![],
+            deferred_groups,
+        }
+    );
+    let reusable = staged | published_rows.clone();
+    assert_eq!(report.reusable_rows(translation), reusable);
+    refresh.assert_report_accounts_for_every_row(&read, report);
+    refresh
+        .assert_reusable_values_follow_inputs(head, report)
+        .await;
+    assert_eq!(
+        head.cell_flag_true_rows(translation).unwrap(),
+        published_rows
+    );
+    assert_visible_values_follow_inputs(head, "translation").await;
+    let kept: &[&str] = if is_dropped {
+        &["summary"]
+    } else {
+        &["summary", "keywords"]
+    };
+    for fragment_id in [0, 1] {
+        assert_fragment_unchanged(&competed, head, fragment_id, kept).await;
+    }
+    assert_eq!(
+        column_values(head, "keywords", None).await[0],
+        (1, Some("keywords(b1)".to_string()))
+    );
+
+    let done = if after_deferral {
+        assert_fragment_unchanged(&competed, head, 0, &["translation"]).await;
+        refresh.follow_report(report, head, &["translation"]).await
+    } else {
+        head.clone()
+    };
+    assert_eq!(done.cell_flag_true_rows(translation).unwrap(), reusable);
+    assert_visible_values_follow_inputs(&done, "translation").await;
+    let translated_fragment_1 = after_deferral.then_some("translation(NULL)");
+    assert_eq!(
+        column_values(&done, "translation", None).await,
+        values(&[
+            (1, Some("translation(NULL)")),
+            (2, Some("translation(NULL)")),
+            (3, None),
+            (4, translated_fragment_1),
+            (5, translated_fragment_1),
+            (6, translated_fragment_1),
+        ])
     );
 }
 

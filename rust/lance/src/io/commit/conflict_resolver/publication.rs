@@ -43,6 +43,9 @@ pub(super) struct Publication {
     ancestors: HashMap<i32, i32>,
     /// The registry at the read version.
     registry: Arc<CellFlagRegistry>,
+    /// The registry at the head the attempt checks against, which also knows
+    /// the flags registered since the read version and not dropped.
+    head_registry: Option<Arc<CellFlagRegistry>>,
     deferred_groups: BTreeMap<u64, (DeferralReason, u64)>,
     /// Per fragment, the rows each concurrent version made stale, in version
     /// order and disjoint.
@@ -107,9 +110,11 @@ fn assigned_rows(transaction: &Transaction, flag_id: u32) -> RowAddrTreeMap {
 
 impl Publication {
     /// `None` unless `transaction` is a `DataReplacement` setting a flag true
-    /// that is dependent at the read version.
+    /// that is dependent at the read version. `head` is the latest version
+    /// the commit attempt loaded.
     pub(super) fn try_new(
         read_manifest: &Manifest,
+        head: &Manifest,
         transaction: &Transaction,
         initial_fragments: &HashMap<u64, (Fragment, bool)>,
         policy: DependencyConflictPolicy,
@@ -199,6 +204,7 @@ impl Publication {
             groups,
             ancestors,
             registry,
+            head_registry: head.cell_flags.clone(),
             deferred_groups: BTreeMap::new(),
             stale_rows: BTreeMap::new(),
             deletion_updates: BTreeMap::new(),
@@ -285,8 +291,13 @@ impl Publication {
         }
         let mut found: Vec<(u64, RoaringBitmap)> = Vec::new();
         for (flag_id, flag) in &self.flags {
-            let changed =
-                input_changed_rows(other, &flag.definition, &self.registry, &self.ancestors);
+            let changed = input_changed_rows(
+                other,
+                &flag.definition,
+                &self.registry,
+                self.head_registry.as_deref(),
+                &self.ancestors,
+            );
             if changed.is_empty() {
                 continue;
             }

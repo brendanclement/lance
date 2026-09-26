@@ -3,7 +3,7 @@
 
 //! What a publication committed and what it deferred.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -252,16 +252,17 @@ impl PublicationReport {
         rows
     }
 
-    /// Record what a commit attempt that checked `transactions` deferred.
-    /// `read` is the dataset at the read version.
+    /// Record what a commit attempt that checked `transactions` against
+    /// `head` deferred. `read` is the dataset at the read version.
     pub(crate) async fn record(
         &mut self,
         read: &Dataset,
+        head: &Dataset,
         transactions: &[(u64, Arc<Transaction>)],
         deferrals: PublicationDeferrals,
     ) -> Result<()> {
         if !self.deferred_groups.is_empty() {
-            self.check_deferred_groups(read, transactions).await?;
+            self.check_deferred_groups(read, head, transactions).await?;
         }
         for deferred in deferrals.rows {
             self.push_deferred_rows(deferred);
@@ -291,13 +292,14 @@ impl PublicationReport {
     }
 
     /// Check groups deferred by an earlier commit attempt against
-    /// `transactions`, the versions a later attempt checks, as its rebase
-    /// checks the groups it installs: for input changes, and for rows
-    /// deleted or moved. That rebase no longer sees them, since the
+    /// `transactions`, the versions a later attempt checks up to `head`, as
+    /// its rebase checks the groups it installs: for input changes, and for
+    /// rows deleted or moved. That rebase no longer sees them, since the
     /// transaction it rebases dropped them.
     async fn check_deferred_groups(
         &mut self,
         read: &Dataset,
+        head: &Dataset,
         transactions: &[(u64, Arc<Transaction>)],
     ) -> Result<()> {
         let registry = read.manifest.cell_flags.as_deref().ok_or_else(|| {
@@ -307,6 +309,7 @@ impl PublicationReport {
                 read.manifest.version
             ))
         })?;
+        let head_registry = head.manifest.cell_flags.as_deref();
         let ancestors = top_level_ancestors(&read.manifest.schema);
         let mut stale_rows = Vec::new();
         for group in self
@@ -359,7 +362,13 @@ impl PublicationReport {
                         ))
                     })?;
                     changed |= &(valid.rows.clone()
-                        & &input_changed_rows(transaction, flag, registry, &ancestors));
+                        & &input_changed_rows(
+                            transaction,
+                            flag,
+                            registry,
+                            head_registry,
+                            &ancestors,
+                        ));
                 }
                 let mut removals = vec![(DeferralReason::InputChanged, changed)];
                 if let Some(deletion_file) =
@@ -471,12 +480,21 @@ fn union_of(updates: &[CellFlagUpdate], flag_id: u32) -> RowAddrTreeMap {
 ///   its writes imply;
 /// - those a `DataReplacement` sets an upstream flag true on, whether or not
 ///   it also sets `flag` true there. The rows it does not assign are copies,
-///   which keep their values. `registry`, the read version's, resolves the
-///   upstream. A flag registered after the read version counts as an
-///   upstream on the fragments where the transaction's file writes a field
-///   `flag` watches, as `ancestors` (the top-level ancestor of every field id
-///   of the read schema) maps the file's fields: a publication writes the
-///   output of each flag it assigns on every fragment it assigns it on.
+///   which keep their values. Flag ids are never reused and definitions never
+///   change, so `read`, the read version's registry, or `head`, a later
+///   one's, resolves each flag it sets that either knows.
+///
+/// A flag neither registry knows was registered after the read version and
+/// dropped by `head`. It counts as an upstream on the fragments where the
+/// transaction's file writes a field `flag` watches (`ancestors` maps the
+/// file's field ids to their top-level ancestors in the read schema) that is
+/// not the output of a resolved dependent flag the transaction sets true: a
+/// publication writes the output of each flag it assigns on every fragment it
+/// assigns it on, every flag it sets is registered at its read version, and a
+/// field has at most one dependent flag there. A watched field it writes
+/// without publishing that field's dependent flag made it record a clear of
+/// `flag` on the whole fragment, so this is exact unless the transaction sets
+/// true two flags neither registry knows: then the rows of both count.
 ///
 /// Rows `transaction` deletes or moves to new addresses are not listed: their
 /// old addresses no longer hold a live row, and the checks report them as
@@ -484,7 +502,8 @@ fn union_of(updates: &[CellFlagUpdate], flag_id: u32) -> RowAddrTreeMap {
 pub fn input_changed_rows(
     transaction: &Transaction,
     flag: &CellFlagDefinition,
-    registry: &CellFlagRegistry,
+    read: &CellFlagRegistry,
+    head: Option<&CellFlagRegistry>,
     ancestors: &HashMap<i32, i32>,
 ) -> RowAddrTreeMap {
     let mut rows = RowAddrTreeMap::new();
@@ -502,27 +521,44 @@ pub fn input_changed_rows(
     let Operation::DataReplacement { replacements } = &transaction.operation else {
         return rows;
     };
-    let writes_watched_field: Vec<u32> = replacements
+    let assignments: Vec<(&CellFlagUpdate, Option<&CellFlagDefinition>)> = changes
+        .updates
+        .iter()
+        .filter(|update| update.value)
+        .map(|update| {
+            let definition = read
+                .definition(update.flag_id)
+                .or_else(|| head.and_then(|head| head.definition(update.flag_id)));
+            (update, definition)
+        })
+        .collect();
+    let resolved_outputs: HashSet<i32> = assignments
+        .iter()
+        .filter_map(|(_, definition)| *definition)
+        .filter(|definition| definition.is_dependent())
+        .map(|definition| definition.field_id)
+        .collect();
+    let writes_unresolved_input: Vec<u32> = replacements
         .iter()
         .filter(|DataReplacementGroup(_, file)| {
             file.fields.iter().any(|field_id| {
                 let top = ancestors.get(field_id).unwrap_or(field_id);
-                flag.clear_on_write.contains(top)
+                flag.clear_on_write.contains(top) && !resolved_outputs.contains(top)
             })
         })
         .filter_map(|DataReplacementGroup(fragment_id, _)| u32::try_from(*fragment_id).ok())
         .collect();
-    for assignment in changes.updates.iter().filter(|update| update.value) {
-        match registry.definition(assignment.flag_id) {
+    for (assignment, definition) in assignments {
+        match definition {
             Some(upstream) => {
                 if upstream.is_dependent() && flag.clear_on_write.contains(&upstream.field_id) {
                     rows |= &assignment.rows;
                 }
             }
             None => {
-                let mut on_watched = assignment.rows.clone();
-                on_watched.retain_fragments(writes_watched_field.iter().copied());
-                rows |= &on_watched;
+                let mut on_unresolved_input = assignment.rows.clone();
+                on_unresolved_input.retain_fragments(writes_unresolved_input.iter().copied());
+                rows |= &on_unresolved_input;
             }
         }
     }

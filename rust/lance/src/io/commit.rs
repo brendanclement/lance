@@ -1679,6 +1679,7 @@ pub(crate) async fn commit_transaction_with_report(
                 transaction,
                 affected_rows,
                 policy,
+                &dataset.manifest,
             )
             .await?;
 
@@ -1689,7 +1690,12 @@ pub(crate) async fn commit_transaction_with_report(
             let deferrals;
             (transaction, deferrals) = rebase.finish_with_report(&dataset).await?;
             report
-                .record(&read_version_dataset, &other_transactions, deferrals)
+                .record(
+                    &read_version_dataset,
+                    &dataset,
+                    &other_transactions,
+                    deferrals,
+                )
                 .await?;
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
