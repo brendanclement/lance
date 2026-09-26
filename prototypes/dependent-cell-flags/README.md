@@ -12,8 +12,8 @@
 | Worktree | `/Users/brendan/code/lance/.claude/worktrees/dependency-aware-cell-flags-43fc32` |
 | Branch | `brendan/dependency-aware-cell-flags` (not merged, no PR) |
 | Baseline | `e3671b2f5730eea927a088a42cbf30e273edc43c` (`origin/main` when the work started) |
-| Final implementation | `25d3cf3e5d988271f05e50de1f47e9885f1b33ba`, the last commit that changes the prototype's code: a deferred publication file no longer certifies outputs computed from an upstream output staged in the same file, and reports them as `UpstreamNotPublished`. Later commits change only rustdoc and tests in `rust/lance` (`9f0911398`) and `prototypes/`. Before it, the last code commit was `26388225a273052b3a1ff0ec705c53da1b68c7cb`; the commits in between change only `prototypes/` (benchmark results, docs and benchmark tooling: `run_paired.sh` gained `ORDER` in `3e8c36ba0672102ad005c6de20858e9a82b32231` and the rustflags check in `f1fb31606`; `analyze.py` gained `--section`/`--title` and `bench/` the rerun scripts after that) and rustdoc in `rust/lance/src/dataset/cell_flag/publication.rs` (the `PublicationReport` conflict table in `4aaa8280c`, the `DependencyConflictPolicy::Reject` description in `4993d350b`) |
-| Benchmarked | Full matrix at `21601f894` (`1m`; `10m` subset; `smoke-final`) and at `26388225a` (`1m-clean`, 1M, clean build). Reads at `26388225a` (`10m-reads-clean-*`, clean builds; `1m-reads-maskfix`, `10m-reads-maskfix`, `10m-reads-reversed`, which record `e48573011`, a results-only commit with the same code). The only code change from `21601f894` to `26388225a` is the mask builder (`fragment/cell_flag_mask.rs`). Not re-run at `25d3cf3e5` or `9f0911398` (rustdoc and tests only): `25d3cf3e5` changes only what the report says about a deferred publication file that carries chained outputs, and no benchmark workload does (none registers an output computed from another output, and each publication stages one output) |
+| Final implementation | `8fa1eab0811087a8c2795ab2b10f85646139601f`, the last commit that changes the prototype's code: staleness checks count a concurrent publication of an upstream output as an input change of the flags computed from it, also where that publication republishes them and so records no clear (`input_changed_rows`), and a deferred group reports its rows deleted or moved since the read version as `RowVacated`. Later commits change only `prototypes/`. Before it, the last code commit was `25d3cf3e5d988271f05e50de1f47e9885f1b33ba` (a deferred publication file no longer certifies outputs computed from an upstream output staged in the same file, and reports them as `UpstreamNotPublished`), followed by rustdoc and tests in `rust/lance` (`9f0911398`) and `prototypes/`; before that, `26388225a273052b3a1ff0ec705c53da1b68c7cb`, and the commits between it and `25d3cf3e5` change only `prototypes/` (benchmark results, docs and benchmark tooling: `run_paired.sh` gained `ORDER` in `3e8c36ba0672102ad005c6de20858e9a82b32231` and the rustflags check in `f1fb31606`; `analyze.py` gained `--section`/`--title` and `bench/` the rerun scripts after that) and rustdoc in `rust/lance/src/dataset/cell_flag/publication.rs` (the `PublicationReport` conflict table in `4aaa8280c`, the `DependencyConflictPolicy::Reject` description in `4993d350b`) |
+| Benchmarked | Full matrix at `21601f894` (`1m`; `10m` subset; `smoke-final`) and at `26388225a` (`1m-clean`, 1M, clean build). Reads at `26388225a` (`10m-reads-clean-*`, clean builds; `1m-reads-maskfix`, `10m-reads-maskfix`, `10m-reads-reversed`, which record `e48573011`, a results-only commit with the same code). The only code change from `21601f894` to `26388225a` is the mask builder (`fragment/cell_flag_mask.rs`). Not re-run at `25d3cf3e5`, `9f0911398` (rustdoc and tests only) or `8fa1eab08`: both code commits change only how the report classifies the staged rows of a deferred publication file (reusable, to recompute or vacated) when outputs are chained or a concurrent publication republishes an upstream output, and `8fa1eab08` also rows deleted or moved while their group is deferred. No benchmark workload has any of these: none registers an output computed from another output, each publication stages one output, and the only workload that defers groups (`OutputOverride`) writes in place, deleting and moving no rows. The staleness check still scans each concurrent transaction's flag updates once per published flag, now with its replacement files |
 
 Checks on the benchmarked code `26388225a` (run at `f1fb31606`, whose Rust, proto, Python and Java
 sources equal it): `cargo fmt --all -- --check`; `cargo clippy --all --tests --benches -- -D
@@ -26,7 +26,17 @@ source changed, only the Rust binding's struct literal. Java and Python tests we
 `4aaa8280c` (same code as `26388225a`): `cargo test -p lance --doc -- cell_flag
 with_dependency_conflict_policy execute_with_report` (10 passed).
 
-Checks on the final code, at `25d3cf3e5` (which changes only `rust/lance`) and again at `9f0911398`
+Checks on the final code, at `8fa1eab08` (which changes only `rust/lance`): `cargo fmt --all --
+--check`; `cargo clippy -p lance-table -p lance --tests --benches -- -D warnings`; `cargo test -p
+lance-table cell_flag` (100 passed); `cargo test -p lance --lib -- cell_flag conflict_resolver` (330
+passed); `cargo test -p lance --doc -- cell_flag with_dependency_conflict_policy
+execute_with_report` (10 passed); `cargo test -p lance --lib` (4417 passed, 3 ignored). With the
+fix's source files reverted, 13 of the 17 new test cases fail (the 4 that pass are controls whose
+staged values stay reusable), and a follow-up restaging the deferred file from the report commits
+the stale translation over the newer one. The workspace-wide check and clippy, `python/` and
+`java/lance-jni/` were not rerun: nothing outside `rust/lance` names the changed items.
+
+Checks on the code at `25d3cf3e5` (which changes only `rust/lance`) and again at `9f0911398`
 (which changes only its rustdoc and tests): `cargo fmt --all -- --check`; `cargo clippy -p
 lance-table -p lance --tests --benches -- -D warnings`; `cargo test -p lance --lib -- cell_flag
 conflict_resolver` (312 passed, then 313); `cargo test -p lance-table cell_flag` (100 passed);
@@ -174,7 +184,7 @@ commit retries:
 | Concurrent change | `Reject` | `Skip` |
 |---|---|---|
 | Drops or replaces a published flag | error | error |
-| Invalidates assigned rows (input written, flag cleared) | retryable | rows deferred (`InputChanged`) |
+| Changes inputs of assigned rows (input written, flag cleared, upstream output published; see below) | retryable | rows deferred (`InputChanged`) |
 | Deletes assigned rows | rows deferred (`RowVacated`) | rows deferred (`RowVacated`) |
 | Moves rows out of a group's fragment (row-moving update), assigned or not | retryable | assigned rows deferred (`RowVacated`) |
 | Publishes on a group's fragment and fields | retryable | group deferred (`NewerResult`) |
@@ -194,25 +204,41 @@ writes. The group still installs its file, so those rows hold stale values under
 (masked outputs read them as NULL); where that changes what an output reads as (an unmasked output,
 or a sibling flag that was true), the commit clears the flag explicitly so that flags computed from
 it are cleared too. A deferred group installs nothing and its staged file is left on storage; its
-`valid_rows` are the staged values still correct at `checked_version`, except the stale rows listed
-in the known gaps. Since that file never committed, a flag's staged values on the rows where the
-file also assigns a flag upstream of it (one whose output it watches) were computed from an input no
-reader sees: they are deferred as `UpstreamNotPublished`, not listed as valid. Those staged values
-must not be reused, and later commit attempts do not check them: a follow-up recomputes them from
-the upstream value it leaves on the row, the committed one or, where it also publishes the upstream
-there, the one it publishes. The upstream's own values, and sibling outputs that do not watch each
-other, stay valid. Only direct upstreams count: where the upstream is not assigned, the file holds
-its copied snapshot value, and a later write or clear of the upstream there clears the downstream
-flag too (`InputChanged`), unless it republishes the downstream flag there as well (see the known
-gaps). A group whose fragment is removed or rewritten by `checked_version` is reported with that
-reason, and no row of that fragment is reported as deferred or reusable. When every group is
-deferred, no version is written. The read version of a publication is never advanced. A follow-up
-refresh reads at `committed_version` (or `checked_version` when nothing was committed), recomputes
-the `InputChanged` and `UpstreamNotPublished` rows and the rows that moved, and may reuse
-`reusable_rows`, except where it also publishes an upstream output of the flag on the row: a
-reusable value was computed from the committed upstream value, so there the publication contract
-requires computing it from the upstream value the follow-up publishes
+`valid_rows` are the staged values still correct at `checked_version`: its rows whose inputs changed
+are reported as `InputChanged`, and its rows deleted or moved since the read version as
+`RowVacated`, as for an installed group. Since that file never committed, a flag's staged values on
+the rows where the file also assigns a flag upstream of it (one whose output it watches) were
+computed from an input no reader sees: they are deferred as `UpstreamNotPublished`, not listed as
+valid. Those staged values must not be reused, and later commit attempts do not check them: a
+follow-up recomputes them from the upstream value it leaves on the row, the committed one or, where
+it also publishes the upstream there, the one it publishes. The upstream's own values, and sibling
+outputs that do not watch each other, stay valid. Only direct upstreams count: where the upstream is
+not assigned, the file holds its copied snapshot value, and any later change of the upstream there
+is an input change of the downstream flag (`InputChanged`). A group whose fragment is removed or
+rewritten by `checked_version` is reported with that reason, and no row of that fragment is reported
+as deferred or reusable. When every group is deferred, no version is written. The read version of a
+publication is never advanced. A follow-up refresh reads at `committed_version` (or
+`checked_version` when nothing was committed), recomputes the `InputChanged` and
+`UpstreamNotPublished` rows and the rows that moved, and may reuse `reusable_rows` on any row,
+pending or already true at the head, except where it also publishes an upstream output of the flag
+on the row: a reusable value was computed from the committed upstream value, so there the
+publication contract requires computing it from the upstream value the follow-up publishes
 (`publication::test_deferred_group_defers_each_link_of_a_chain`).
+
+**A recorded clear is not an input change.** A commit's recorded clears (`derived_invalidations` and
+explicit `value: false` updates) are the flags that commit sets false. Whether a staged value is
+still correct depends instead on where a later commit changed an input of its flag, which
+`input_changed_rows` (`rust/lance/src/dataset/cell_flag/publication.rs`) defines: the flag's
+recorded clears, plus the rows where a publication sets an upstream flag true, also where it
+republishes the flag itself there and the copy-through exemption so records no clear of it. The read
+version's registry resolves the upstream; a flag registered later counts as one on the fragments
+where the publication's file writes a field the flag watches. The rebase's staleness check (both
+policies) and the report's check of groups deferred by earlier attempts use it; recorded clears
+still decide what a commit does to flag state, so a competitor's values and flags are kept. Clears
+and input changes differ only for deferred groups: a competitor that records no clear of a flag on a
+row it changed an input of republishes the flag there, so its file writes the flag's output on that
+fragment and defers the group (`NewerResult`). A competitor that republishes only the flag, over
+unchanged inputs, leaves the staged value valid: it was computed from the inputs the head shows.
 
 `Reject` still drops assignments of rows deleted since the read version and commits the rest;
 `execute_with_report` reports them as `RowVacated`.
@@ -296,7 +322,7 @@ Requirements from the task, with the tests that cover them (files under
 | 2 | Input changes, then an old refresh publishes: rejected or skipped | `publication::test_refresh_staged_before_input_write` (3 write paths × 2 policies) |
 | 3 | Invalidation while the flag is already false | `publication::test_refresh_skips_rows_invalidated_while_flag_false` (3 write paths × 2 policies; replace and `merge_insert` record the clear, the row-moving update records its moved rows instead); `cell_flags::test_dependent_flag_publication_and_invalidation`; `lance-table` `derive_records_clears_when_already_false_and_against_head_registry` |
 | 4 | Input A → B → A | `publication::test_input_restored_before_refresh_publishes` (3 write paths × 2 policies) |
-| 5 | A newer worker's result survives an older worker | `publication::test_newer_result_survives_older_refresh`, `test_copied_rows_cannot_overwrite_newer_result`, `test_retry_that_defers_a_group_keeps_the_newer_flag` |
+| 5 | A newer worker's result survives an older worker | `publication::test_newer_result_survives_older_refresh`, `test_copied_rows_cannot_overwrite_newer_result`, `test_retry_that_defers_a_group_keeps_the_newer_flag`, `test_deferred_group_defers_rows_whose_upstream_was_republished` (a follow-up restaging the deferred file from the report keeps the newer result) |
 | 6 | An input write staged before a publication commits after it and clears it | `publication::test_input_write_staged_before_publication_clears_it`; `update::test_update_retries_over_concurrent_publication` (a row-moving update read before the publication retries over it); `cell_flags::test_write_staged_before_registration_records_clear` |
 | 7 | An unrelated-field update keeps dependent outputs | `update::test_update_moves_flags_whose_watched_fields_it_does_not_set::unrelated_field`, `test_in_place_merge_insert_clears_only_flags_watching_it::unrelated_field`; `masking::test_write_predicates_see_masked_values::unwatched_field` |
 | 8 | Shared inputs invalidate all and only the right outputs | `update::test_update_moves_flags_whose_watched_fields_it_does_not_set`, `test_in_place_merge_insert_clears_only_flags_watching_it`; `cell_flags::test_clears_propagate_down_dependency_chains`; `publication::test_refresh_loop_never_shows_a_stale_output`, `test_chained_outputs_published_together` |
@@ -304,12 +330,13 @@ Requirements from the task, with the tests that cover them (files under
 | 10 | A full-file replacement cannot overwrite newer results outside its rows | `publication::test_copied_rows_cannot_overwrite_newer_result`, `test_newer_result_survives_older_refresh`; `lance-table` `derive_counts_unassigned_rows_of_a_publication_as_copied`, `publication_exempts_only_published_inputs` |
 | 11 | An assigned NULL is distinguishable from pending work | `masking::test_masked_field_reads_null_where_flag_is_false` |
 | 12 | Registration replace/drop fences old work | `publication::test_registration_change_fences_old_publisher`; `cell_flags::test_dropped_flag_fences_staged_publication`, `test_publication_needs_flag_registered_at_read_version`; `lance-table` `apply_fences_changes_for_unknown_flags` |
-| 13 | A commit retry after a competing commit keeps every invalidation | `publication::test_commit_retry_records_every_invalidation` (3 write paths × registration/publication competitor; the first manifest write loses its slot to a competitor committed by a `CommitHandler` wrapper), `test_publication_retry_accumulates_deferrals`, `test_retry_keeps_chained_outputs_of_a_deferred_group_unreusable` |
+| 13 | A commit retry after a competing commit keeps every invalidation | `publication::test_commit_retry_records_every_invalidation` (3 write paths × registration/publication competitor; the first manifest write loses its slot to a competitor committed by a `CommitHandler` wrapper), `test_publication_retry_accumulates_deferrals`, `test_retry_keeps_chained_outputs_of_a_deferred_group_unreusable`, `test_deferred_group_defers_rows_whose_upstream_was_republished::{during_retry, after_deferral}`, `test_deferred_group_reports_rows_moved_or_deleted_as_vacated::{upsert_during_retry, delete_during_retry}` |
 | 14 | A failed publication exposes no partial values or assignments | `publication::test_rejected_publication_exposes_nothing` (conflict; invalid assignment under `Reject`, and under `Skip` with a concurrent commit deferring the invalid group or every group), `test_registration_change_fences_old_publisher`, the `Reject` branches of the tests above |
 | 15 | Unsupported operations fail explicitly | see the table above |
 | M | Masking, `IS NULL`, `COUNT(column)` vs `COUNT(*)` | `masking::test_filters_see_masked_values`, `test_aggregates_count_masked_cells_as_null`, `test_every_reader_funnel_masks_each_batch`, `test_takes_and_late_materialization_mask`, `test_sort_and_group_by_see_masked_values` |
 | S | Staged writes: the clears they record, and retries over a dropped mask they read through | `cell_flags::test_partial_merge_insert_records_offsets_only_when_read`; `update::test_rewrite_retries_over_drop_of_the_mask_it_read_through` |
 | R | A deferred file's values computed from an upstream it also stages are reported for recomputation (`UpstreamNotPublished`), never as reusable; independent outputs stay reusable | `publication::test_deferred_group_recomputes_outputs_of_its_staged_upstream` (the review's case; a follow-up that follows the report: translating alone, after republishing summary, or with summary in one file), `test_deferred_group_defers_only_rows_its_upstream_assigns` (partially overlapping assignments), `test_deferred_group_defers_each_link_of_a_chain` (three outputs in one file; a follow-up restaging them in one file recomputes the reusable values whose input it republishes), `test_retry_keeps_chained_outputs_of_a_deferred_group_unreusable` (group deferred on the retry, or invalidated during it), `test_deferred_group_keeps_independent_outputs_reusable`. Each checks that every assigned row is reported once and that every reusable staged value is the function of its input at the head |
+| I | A concurrent input change the competitor recorded no clear for (it republished the downstream output with a new upstream value) defers the staged rows as `InputChanged`, never as reusable; rows moved or deleted while their group was deferred are `RowVacated` | `publication::test_deferred_group_defers_rows_whose_upstream_was_republished` (competitor committed before the check, during the retry, or after an earlier attempt deferred the group; partially overlapping rows: the row whose clear was recorded and the one whose clear was not are both deferred, with their sibling, the third stays reusable), `test_deferred_group_defers_rows_whose_published_upstream_was_recomputed` (an upstream already true at the read version, recomputed with a new value), `test_deferred_group_defers_each_link_a_competitor_republishes` (three-level chain; the competitor publishes summary and translation, translation and keywords, the whole chain, or keywords alone), `test_flag_registered_after_the_read_is_resolved` (the upstream's flag registered after the read, unmasked, dropped again or not; an unrelated late flag leaves the row reusable), `test_deferred_group_keeps_independent_outputs_reusable` (a competitor publishing one or both independent outputs), `test_deferred_group_reports_rows_moved_or_deleted_as_vacated` (update, delete, and a full-row upsert or delete during the retry). Each checks the full report, `reusable_rows`, that every assigned row is reported once, flag state and values, that the competitor's values and flags are unchanged and, for input changes, a follow-up that restages the deferred file from the report: it reuses exactly the reusable staged values, recomputes the deferred rows from the head, keeps the newer results and leaves every visible value the function of its inputs |
 
 `test_refresh_loop_never_shows_a_stale_output` runs the whole loop on three fragments with
 `summary <- title, body` and `translation <- body, language`, and checks every version by time
@@ -386,12 +413,7 @@ serving its rows unmasked once a masking flag is registered. A caller-staged `Da
 computed from masked reads is not retried over a concurrent drop of the mask; it writes whatever it
 read, and its whole-fragment clear keeps downstream flags safe. Compaction is refused only at commit,
 after it has reserved fragment ids and written its files; a plain delete leaves flag state on
-deleted rows, which still counts toward the ordinary-flag gate for row-moving writes;
-`DeferredGroup::valid_rows` can list rows deleted after the read version, and rows where a
-concurrent publication republished the flag together with an upstream output it watches. Nothing
-clears the flag there, so the staged value, computed from the older upstream value, stays listed.
-Those rows are true at the head with the newer result: a follow-up that reuses staged values only
-on rows still pending is unaffected, one that restages them overwrites the newer result.
+deleted rows, which still counts toward the ordinary-flag gate for row-moving writes.
 
 ## Benchmarks
 
@@ -490,8 +512,7 @@ Correctness risks:
   either be handled or refused by the commit gate; a new `Operation` variant or row-moving writer
   that bypasses it would misplace or drop flag state.
 - **Known gaps** listed above: base-table-less MemWAL readers, caller-staged replacements computed
-  from masked reads racing a mask drop, compaction refused only after it wrote its files, stale
-  `valid_rows` after a concurrent publication of an output together with its upstream, Python
+  from masked reads racing a mask drop, compaction refused only after it wrote its files, Python
   bindings dropping cell flag changes on a round trip (the outcome is conservative), no Python/Java
   API.
 - **Compatibility review needed** for a public `Transaction` field, the `CellFlagMovedRows` type, the
