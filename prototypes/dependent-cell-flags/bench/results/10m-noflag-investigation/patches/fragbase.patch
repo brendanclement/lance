@@ -1,0 +1,134 @@
+diff --git a/rust/lance/src/dataset/fragment.rs b/rust/lance/src/dataset/fragment.rs
+index af593f18e..9e3dd0e89 100644
+--- a/rust/lance/src/dataset/fragment.rs
++++ b/rust/lance/src/dataset/fragment.rs
+@@ -3,7 +3,6 @@
+ 
+ //! Wraps a Fragment of the dataset.
+ 
+-mod cell_flag_mask;
+ pub mod session;
+ pub mod write;
+ 
+@@ -63,7 +62,6 @@ use lance_table::utils::stream::{
+ use object_store::path::Path;
+ use roaring::RoaringBitmap;
+ 
+-use self::cell_flag_mask::CellFlagMasks;
+ use self::write::FragmentCreateBuilder;
+ 
+ use super::hash_joiner::HashJoiner;
+@@ -1146,7 +1144,6 @@ impl FileFragment {
+         projection: &Schema,
+         read_config: FragReadConfig,
+     ) -> Result<FragmentReader> {
+-        let cell_flag_masks = CellFlagMasks::resolve(&self.dataset, self.metadata.id, projection)?;
+         let open_files = self.open_readers(projection, &read_config);
+         let deletion_vec_load = self.get_deletion_vector();
+ 
+@@ -1230,7 +1227,6 @@ impl FileFragment {
+                 });
+             }
+         }
+-        reader.cell_flag_masks = cell_flag_masks;
+ 
+         if read_config.with_row_id {
+             reader.with_row_id();
+@@ -1253,7 +1249,6 @@ impl FileFragment {
+         projection: &Schema,
+         read_config: &FragReadConfig,
+     ) -> Result<V1FragmentReader> {
+-        cell_flag_mask::reject_masked_v1_read(&self.dataset, self.metadata.id, projection)?;
+         let open_readers = async {
+             let mut readers = Vec::new();
+             for data_file in &self.metadata.files {
+@@ -1968,8 +1963,7 @@ impl FileFragment {
+     ///
+     /// Unlike logical range reads, offsets address the immutable rows stored in
+     /// the fragment's files. Deleted positions remain present with their stored
+-    /// column values, except that cells a cell flag masks read as NULL, so a
+-    /// copy-through writes them back without a value. Callers can stream the batches into
++    /// column values. Callers can stream the batches into
+     /// [`Dataset::write_data_file_part`](super::Dataset::write_data_file_part)
+     /// when independently computing a physical-row part.
+     ///
+@@ -2259,8 +2253,6 @@ impl FileFragment {
+         // If there is no projection, we at least need to read the row addresses
+         with_row_addr |= !with_row_id && schema.fields.is_empty();
+ 
+-        // Masked cells read as NULL here, so a column rewritten through the
+-        // updater keeps no value where its masking cell flag is false.
+         let reader = self.open(
+             &schema,
+             FragReadConfig::default()
+@@ -3355,11 +3347,6 @@ pub struct FragmentReader {
+     /// overlays. Overlays are merged into base batches (by `offset_in_frag`) before
+     /// deletion filtering, opening only the files each read's rows touch.
+     overlay: Option<OverlayReadState>,
+-
+-    /// Projected fields a masking cell flag hides on some row of this fragment,
+-    /// nulled right after the overlay merge. `None` when no projected field is
+-    /// masked here, so unmasked reads pay only this check.
+-    cell_flag_masks: Option<Arc<CellFlagMasks>>,
+ }
+ 
+ /// What [`FragmentReader`] needs to resolve overlays at read time: the coverage
+@@ -3400,7 +3387,6 @@ impl Clone for FragmentReader {
+             num_rows: self.num_rows,
+             num_physical_rows: self.num_physical_rows,
+             overlay: self.overlay.clone(),
+-            cell_flag_masks: self.cell_flag_masks.clone(),
+         }
+     }
+ }
+@@ -3454,7 +3440,6 @@ impl FragmentReader {
+             num_rows,
+             num_physical_rows,
+             overlay: None,
+-            cell_flag_masks: None,
+         })
+     }
+ 
+@@ -3590,26 +3575,6 @@ impl FragmentReader {
+         Ok(stream)
+     }
+ 
+-    /// Null the cells a masking cell flag hides, after overlays are merged and
+-    /// before deletions are applied, when rows still line up with their
+-    /// physical offsets. Kept a plain function outside `merge_overlays`:
+-    /// wrapping that future in another async fn cost full scans of tables
+-    /// without cell flags about 3% of their wall time.
+-    fn mask_cells(
+-        &self,
+-        stream: ReadBatchTaskStream,
+-        params: &ReadBatchParams,
+-        total_num_rows: u32,
+-    ) -> ReadBatchTaskStream {
+-        let Some(masks) = &self.cell_flag_masks else {
+-            return stream;
+-        };
+-        let offsets_in_frag = masks
+-            .needs_offsets()
+-            .then(|| Arc::new(params.to_offsets_total(total_num_rows).values().to_vec()));
+-        masks.clone().apply(stream, offsets_in_frag)
+-    }
+-
+     async fn new_read_impl<'a, F>(
+         &'a self,
+         params: ReadBatchParams,
+@@ -3694,7 +3659,6 @@ impl FragmentReader {
+         };
+ 
+         let merged = self.merge_overlays(merged, &params, total_num_rows).await?;
+-        let merged = self.mask_cells(merged, &params, total_num_rows);
+ 
+         // Add the row id column (if needed) and delete rows (if a deletion
+         // vector is present).
+@@ -3890,7 +3854,6 @@ impl FragmentReader {
+         let merged_stream = self
+             .merge_overlays(merged_stream, &params, total_num_rows)
+             .await?;
+-        let merged_stream = self.mask_cells(merged_stream, &params, total_num_rows);
+ 
+         // Add the row id column (if needed) and delete rows (if a deletion
+         // vector is present).

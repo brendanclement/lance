@@ -12,8 +12,8 @@
 | Worktree | `/Users/brendan/code/lance/.claude/worktrees/dependency-aware-cell-flags-43fc32` |
 | Branch | `brendan/dependency-aware-cell-flags` (not merged, no PR) |
 | Baseline | `e3671b2f5730eea927a088a42cbf30e273edc43c` (`origin/main` when the work started) |
-| Final implementation | `93ada9bca33fd1b747826ec098c451fb1b531778`, the last commit that changes the prototype's code: `input_changed_rows` resolves a flag registered after the read version through the head's registry, and only a flag the head no longer knows falls back to the file's fields, so a late flag on an unrelated output no longer counts as an input change. Later commits change only `prototypes/`. Before it, `8fa1eab0811087a8c2795ab2b10f85646139601f`: staleness checks count a concurrent publication of an upstream output as an input change of the flags computed from it, also where that publication republishes them and so records no clear (`input_changed_rows`), and a deferred group reports its rows deleted or moved since the read version as `RowVacated`. Before that, the last code commit was `25d3cf3e5d988271f05e50de1f47e9885f1b33ba` (a deferred publication file no longer certifies outputs computed from an upstream output staged in the same file, and reports them as `UpstreamNotPublished`), followed by rustdoc and tests in `rust/lance` (`9f0911398`) and `prototypes/`; before that, `26388225a273052b3a1ff0ec705c53da1b68c7cb`, and the commits between it and `25d3cf3e5` change only `prototypes/` (benchmark results, docs and benchmark tooling: `run_paired.sh` gained `ORDER` in `3e8c36ba0672102ad005c6de20858e9a82b32231` and the rustflags check in `f1fb31606`; `analyze.py` gained `--section`/`--title` and `bench/` the rerun scripts after that) and rustdoc in `rust/lance/src/dataset/cell_flag/publication.rs` (the `PublicationReport` conflict table in `4aaa8280c`, the `DependencyConflictPolicy::Reject` description in `4993d350b`) |
-| Benchmarked | Full matrix at `21601f894` (`1m`; `10m` subset; `smoke-final`) and at `26388225a` (`1m-clean`, 1M, clean build). Reads at `26388225a` (`10m-reads-clean-*`, clean builds; `1m-reads-maskfix`, `10m-reads-maskfix`, `10m-reads-reversed`, which record `e48573011`, a results-only commit with the same code). The only code change from `21601f894` to `26388225a` is the mask builder (`fragment/cell_flag_mask.rs`). Not re-run at `25d3cf3e5`, `9f0911398` (rustdoc and tests only), `8fa1eab08` or `93ada9bca`: the code commits change only how the report classifies the staged rows of a deferred publication file (reusable, to recompute or vacated) when outputs are chained or a concurrent publication republishes an upstream output, `8fa1eab08` also rows deleted or moved while their group is deferred, and `93ada9bca` how a flag registered after the read version is resolved. No benchmark workload has any of these: none registers an output computed from another output or a flag while a publication is in flight, each publication stages one output, and the only workload that defers groups (`OutputOverride`) writes in place, deleting and moving no rows. The staleness check still scans each concurrent transaction's flag updates once per published flag, now with its replacement files |
+| Final implementation | `2fd300ac2885f07d1357a0a438ceb874d7d6a519`, the last commit that changes the prototype's code: both `FragmentReader` read funnels keep `main`'s `merge_overlays` call and apply masks afterwards through a plain function, so the read path of unmasked fields is structurally `main`'s. That removed a 3–4% slowdown of full-column reads on tables without flags in the benchmark profile. It is not a performance fix: in the shipping `release` profile the fix measures slower than the prototype, and neither build retires more instructions than `main` (see Benchmarks). Later commits change only `prototypes/`, drop a performance claim from `mask_cells`'s rustdoc, and add a benchmark (`rust/lance/benches/cell_flags_scan_counters.rs` and its `[[bench]]` entry). Before it, `93ada9bca33fd1b747826ec098c451fb1b531778`: `input_changed_rows` resolves a flag registered after the read version through the head's registry, and only a flag the head no longer knows falls back to the file's fields, so a late flag on an unrelated output no longer counts as an input change. Before `93ada9bca`, `8fa1eab0811087a8c2795ab2b10f85646139601f`: staleness checks count a concurrent publication of an upstream output as an input change of the flags computed from it, also where that publication republishes them and so records no clear (`input_changed_rows`), and a deferred group reports its rows deleted or moved since the read version as `RowVacated`. Before that, the last code commit was `25d3cf3e5d988271f05e50de1f47e9885f1b33ba` (a deferred publication file no longer certifies outputs computed from an upstream output staged in the same file, and reports them as `UpstreamNotPublished`), followed by rustdoc and tests in `rust/lance` (`9f0911398`) and `prototypes/`; before that, `26388225a273052b3a1ff0ec705c53da1b68c7cb`, and the commits between it and `25d3cf3e5` change only `prototypes/` (benchmark results, docs and benchmark tooling: `run_paired.sh` gained `ORDER` in `3e8c36ba0672102ad005c6de20858e9a82b32231` and the rustflags check in `f1fb31606`; `analyze.py` gained `--section`/`--title` and `bench/` the rerun scripts after that) and rustdoc in `rust/lance/src/dataset/cell_flag/publication.rs` (the `PublicationReport` conflict table in `4aaa8280c`, the `DependencyConflictPolicy::Reject` description in `4993d350b`) |
+| Benchmarked | Reads at `2fd300ac2`: `10m-reads-fix-*` (clean builds, flags in round 3 only) and the no-flag counters rotations in `bench/results/10m-noflag-investigation/`. Writes, publication and conflicts were not re-run at `2fd300ac2`, which changes only the read funnels. Full matrix at `21601f894` (`1m`; `10m` subset; `smoke-final`) and at `26388225a` (`1m-clean`, 1M, clean build). Reads at `26388225a` (`10m-reads-clean-*`, clean builds; `1m-reads-maskfix`, `10m-reads-maskfix`, `10m-reads-reversed`, which record `e48573011`, a results-only commit with the same code). The only code change from `21601f894` to `26388225a` is the mask builder (`fragment/cell_flag_mask.rs`). Not re-run at `25d3cf3e5`, `9f0911398` (rustdoc and tests only), `8fa1eab08` or `93ada9bca`: the code commits change only how the report classifies the staged rows of a deferred publication file (reusable, to recompute or vacated) when outputs are chained or a concurrent publication republishes an upstream output, `8fa1eab08` also rows deleted or moved while their group is deferred, and `93ada9bca` how a flag registered after the read version is resolved. No benchmark workload has any of these: none registers an output computed from another output or a flag while a publication is in flight, each publication stages one output, and the only workload that defers groups (`OutputOverride`) writes in place, deleting and moving no rows. The staleness check still scans each concurrent transaction's flag updates once per published flag, now with its replacement files |
 
 Checks on the benchmarked code `26388225a` (run at `f1fb31606`, whose Rust, proto, Python and Java
 sources equal it): `cargo fmt --all -- --check`; `cargo clippy --all --tests --benches -- -D
@@ -26,7 +26,18 @@ source changed, only the Rust binding's struct literal. Java and Python tests we
 `4aaa8280c` (same code as `26388225a`): `cargo test -p lance --doc -- cell_flag
 with_dependency_conflict_policy execute_with_report` (10 passed).
 
-Checks on the final code, at `93ada9bca` (which changes only `rust/lance`): `cargo fmt --all --
+Checks on the final code, at `2fd300ac2` (which changes only `rust/lance/src/dataset/fragment.rs`),
+run with the counters bench and its `[[bench]]` entry added:
+- `cargo fmt --all -- --check`
+- `cargo clippy --all --tests --benches -- -D warnings`
+- `cargo test -p lance --lib`: 4425 passed, 3 ignored.
+
+Removing either `mask_cells` call fails `test_every_reader_funnel_masks_each_batch` and the
+filter tests of `dataset_cell_flags_masking`. `python/` and `java/lance-jni/` were not rerun:
+nothing outside `rust/lance` names the changed items. The doctests were not rerun either: the
+commit changes no public item.
+
+Checks on the code at `93ada9bca` (which changes only `rust/lance`): `cargo fmt --all --
 --check`; `cargo clippy -p lance-table -p lance --tests --benches -- -D warnings`; `cargo test -p
 lance-table cell_flag` (100 passed); `cargo test -p lance --lib -- cell_flag conflict_resolver` (338
 passed); `cargo test -p lance --doc -- cell_flag with_dependency_conflict_policy
@@ -485,26 +496,35 @@ unrelated-field updates 1.13× / 1.16×, clean refresh +0.6%, publication after 
 1.00–1.08×, 858 KB of manifest for the 1%-invalidated read table, and masked reads 0.92–1.03× with
 all flags true and 3.0–3.5× on full-column reads with 1% invalidated. With the final mask builder
 (`10m-reads-maskfix`, `10m-reads-reversed`, `10m-reads-clean-*`): all flags true 0.94–1.04×,
-full-column reads with 1% invalidated 1.68–1.80×.
+full-column reads with 1% invalidated 1.68–1.80×. At `2fd300ac2` (`10m-reads-fix-*`, one flag
+round per order): 0.92–1.04× and 1.60–1.81×.
 
-**Open regression: full-column reads of tables without flags are 6–9% slower at 10M rows**
-(geometric mean of `10m-reads-clean-baseline-first` and `10m-reads-clean-prototype-first`, clean
-builds with rustflags identical to the baseline; selective reads 1.00–1.06×; at 1M, `1m-clean`
-full-column reads are 0.96–1.03×). A baseline plus one unused function
-(`10m-reads-layout-control`, 6 rounds) moves the same reads by 0.99–1.04× (per round 0.95–1.10×).
-The prototype with `fragment.rs`, its fragment read path, reverted to the baseline
-(`10m-reads-variant-fragment-reverted`; the masked-index check in `index.rs` and the manifest's
-cell flag decoding remain) measured 1.02–1.06×. The clean slowdown exceeds the layout control by
-2.6–7.7% per full-column workload (median 4.7%). On a dataset without flags, the prototype's read
-path adds an `Option` check per fragment open (`CellFlagMasks::resolve`) and per read call
-(`FragmentReader::resolve_cells`), an `Option<Arc<CellFlagMasks>>` field that `FragmentReader`
-copies on clone, a registry check per index in `scalar_index_info` (`index.rs`), and an optional
-registry in the manifest decode; the variant reverted the first three and kept the last two. A
-sampling profile of the nested build (`bench/results/10m-profile/`) has the same six leading
-non-wait frames in both builds and cell flag code in 2 of its 62,830 non-wait samples. Of the 18
-frames with at least 1% of the non-wait samples in either build, all but `mach_absolute_time`
-(1.7% against the baseline's 3.0%) differ in share by at most 0.8 percentage points, though `_free`
-is 1.2% against 0.4%. No clean-build binary was profiled, and the cause is not identified.
+**No-flag reads at 10M rows: no extra work, and a code-generation effect of a few percent whose
+sign depends on the build profile.** `bench/results/10m-noflag-investigation/` has the runs.
+Every comparison retired the same instructions to 0.3%.
+- The clean paired runs (`10m-reads-clean-*`) measured full-column reads of tables without flags
+  6–9% slower. That harness writes a new table in each process, and writes are not byte-identical,
+  so each of its 3 rounds compares two physically different tables.
+- On shared tables, in the benchmark profile (`release-with-debug`: thin LTO, 16 codegen units),
+  a hardware-counter rotation (20 rounds, Latin square) measured the prototype 3.2–4.4% slower,
+  with fewer busy cores.
+- Narrowly scoped variants tied that to the `async fn resolve_cells` wrapper around
+  `merge_overlays` in both `FragmentReader` read funnels. Restoring `main`'s call (`funnel`) removed
+  the gap; skipping the per-open mask lookup (`noresolve`) or adding one unused function (`layout`)
+  did not.
+- `2fd300ac2` restores the funnels and applies masks through a plain function (`mask_cells`). In
+  the run that also measured the prototype at 1.032–1.038×, the fix measured 1.000–1.001× `main`.
+- Later rotations measured the fix at 1.000–1.032×, the same range as edits that do no work:
+  - `main` plus one unused `FragmentReader` field: 1.014–1.021×.
+  - The fix with `main`'s `fragment.rs`: 1.056–1.064×.
+- In the shipping profile (`release`: fat LTO, 1 codegen unit), one rotation measured:
+  - the prototype at 0.997–1.025× `main`;
+  - the fix at 1.032–1.044×;
+  - `main` plus the unused field at 1.024–1.032×.
+- The fix's paired harness runs (`10m-reads-fix-*`) measured 1.00–1.07× on full-column reads. In
+  both orders, round 1 favored the fix and rounds 2–3 the baseline.
+
+`2fd300ac2` stays because it keeps the unmasked read path structurally `main`'s, not for speed.
 
 Method caveat: this worktree sits under another Lance checkout (`/Users/brendan/code/lance`), and
 cargo merged both identical `.cargo/config.toml` files, concatenating their `rustflags`, so
@@ -513,8 +533,8 @@ prototype binaries built here received their rustflags twice. The early baseline
 that build difference with the code change. Whether it also moves flags-vs-no-flags ratios is not
 established: the only clean-build flag round (`1m-clean`, round 3) measured the lower write
 overheads in the table above and full-column reads with 1% invalidated of 1.66–1.89×
-(`1m-reads-maskfix`: 1.53–1.77×). The `*-clean` runs and both controls were built outside any other
-checkout, and `run_paired.sh` now refuses builds whose rustflags differ. `bench/REPORT.md` opens
+(`1m-reads-maskfix`: 1.53–1.77×). The `*-clean` runs, both controls, the `10m-reads-fix-*` runs and
+the counters rotations were built outside any other checkout, and `run_paired.sh` now refuses builds whose rustflags differ. `bench/REPORT.md` opens
 with a summary saying which run answers which question.
 
 These are prototype measurements on local disk, not a pass of #8655's benchmark acceptance criteria;
@@ -541,10 +561,14 @@ Correctness risks:
 
 Performance bottlenecks:
 
-- **Unexplained no-flag read regression at 10M rows.** Full-column reads of tables without flags
-  measured 6–9% slower than the baseline in the clean builds (`10m-reads-clean-*`), 2.6–7.7%
-  (median 4.7%) beyond the layout control; not seen at 1M (`1m-clean`). Needs a hardware-counter
-  profile of the clean build before any claim of zero overhead.
+- **No-flag read overhead is below the code-generation noise floor, not proven zero.**
+  - At 10M rows, reads of tables without flags retire the same instructions as `main`.
+  - Wall time is 1.000–1.032× `main` in the benchmark profile and 1.032–1.044× in the shipping
+    profile (`2fd300ac2`). Behavior-free edits of `main` move the same reads by 1.4–3.2%
+    (`10m-noflag-investigation`).
+  - Any change to the read funnels can move wall time by a few percent in either direction without
+    adding work. Measure such changes with `bench/run_counters_rotation.sh` on a shared table, in
+    both profiles; the 3-round paired harness cannot resolve them.
 - **Manifest-inline state.** Fragmented true sets make every commit rewrite, and every open decode,
   hundreds of KB (858 KB at 10M rows with 1% scattered invalidation, `10m`). Spill per-fragment
   state to external files, as deletion files or #8655's roots do.

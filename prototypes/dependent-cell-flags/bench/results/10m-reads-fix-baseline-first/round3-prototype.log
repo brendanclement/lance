@@ -1,0 +1,30 @@
+cell_flags_regression build=prototype git_sha=2fd300ac2885f07d1357a0a438ceb874d7d6a519 scale_rows=10000000 rows_per_fragment=100000 fragments=100 samples=3 read_samples=20 warmup=1 stable_row_ids=false data=/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/bench-data/cell_flags_regression-prototype
+udf iterations=16 summary=1479 ns/row translation=1090 ns/row
+
+workload                           variant                  cache          n    wall_ms    udf_ms  stage_ms commit_ms  r_iops     r_KiB w_iops      w_KiB  manif_B   txn_B  outcome
+scan_summary_full                  populated                warm          20      25.92         -         -         -     100    146289      0          0    24800    7842  
+filter_summary_is_null_count       populated                warm          20      28.24         -         -         -     100    146289      0          0    24800    7842  
+count_summary_vs_star              populated:aggregate      warm          20      26.26         -         -         -     100    146289      0          0    24800    7842  
+count_summary_vs_star              populated:sql            warm          20      34.63         -         -         -     100    146289      0          0    24800    7842  
+filter_id_range_project_summary    populated                warm          20      13.54         -         -         -     113     28994      0          0    24800    7842  
+take_random_1k                     populated                warm          20      10.45         -         -         -     932      3762      0          0    24800    7842  
+scan_summary_full                  populated                fresh-session 20      25.11         -         -         -     300    146841      0          0    24800    7842  
+filter_summary_is_null_count       populated                fresh-session 20      26.55         -         -         -     300    146841      0          0    24800    7842  
+count_summary_vs_star              populated:aggregate      fresh-session 20      24.36         -         -         -     300    146841      0          0    24800    7842  
+count_summary_vs_star              populated:sql            fresh-session 20      33.26         -         -         -     300    146841      0          0    24800    7842  
+filter_id_range_project_summary    populated                fresh-session 20      13.21         -         -         -     418     29454      0          0    24800    7842  
+take_random_1k                     populated                fresh-session 20      12.51         -         -         -    1132      4315      0          0    24800    7842  
+scan_summary_full                  null_1pct                warm          20      26.51         -         -         -     100    146541      0          0    24800    7842  
+filter_summary_is_null_count       null_1pct                warm          20      30.02         -         -         -     100    146541      0          0    24800    7842  
+count_summary_vs_star              null_1pct:aggregate      warm          20      26.88         -         -         -     100    146541      0          0    24800    7842  
+count_summary_vs_star              null_1pct:sql            warm          20      36.05         -         -         -     100    146541      0          0    24800    7842  
+filter_id_range_project_summary    null_1pct                warm          20      12.46         -         -         -     113     28992      0          0    24800    7842  
+take_random_1k                     null_1pct                warm          20      10.80         -         -         -     932      3766      0          0    24800    7842  
+scan_summary_full                  null_1pct                fresh-session 20      27.11         -         -         -     300    147094      0          0    24800    7842  
+filter_summary_is_null_count       null_1pct                fresh-session 20      31.00         -         -         -     300    147094      0          0    24800    7842  
+count_summary_vs_star              null_1pct:aggregate      fresh-session 20      29.33         -         -         -     300    147094      0          0    24800    7842  
+count_summary_vs_star              null_1pct:sql            fresh-session 20      36.28         -         -         -     300    147094      0          0    24800    7842  
+filter_id_range_project_summary    null_1pct                fresh-session 20      13.42         -         -         -     418     29452      0          0    24800    7842  
+take_random_1k                     null_1pct                fresh-session 20      12.66         -         -         -    1132      4319      0          0    24800    7842  
+
+records appended to prototypes/dependent-cell-flags/bench/results/10m-reads-fix-baseline-first/round3-prototype.jsonl

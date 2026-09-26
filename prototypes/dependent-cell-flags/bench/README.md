@@ -21,6 +21,9 @@ Benchmarks for the dependent cell flag prototype (option D). They answer three q
 | `run_variant.sh` | The read-path variant: `run_paired.sh` on the prototype with `rust/lance/src/dataset/fragment.rs` reverted to the baseline, without the flag harness. |
 | `run_layout_control.sh` | The layout control: the baseline against the baseline plus one unused function, 3 rounds in each order. |
 | `regenerate_report.sh` | Rebuilds every generated section of `REPORT.md` with its heading. |
+| `rust/lance/benches/cell_flags_scan_counters.rs` | Reads one shared table without flags and records per sample the wall time and the process's retired instructions, cycles and CPU time (macOS `proc_pid_rusage`). Uses `main` APIs only. |
+| `run_counters_rotation.sh` | Rotates four builds of the counters bench over one shared table in a 4×4 Latin-square order. |
+| `analyze_counters.py` | Python standard library only. Per-round ratios of the counters bench to a reference build, with bootstrap intervals and busy cores. |
 
 `mod.rs` and `cell_flags_regression.rs` must be **byte-identical** in the baseline and the
 prototype worktree, and `run_paired.sh` refuses to run otherwise. Keep additions in `flags.rs`.
@@ -49,11 +52,13 @@ cp rust/lance/benches/cell_flags_regression.rs /abs/lance-baseline/rust/lance/be
 # harness = false
 ```
 
-The prototype worktree is a checkout of this branch. The benchmarked code is `26388225a`. The branch
-head differs from it only in `rust/lance`: rustdoc, tests, and `25d3cf3e5`, which changes only what
-a publication report says about a deferred file carrying chained outputs (no workload publishes
-one). For the exact benchmarked code, restore `rust/` from `26388225a` in the checkout; the driver
-stays the branch's, and `env.json` records the resulting `git status`:
+The prototype worktree is a checkout of this branch. The branch head's code is `2fd300ac2`, which
+only the `10m-reads-fix-*` runs and the counters rotations measured. The full matrix and the
+clean runs measured `26388225a`. From there to `2fd300ac2`, the commits change how a publication
+report classifies the staged rows of a deferred file, which no workload exercises, and the
+fragment read funnels. To rerun one of those runs on its exact code, restore `rust/` from
+`26388225a` in the checkout. The driver stays the branch's, and `env.json` records the resulting
+`git status`:
 
 ```bash
 git worktree add --detach /abs/lance-proto brendan/dependency-aware-cell-flags
@@ -184,6 +189,12 @@ repeated only as clean builds.
 | `10m-reads-clean-prototype-first` | same | `BENCH_WORKLOADS=$READS ORDER=prototype-first ROUNDS=3 RESULTS_DIR=… run_paired.sh 10m` |
 | `1m-clean` | same | `FLAG_EVERY_ROUND=0 ROUNDS=3 RESULTS_DIR=… run_paired.sh 1m` |
 | `10m-reads-layout-control` | none: the baseline plus `control.patch` (in the results), outside any checkout | `CONTROL_WORKTREE=/abs/lance-layout-control RESULTS_DIR=… run_layout_control.sh` (defaults 3 rounds per order and the 10M read settings) |
+| `10m-reads-fix-baseline-first` | `2fd300ac2` plus the untracked counters bench, outside any checkout | `BENCH_WORKLOADS=$READS ORDER=baseline-first FLAG_EVERY_ROUND=0 ROUNDS=3 RESULTS_DIR=… run_paired.sh 10m` |
+| `10m-reads-fix-prototype-first` | same | `BENCH_WORKLOADS=$READS ORDER=prototype-first FLAG_EVERY_ROUND=0 ROUNDS=3 RESULTS_DIR=… run_paired.sh 10m` |
+
+The hardware-counter rotations on shared tables (`results/10m-noflag-investigation/`) use
+`cell_flags_scan_counters.rs`, `run_counters_rotation.sh` and `analyze_counters.py`. Their README
+has the commands and the variant patches.
 
 A checkout of this branch with `rust/` restored from `26388225a` (see Setup) has the clean runs'
 code and driver (their `env.json` has the `rustflags` field that `f1fb31606` added). Differences

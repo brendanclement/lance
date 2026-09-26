@@ -21,6 +21,11 @@ Prototype measurements on one local machine (Apple M5 Pro, 18 cores, 48 GB, APFS
   `1m-clean` (full 1M matrix), `10m-reads-clean-baseline-first`, `10m-reads-clean-prototype-first`,
   and the read reruns `1m-reads-maskfix`, `10m-reads-maskfix` and `10m-reads-reversed`, which
   record `e48573011`, a results-only commit with the same code.
+- `2fd300ac2`, the final code. For reads it differs from `26388225a` only in the fragment read
+  funnels, which keep `main`'s `merge_overlays` call and apply masks through a plain function:
+  `10m-reads-fix-baseline-first` and `10m-reads-fix-prototype-first`. The no-flag hardware-counter
+  rotations are in `results/10m-noflag-investigation/`. They have no section here; their README
+  has the tables.
 - Controls: `10m-reads-variant-fragment-reverted` (`26388225a` with `rust/lance/src/dataset/fragment.rs`
   reverted to the baseline; the rest of the prototype, including the masked-index check in
   `index.rs` and the manifest's cell flag decoding, stays) and `10m-reads-layout-control` (the
@@ -34,9 +39,9 @@ pass of #8655's benchmark acceptance criteria, and S3 was not measured.
 | Question | Authoritative run | Other runs |
 |---|---|---|
 | Regression on tables without flags, 1M | `1m-clean` | `1m` |
-| Regression on tables without flags, 10M reads | `10m-reads-clean-baseline-first` and `10m-reads-clean-prototype-first`, with the controls `10m-reads-layout-control` and `10m-reads-variant-fragment-reverted` | `10m`, `10m-reads-maskfix`, `10m-reads-reversed` |
+| Regression on tables without flags, 10M reads | `results/10m-noflag-investigation/` (shared tables, 20-round rotations, hardware counters) | `10m-reads-fix-*` (the fix, paired harness); `10m-reads-clean-*` with the controls `10m-reads-layout-control` and `10m-reads-variant-fragment-reverted`; `10m`, `10m-reads-maskfix`, `10m-reads-reversed` |
 | Flag invalidation, publication and conflict costs | `1m`, `10m` (flags vs no flags within one nested build) | `1m-clean` (one flag round, clean build) |
-| Masked reads | `1m-reads-maskfix`, `10m-reads-clean-*` (final mask builder) | `10m-reads-maskfix`, `10m-reads-reversed`, `1m-clean` (final builder); `1m`, `10m` (earlier builder) |
+| Masked reads | `1m-reads-maskfix`, `10m-reads-clean-*`, `10m-reads-fix-*` (final mask builder) | `10m-reads-maskfix`, `10m-reads-reversed`, `1m-clean` (final builder); `1m`, `10m` (earlier builder) |
 
 **Build-configuration caveat.** The prototype worktree sits under another Lance checkout, and cargo
 merges the `.cargo/config.toml` of every parent directory, concatenating `rustflags`, so every
@@ -57,23 +62,32 @@ unrelated-field updates 0.98× / 1.11× (`1m`: 1.16× / 1.20×), dense updates 1
 
 - **Tables without flags, 1M rows** (`1m-clean`, 3 rounds): every workload 0.96–1.04× baseline
   (dense `UpdateBuilder` 1.04×, everything else 0.96–1.03×; full-column reads 0.96–1.03×).
-- **Tables without flags, 10M rows, full-column reads** (scans, `IS NULL`, `COUNT` and SQL
-  counts): **1.06–1.09× baseline**, the geometric mean of `10m-reads-clean-baseline-first`
-  (1.05–1.07×) and `10m-reads-clean-prototype-first` (1.06–1.11×); selective reads (id range, take)
-  1.00–1.06×. Controls: the baseline plus one unused function (`10m-reads-layout-control`, 6
-  rounds) measured 0.99–1.04× on the same reads, with per-round ratios of 0.95–1.10×; the prototype
-  with `fragment.rs` reverted (`10m-reads-variant-fragment-reverted`, baseline first) measured
-  1.02–1.06×. The clean geometric mean exceeds the layout control by 2.6–7.7% per full-column
-  workload (median 4.7%). On a dataset without flags, the prototype's read path adds an `Option`
-  check per fragment open and per read call, an `Option<Arc<CellFlagMasks>>` field on
-  `FragmentReader`, a registry check per index in `scalar_index_info` and an optional registry in
-  the manifest decode; the variant kept only the last two. A sampling profile of the nested build
-  (`results/10m-profile/`) has the same six leading non-wait frames in both builds and cell flag
-  code in 2 of its 62,830 non-wait samples; of the 18 frames with at least 1% of the non-wait
-  samples in either build, all but `mach_absolute_time` (1.7% against 3.0%) differ in share by at
-  most 0.8 percentage points, though `_free` is 1.2% against 0.4%. No clean-build binary was
-  profiled. **An open regression, not attributed to a cause: profile the clean build with hardware
-  counters.**
+- **Tables without flags, 10M rows, full-column reads**: no extra work, and a code-generation
+  effect of a few percent whose sign depends on the build profile.
+  `results/10m-noflag-investigation/README.md` has the details.
+  - Method: shared tables, 20-round Latin-square rotations, and the process's retired
+    instructions and cycles per sample. Every comparison retired the same instructions to 0.3%.
+  - In the benchmark profile, the prototype measured 3.2–4.4% slower than `main`, with fewer cores
+    busy. Narrowly scoped variants traced this to the `async fn resolve_cells` wrapper around
+    `merge_overlays` in both `FragmentReader` read funnels.
+  - `2fd300ac2` restores `main`'s call. It measured 1.000–1.001× `main` in the run that measured
+    the prototype at 1.032–1.038×, and 1.000–1.032× over four rotations.
+  - Edits that do no work produce the same spread: `main` plus one unused `FragmentReader` field
+    measured 1.014–1.021×, and the fix with `main`'s `fragment.rs` 1.056–1.064×.
+  - In the shipping `release` profile (fat LTO, 1 codegen unit), one rotation put the prototype at
+    0.997–1.025×, the fix at 1.032–1.044× and `main` plus the unused field at 1.024–1.032×. So
+    `2fd300ac2` is not a performance fix; it stays because the unmasked read path is structurally
+    `main`'s.
+  - The paired harness overstated the regression. It writes a new table per process, and writes
+    are not byte-identical. Its clean runs put the prototype at **1.06–1.09×**, the
+    geometric mean of `10m-reads-clean-baseline-first` (1.05–1.07×) and
+    `10m-reads-clean-prototype-first` (1.06–1.11×).
+  - The fix's paired runs (`10m-reads-fix-*`) measured 1.00–1.07×, with round 1 favoring the fix
+    and rounds 2–3 the baseline in both orders.
+  - Selective reads (id range, take) measured 1.00–1.06× in the clean runs and 0.95–1.00× in the
+    fix runs.
+  - The earlier controls (`10m-reads-layout-control`, `10m-reads-variant-fragment-reverted`) and
+    the sampling profile of the nested build (`results/10m-profile/`) did not identify the cause.
 - **Flag costs, 1M** (`1m`, 3 rounds, flags vs no flags in one build): sparse `UpdateBuilder`
   1.11× (one output) / 1.15× (two sharing an input); unrelated-field update 1.16× / 1.20× (flag
   state moves with the rows); dense update 1.53× / 1.48× with manifest 2.8 KB → 336 KB / 502 KB;
@@ -84,7 +98,8 @@ unrelated-field updates 0.98× / 1.11× (`1m`: 1.16× / 1.20×), dense updates 1
 - **Masked reads, final mask builder**: all flags true 0.93–1.04× (`1m-reads-maskfix` 0.93–1.00×,
   `10m-reads-clean-*` 0.94–1.04×). With 1% of rows invalidated (scattered), full-column reads cost
   1.53–1.77× a plain NULL column at 1M (`1m-reads-maskfix`) and 1.68–1.80× at 10M
-  (`10m-reads-clean-*`); id-range filters and takes 0.91–1.00× (both). With the per-row builder at
+  (`10m-reads-clean-*`); id-range filters and takes 0.91–1.00× (both). At `2fd300ac2`
+  (`10m-reads-fix-*`, one flag round per order): all true 0.92–1.04×, 1% invalidated 1.60–1.81×. With the per-row builder at
   `21601f894`: all true 0.98–1.05× (`1m`) and 0.92–1.03× (`10m`), full-column reads with 1%
   invalidated 3.02–3.22× (`1m`) and 3.02–3.46× (`10m`).
 - **Refresh under concurrent writes** (`1m`, K commits of 10 rows): `Skip` publishes 999,990 /
@@ -3372,3 +3387,473 @@ One row per (build, workload, variant, cache) in the input.
 | prototype | filter_id_range_project_summary | null_1pct | fresh-session | 120 | 14.02 | 13.14 | 15.05 | 14.77 | - | - | - | - |
 | prototype | take_random_1k | null_1pct | fresh-session | 120 | 12.61 | 11.97 | 14.19 | 13.50 | - | - | - | - |
 <!-- END results:10m-reads-layout-control -->
+
+<!-- BEGIN results:10m-reads-fix-baseline-first -->
+## Clean build: 10M reads at `2fd300ac2`, baseline first, flags in round 3 only
+
+Source: `results/10m-reads-fix-baseline-first`
+
+### Environment
+
+| key | value |
+|---|---|
+| scale | `10m` |
+| profile | `release-with-debug` |
+| hw_model | `Mac17,8` |
+| cpu_brand | `Apple M5 Pro` |
+| ncpu | `18` |
+| memsize_bytes | `51539607552` |
+| macos | `26.7 (25G229)` |
+| rustc_baseline | `rustc 1.97.0 (2d8144b78 2026-07-07)` |
+| rustc_prototype | `rustc 1.97.0 (2d8144b78 2026-07-07)` |
+| baseline_sha | `e3671b2f5730eea927a088a42cbf30e273edc43c` |
+| prototype_sha | `2fd300ac2885f07d1357a0a438ceb874d7d6a519` |
+| rounds | `3` |
+| flag_every_round | `False` |
+| run_nice | `0` |
+| config | `{"BENCH_SCALE_ROWS": "10000000", "BENCH_ROWS_PER_FRAGMENT": "100000", "BENCH_SAMPLES": "3", "BENCH_READ_SAMPLES": "20", "BENCH_WARMUP": "1", "BENCH_WORKLOADS": "scan_summary_full,filter_summary_is_null_count,count_summary_vs_star,filter_id_range_project_summary,take_random_1k"}` |
+| baseline_status | dirty: M rust/lance/Cargo.toml; ?? rust/lance/benches/cell_flags_common/; ?? rust/lance/benches/cell_flags_regression.rs; ?? rust/lance/benches/cell_flags_scan_counters.rs |
+| prototype_status | dirty: M rust/lance/Cargo.toml; ?? rust/lance/benches/cell_flags_scan_counters.rs |
+
+Runs (load average before each run):
+
+```
+round	build	started	finished	loadavg_before
+1	baseline	2026-09-26T05:23:44Z	2026-09-26T05:24:32Z	26.24 20.98 15.76
+1	prototype	2026-09-26T05:24:32Z	2026-09-26T05:25:17Z	14.79 18.67 15.17
+2	baseline	2026-09-26T05:25:17Z	2026-09-26T05:25:59Z	8.83 16.54 14.57
+2	prototype	2026-09-26T05:26:00Z	2026-09-26T05:26:42Z	6.36 14.79 14.02
+3	baseline	2026-09-26T05:26:42Z	2026-09-26T05:27:25Z	5.54 13.49 13.58
+3	prototype	2026-09-26T05:27:25Z	2026-09-26T05:28:09Z	4.88 12.17 13.08
+3	prototype-flags	2026-09-26T05:28:09Z	2026-09-26T05:29:02Z	5.25 11.22 12.68
+```
+
+Records: 3600. Simulated UDF iterations: [16]. `udf_ms` is the labeled simulated UDF (FNV-1a rounds), reported apart from read, stage and commit time.
+`warm` reuses one Session; `fresh-session` opens with a new Session per sample. The OS page cache is not controlled, so no state here is a cold read.
+
+### Regression: tables without cell flags, baseline vs prototype
+
+Same harness binary source on both builds. Ratio = prototype / baseline median wall_ms, per round (paired) and the median of those. Conflict workloads are **not correctness-equivalent** (see notes): compare latency and IO only.
+
+| workload | variant | cache | base n | base med ms | base min | base max | base p95 | proto n | proto med ms | proto min | proto max | proto p95 | ratio (med) | ratio per round | base manifest B | proto manifest B | base txn B | proto txn B | base r_iops | proto r_iops | base written B | proto written B | outcome base / proto |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| scan_summary_full | populated | warm | 60 | 24.49 | 23.27 | 37.57 | 26.43 | 60 | 25.48 | 24.06 | 26.71 | 26.30 | 1.049 | 0.946 1.049 1.088 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| filter_summary_is_null_count | populated | warm | 60 | 26.60 | 25.34 | 28.70 | 28.06 | 60 | 26.84 | 26.00 | 28.62 | 28.56 | 1.021 | 0.966 1.021 1.063 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| count_summary_vs_star | populated:aggregate | warm | 60 | 24.58 | 23.44 | 26.52 | 26.32 | 60 | 25.20 | 24.03 | 26.98 | 26.64 | 1.016 | 0.970 1.016 1.077 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| count_summary_vs_star | populated:sql | warm | 60 | 33.79 | 32.16 | 35.97 | 34.72 | 60 | 34.03 | 32.36 | 35.71 | 35.06 | 0.999 | 0.985 0.999 1.026 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| filter_id_range_project_summary | populated | warm | 60 | 12.88 | 12.34 | 13.24 | 13.09 | 60 | 12.33 | 11.89 | 16.55 | 15.12 | 0.981 | 0.981 0.942 1.039 | 24,800 | 24,800 | 7,842 | 7,842 | 113 | 113 | 0 | 0 | - / - |
+| take_random_1k | populated | warm | 60 | 10.70 | 9.51 | 16.62 | 11.32 | 60 | 10.58 | 10.00 | 11.28 | 11.04 | 0.987 | 0.988 0.973 0.987 | 24,800 | 24,800 | 7,842 | 7,842 | 932 | 932 | 0 | 0 | - / - |
+| scan_summary_full | populated | fresh-session | 60 | 24.34 | 23.48 | 26.18 | 25.92 | 60 | 24.55 | 22.99 | 26.35 | 25.97 | 1.012 | 0.964 1.012 1.032 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| filter_summary_is_null_count | populated | fresh-session | 60 | 26.49 | 25.52 | 27.58 | 27.21 | 60 | 26.66 | 25.93 | 27.54 | 27.40 | 1.005 | 1.026 1.005 0.994 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| count_summary_vs_star | populated:aggregate | fresh-session | 60 | 24.35 | 23.19 | 26.10 | 25.13 | 60 | 24.99 | 23.75 | 25.64 | 25.60 | 1.032 | 1.044 1.032 0.989 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| count_summary_vs_star | populated:sql | fresh-session | 60 | 33.24 | 32.28 | 35.77 | 34.12 | 60 | 33.44 | 32.06 | 35.51 | 34.88 | 1.007 | 1.031 1.007 0.989 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| filter_id_range_project_summary | populated | fresh-session | 60 | 13.77 | 13.13 | 14.14 | 14.00 | 60 | 13.20 | 12.86 | 13.62 | 13.44 | 0.951 | 0.984 0.951 0.949 | 24,800 | 24,800 | 7,842 | 7,842 | 418 | 418 | 0 | 0 | - / - |
+| take_random_1k | populated | fresh-session | 60 | 12.58 | 12.03 | 13.30 | 13.00 | 60 | 12.61 | 11.91 | 13.54 | 12.96 | 1.002 | 1.004 0.985 1.002 | 24,800 | 24,800 | 7,842 | 7,842 | 1,132 | 1,132 | 0 | 0 | - / - |
+| scan_summary_full | null_1pct | warm | 60 | 26.19 | 25.03 | 27.10 | 26.79 | 60 | 26.50 | 25.60 | 27.06 | 26.93 | 1.007 | 1.025 1.007 1.000 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| filter_summary_is_null_count | null_1pct | warm | 60 | 30.05 | 28.85 | 30.86 | 30.55 | 60 | 29.83 | 28.78 | 30.77 | 30.70 | 0.994 | 0.994 0.997 0.994 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| count_summary_vs_star | null_1pct:aggregate | warm | 60 | 26.76 | 26.08 | 27.66 | 27.40 | 60 | 26.87 | 25.94 | 27.49 | 27.35 | 1.004 | 0.998 1.011 1.004 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| count_summary_vs_star | null_1pct:sql | warm | 60 | 36.27 | 35.33 | 37.11 | 36.95 | 60 | 36.03 | 34.90 | 49.85 | 37.13 | 0.994 | 0.994 1.000 0.984 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| filter_id_range_project_summary | null_1pct | warm | 60 | 13.02 | 12.45 | 13.33 | 13.30 | 60 | 12.41 | 12.22 | 12.67 | 12.61 | 0.952 | 0.979 0.952 0.942 | 24,800 | 24,800 | 7,842 | 7,842 | 113 | 113 | 0 | 0 | - / - |
+| take_random_1k | null_1pct | warm | 60 | 10.91 | 10.26 | 11.46 | 11.31 | 60 | 10.71 | 10.15 | 11.32 | 11.20 | 0.981 | 0.981 0.968 1.000 | 24,800 | 24,800 | 7,842 | 7,842 | 932 | 932 | 0 | 0 | - / - |
+| scan_summary_full | null_1pct | fresh-session | 60 | 26.74 | 26.00 | 29.21 | 27.64 | 60 | 27.13 | 26.36 | 29.75 | 28.14 | 1.012 | 1.026 1.012 1.002 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| filter_summary_is_null_count | null_1pct | fresh-session | 60 | 30.64 | 29.68 | 31.55 | 31.06 | 60 | 31.05 | 30.17 | 32.12 | 31.82 | 1.012 | 1.024 1.012 1.009 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| count_summary_vs_star | null_1pct:aggregate | fresh-session | 60 | 27.08 | 26.46 | 27.80 | 27.61 | 60 | 28.00 | 26.70 | 30.65 | 30.15 | 1.038 | 1.038 1.010 1.080 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| count_summary_vs_star | null_1pct:sql | fresh-session | 60 | 36.07 | 35.32 | 37.41 | 36.89 | 60 | 36.30 | 35.01 | 38.80 | 37.03 | 1.004 | 1.016 1.004 1.003 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| filter_id_range_project_summary | null_1pct | fresh-session | 60 | 13.90 | 13.18 | 14.16 | 14.11 | 60 | 13.34 | 12.98 | 13.68 | 13.60 | 0.956 | 0.980 0.956 0.956 | 24,800 | 24,800 | 7,842 | 7,842 | 418 | 418 | 0 | 0 | - / - |
+| take_random_1k | null_1pct | fresh-session | 60 | 12.77 | 12.11 | 13.45 | 13.31 | 60 | 12.72 | 11.99 | 13.66 | 13.19 | 0.987 | 0.985 0.987 1.002 | 24,800 | 24,800 | 7,842 | 7,842 | 1,132 | 1,132 | 0 | 0 | - / - |
+
+† baseline is NOT correctness-equivalent to the prototype (no dependency tracking).
+
+### Flag overhead: prototype without flags vs prototype with dependent masking flags
+
+Both from the prototype build. Ratio = flags / no-flags median wall_ms (paired by round). Updates run on a fully published table; `groups=2` adds a second output sharing `body`. Reads compare `populated` with `all_true` and `null_1pct` (stored NULLs) with `partial_1pct` (masked by false flags), on the same ids.
+
+| flag workload | variant | cache | compared with | plain n | plain med ms | plain min | plain max | plain p95 | flags n | flags med ms | flags min | flags max | flags p95 | ratio (med) | ratio per round | plain commit ms | flags commit ms | plain manifest B | flags manifest B | plain txn B | flags txn B | plain written B | flags written B |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| scan_summary_full | all_true | warm | scan_summary_full:populated | 60 | 25.48 | 24.06 | 26.71 | 26.30 | 20 | 23.86 | 23.17 | 24.36 | 24.29 | 0.920 | 0.920 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| filter_summary_is_null_count | all_true | warm | filter_summary_is_null_count:populated | 60 | 26.84 | 26.00 | 28.62 | 28.56 | 20 | 26.05 | 25.64 | 26.83 | 26.59 | 0.923 | 0.923 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| count_summary_vs_star | all_true:aggregate | warm | count_summary_vs_star:populated:aggregate | 60 | 25.20 | 24.03 | 26.98 | 26.64 | 20 | 24.12 | 23.93 | 25.01 | 24.74 | 0.919 | 0.919 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| count_summary_vs_star | all_true:sql | warm | count_summary_vs_star:populated:sql | 60 | 34.03 | 32.36 | 35.71 | 35.06 | 20 | 32.04 | 31.06 | 32.92 | 32.80 | 0.925 | 0.925 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| filter_id_range_project_summary | all_true | warm | filter_id_range_project_summary:populated | 60 | 12.33 | 11.89 | 16.55 | 15.12 | 20 | 12.65 | 12.35 | 12.87 | 12.76 | 0.934 | 0.934 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| take_random_1k | all_true | warm | take_random_1k:populated | 60 | 10.58 | 10.00 | 11.28 | 11.04 | 20 | 10.55 | 9.81 | 11.22 | 11.22 | 1.011 | 1.011 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| scan_summary_full | all_true | fresh-session | scan_summary_full:populated | 60 | 24.55 | 22.99 | 26.35 | 25.97 | 20 | 23.92 | 23.36 | 24.67 | 24.59 | 0.952 | 0.952 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| filter_summary_is_null_count | all_true | fresh-session | filter_summary_is_null_count:populated | 60 | 26.66 | 25.93 | 27.54 | 27.40 | 20 | 26.71 | 26.17 | 27.16 | 27.05 | 1.006 | 1.006 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| count_summary_vs_star | all_true:aggregate | fresh-session | count_summary_vs_star:populated:aggregate | 60 | 24.99 | 23.75 | 25.64 | 25.60 | 20 | 24.42 | 23.89 | 24.95 | 24.87 | 1.002 | 1.002 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| count_summary_vs_star | all_true:sql | fresh-session | count_summary_vs_star:populated:sql | 60 | 33.44 | 32.06 | 35.51 | 34.88 | 20 | 32.36 | 31.60 | 34.39 | 33.09 | 0.973 | 0.973 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| filter_id_range_project_summary | all_true | fresh-session | filter_id_range_project_summary:populated | 60 | 13.20 | 12.86 | 13.62 | 13.44 | 20 | 13.60 | 13.42 | 13.85 | 13.78 | 1.030 | 1.030 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| take_random_1k | all_true | fresh-session | take_random_1k:populated | 60 | 12.61 | 11.91 | 13.54 | 12.96 | 20 | 12.43 | 11.92 | 12.95 | 12.92 | 0.994 | 0.994 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| scan_summary_full | partial_1pct | warm | scan_summary_full:null_1pct | 60 | 26.50 | 25.60 | 27.06 | 26.93 | 20 | 45.79 | 40.76 | 47.44 | 47.33 | 1.728 | 1.728 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| filter_summary_is_null_count | partial_1pct | warm | filter_summary_is_null_count:null_1pct | 60 | 29.83 | 28.78 | 30.77 | 30.70 | 20 | 50.41 | 44.32 | 53.56 | 53.06 | 1.679 | 1.679 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| count_summary_vs_star | partial_1pct:aggregate | warm | count_summary_vs_star:null_1pct:aggregate | 60 | 26.87 | 25.94 | 27.49 | 27.35 | 20 | 47.57 | 43.80 | 51.38 | 49.20 | 1.769 | 1.769 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| count_summary_vs_star | partial_1pct:sql | warm | count_summary_vs_star:null_1pct:sql | 60 | 36.03 | 34.90 | 49.85 | 37.13 | 20 | 65.20 | 58.99 | 66.25 | 65.97 | 1.808 | 1.808 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| filter_id_range_project_summary | partial_1pct | warm | filter_id_range_project_summary:null_1pct | 60 | 12.41 | 12.22 | 12.67 | 12.61 | 20 | 12.68 | 12.35 | 12.84 | 12.84 | 1.017 | 1.017 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| take_random_1k | partial_1pct | warm | take_random_1k:null_1pct | 60 | 10.71 | 10.15 | 11.32 | 11.20 | 20 | 10.57 | 10.20 | 11.02 | 10.93 | 0.979 | 0.979 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| scan_summary_full | partial_1pct | fresh-session | scan_summary_full:null_1pct | 60 | 27.13 | 26.36 | 29.75 | 28.14 | 20 | 47.18 | 39.14 | 48.75 | 48.35 | 1.741 | 1.741 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| filter_summary_is_null_count | partial_1pct | fresh-session | filter_summary_is_null_count:null_1pct | 60 | 31.05 | 30.17 | 32.12 | 31.82 | 20 | 51.60 | 48.22 | 52.95 | 52.44 | 1.665 | 1.665 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| count_summary_vs_star | partial_1pct:aggregate | fresh-session | count_summary_vs_star:null_1pct:aggregate | 60 | 28.00 | 26.70 | 30.65 | 30.15 | 20 | 47.63 | 41.46 | 48.94 | 48.72 | 1.624 | 1.624 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| count_summary_vs_star | partial_1pct:sql | fresh-session | count_summary_vs_star:null_1pct:sql | 60 | 36.30 | 35.01 | 38.80 | 37.03 | 20 | 65.06 | 59.98 | 66.08 | 66.00 | 1.793 | 1.793 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| filter_id_range_project_summary | partial_1pct | fresh-session | filter_id_range_project_summary:null_1pct | 60 | 13.34 | 12.98 | 13.68 | 13.60 | 20 | 13.38 | 13.18 | 20.82 | 19.60 | 0.997 | 0.997 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| take_random_1k | partial_1pct | fresh-session | take_random_1k:null_1pct | 60 | 12.72 | 11.99 | 13.66 | 13.19 | 20 | 12.65 | 12.27 | 13.15 | 13.03 | 0.999 | 0.999 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| scan_summary_full | all_pending | warm | (no counterpart) | - | - | - | - | - | 20 | 2.71 | 2.66 | 2.76 | 2.74 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| filter_summary_is_null_count | all_pending | warm | (no counterpart) | - | - | - | - | - | 20 | 5.52 | 5.32 | 5.73 | 5.71 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| count_summary_vs_star | all_pending:aggregate | warm | (no counterpart) | - | - | - | - | - | 20 | 3.17 | 3.12 | 3.25 | 3.24 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| count_summary_vs_star | all_pending:sql | warm | (no counterpart) | - | - | - | - | - | 20 | 6.82 | 6.73 | 6.93 | 6.92 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| filter_id_range_project_summary | all_pending | warm | (no counterpart) | - | - | - | - | - | 20 | 11.77 | 11.62 | 11.95 | 11.93 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| take_random_1k | all_pending | warm | (no counterpart) | - | - | - | - | - | 20 | 0.36 | 0.36 | 0.41 | 0.39 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| scan_summary_full | all_pending | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 2.71 | 2.66 | 2.75 | 2.73 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| filter_summary_is_null_count | all_pending | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 5.45 | 5.38 | 5.54 | 5.52 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| count_summary_vs_star | all_pending:aggregate | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 3.19 | 3.15 | 3.25 | 3.24 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| count_summary_vs_star | all_pending:sql | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 6.85 | 6.78 | 7.18 | 7.01 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| filter_id_range_project_summary | all_pending | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 12.57 | 12.34 | 12.69 | 12.68 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| take_random_1k | all_pending | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 0.38 | 0.37 | 0.42 | 0.42 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+
+### Refresh under concurrent source writes
+
+A full `summary` refresh staged at V, K source commits of 10 scattered rows each, then the publication at V. `commit ms` is the conflict-checked publication commit. `merge_insert_output_in_place` writes `summary` itself (an output override); it is the only source write here that defers whole groups.
+
+No flagged conflict records.
+
+### Follow-up refresh to completion: saved and repeated computation
+
+From the state the conflicted publication left, each strategy refreshes every pending row and publishes; afterwards every flag is asserted true and every value equal to the UDF of its current inputs. `recompute_all_pending` ignores the report; `reuse_valid_staged` reuses staged values of `PublicationReport::reusable_rows` (Reject returns an error, so it has no report). `total UDF rows` = rows the conflicted publication computed + rows the follow-up recomputed; with N rows, anything above N is repeated computation.
+
+No follow-up records.
+
+### Publication commit latency after K unrelated commits
+
+`wall = commit_ms` of the publication only. Conflict checks read every transaction since the read version.
+
+No publish_after_k records.
+
+### Flag state size as the true set fragments
+
+Head after one in-place `body` write invalidating the given fraction of scattered rows. `groups=0` is the unflagged control with the same data files. `wall` is a fresh-session open (OS page cache not controlled).
+
+No flag_state_size records.
+
+### Every group (wall_ms)
+
+One row per (build, workload, variant, cache) in the input.
+
+| build | workload | variant | cache | n | med ms | min | max | p95 | udf med ms | stage med ms | commit med ms | outcome |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| baseline | scan_summary_full | populated | warm | 60 | 24.49 | 23.27 | 37.57 | 26.43 | - | - | - | - |
+| baseline | filter_summary_is_null_count | populated | warm | 60 | 26.60 | 25.34 | 28.70 | 28.06 | - | - | - | - |
+| baseline | count_summary_vs_star | populated:aggregate | warm | 60 | 24.58 | 23.44 | 26.52 | 26.32 | - | - | - | - |
+| baseline | count_summary_vs_star | populated:sql | warm | 60 | 33.79 | 32.16 | 35.97 | 34.72 | - | - | - | - |
+| baseline | filter_id_range_project_summary | populated | warm | 60 | 12.88 | 12.34 | 13.24 | 13.09 | - | - | - | - |
+| baseline | take_random_1k | populated | warm | 60 | 10.70 | 9.51 | 16.62 | 11.32 | - | - | - | - |
+| baseline | scan_summary_full | populated | fresh-session | 60 | 24.34 | 23.48 | 26.18 | 25.92 | - | - | - | - |
+| baseline | filter_summary_is_null_count | populated | fresh-session | 60 | 26.49 | 25.52 | 27.58 | 27.21 | - | - | - | - |
+| baseline | count_summary_vs_star | populated:aggregate | fresh-session | 60 | 24.35 | 23.19 | 26.10 | 25.13 | - | - | - | - |
+| baseline | count_summary_vs_star | populated:sql | fresh-session | 60 | 33.24 | 32.28 | 35.77 | 34.12 | - | - | - | - |
+| baseline | filter_id_range_project_summary | populated | fresh-session | 60 | 13.77 | 13.13 | 14.14 | 14.00 | - | - | - | - |
+| baseline | take_random_1k | populated | fresh-session | 60 | 12.58 | 12.03 | 13.30 | 13.00 | - | - | - | - |
+| baseline | scan_summary_full | null_1pct | warm | 60 | 26.19 | 25.03 | 27.10 | 26.79 | - | - | - | - |
+| baseline | filter_summary_is_null_count | null_1pct | warm | 60 | 30.05 | 28.85 | 30.86 | 30.55 | - | - | - | - |
+| baseline | count_summary_vs_star | null_1pct:aggregate | warm | 60 | 26.76 | 26.08 | 27.66 | 27.40 | - | - | - | - |
+| baseline | count_summary_vs_star | null_1pct:sql | warm | 60 | 36.27 | 35.33 | 37.11 | 36.95 | - | - | - | - |
+| baseline | filter_id_range_project_summary | null_1pct | warm | 60 | 13.02 | 12.45 | 13.33 | 13.30 | - | - | - | - |
+| baseline | take_random_1k | null_1pct | warm | 60 | 10.91 | 10.26 | 11.46 | 11.31 | - | - | - | - |
+| baseline | scan_summary_full | null_1pct | fresh-session | 60 | 26.74 | 26.00 | 29.21 | 27.64 | - | - | - | - |
+| baseline | filter_summary_is_null_count | null_1pct | fresh-session | 60 | 30.64 | 29.68 | 31.55 | 31.06 | - | - | - | - |
+| baseline | count_summary_vs_star | null_1pct:aggregate | fresh-session | 60 | 27.08 | 26.46 | 27.80 | 27.61 | - | - | - | - |
+| baseline | count_summary_vs_star | null_1pct:sql | fresh-session | 60 | 36.07 | 35.32 | 37.41 | 36.89 | - | - | - | - |
+| baseline | filter_id_range_project_summary | null_1pct | fresh-session | 60 | 13.90 | 13.18 | 14.16 | 14.11 | - | - | - | - |
+| baseline | take_random_1k | null_1pct | fresh-session | 60 | 12.77 | 12.11 | 13.45 | 13.31 | - | - | - | - |
+| prototype | scan_summary_full | populated | warm | 60 | 25.48 | 24.06 | 26.71 | 26.30 | - | - | - | - |
+| prototype | filter_summary_is_null_count | populated | warm | 60 | 26.84 | 26.00 | 28.62 | 28.56 | - | - | - | - |
+| prototype | count_summary_vs_star | populated:aggregate | warm | 60 | 25.20 | 24.03 | 26.98 | 26.64 | - | - | - | - |
+| prototype | count_summary_vs_star | populated:sql | warm | 60 | 34.03 | 32.36 | 35.71 | 35.06 | - | - | - | - |
+| prototype | filter_id_range_project_summary | populated | warm | 60 | 12.33 | 11.89 | 16.55 | 15.12 | - | - | - | - |
+| prototype | take_random_1k | populated | warm | 60 | 10.58 | 10.00 | 11.28 | 11.04 | - | - | - | - |
+| prototype | scan_summary_full | populated | fresh-session | 60 | 24.55 | 22.99 | 26.35 | 25.97 | - | - | - | - |
+| prototype | filter_summary_is_null_count | populated | fresh-session | 60 | 26.66 | 25.93 | 27.54 | 27.40 | - | - | - | - |
+| prototype | count_summary_vs_star | populated:aggregate | fresh-session | 60 | 24.99 | 23.75 | 25.64 | 25.60 | - | - | - | - |
+| prototype | count_summary_vs_star | populated:sql | fresh-session | 60 | 33.44 | 32.06 | 35.51 | 34.88 | - | - | - | - |
+| prototype | filter_id_range_project_summary | populated | fresh-session | 60 | 13.20 | 12.86 | 13.62 | 13.44 | - | - | - | - |
+| prototype | take_random_1k | populated | fresh-session | 60 | 12.61 | 11.91 | 13.54 | 12.96 | - | - | - | - |
+| prototype | scan_summary_full | null_1pct | warm | 60 | 26.50 | 25.60 | 27.06 | 26.93 | - | - | - | - |
+| prototype | filter_summary_is_null_count | null_1pct | warm | 60 | 29.83 | 28.78 | 30.77 | 30.70 | - | - | - | - |
+| prototype | count_summary_vs_star | null_1pct:aggregate | warm | 60 | 26.87 | 25.94 | 27.49 | 27.35 | - | - | - | - |
+| prototype | count_summary_vs_star | null_1pct:sql | warm | 60 | 36.03 | 34.90 | 49.85 | 37.13 | - | - | - | - |
+| prototype | filter_id_range_project_summary | null_1pct | warm | 60 | 12.41 | 12.22 | 12.67 | 12.61 | - | - | - | - |
+| prototype | take_random_1k | null_1pct | warm | 60 | 10.71 | 10.15 | 11.32 | 11.20 | - | - | - | - |
+| prototype | scan_summary_full | null_1pct | fresh-session | 60 | 27.13 | 26.36 | 29.75 | 28.14 | - | - | - | - |
+| prototype | filter_summary_is_null_count | null_1pct | fresh-session | 60 | 31.05 | 30.17 | 32.12 | 31.82 | - | - | - | - |
+| prototype | count_summary_vs_star | null_1pct:aggregate | fresh-session | 60 | 28.00 | 26.70 | 30.65 | 30.15 | - | - | - | - |
+| prototype | count_summary_vs_star | null_1pct:sql | fresh-session | 60 | 36.30 | 35.01 | 38.80 | 37.03 | - | - | - | - |
+| prototype | filter_id_range_project_summary | null_1pct | fresh-session | 60 | 13.34 | 12.98 | 13.68 | 13.60 | - | - | - | - |
+| prototype | take_random_1k | null_1pct | fresh-session | 60 | 12.72 | 11.99 | 13.66 | 13.19 | - | - | - | - |
+| prototype-flags | scan_summary_full | all_true | warm | 20 | 23.86 | 23.17 | 24.36 | 24.29 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | all_true | warm | 20 | 26.05 | 25.64 | 26.83 | 26.59 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_true:aggregate | warm | 20 | 24.12 | 23.93 | 25.01 | 24.74 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_true:sql | warm | 20 | 32.04 | 31.06 | 32.92 | 32.80 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | all_true | warm | 20 | 12.65 | 12.35 | 12.87 | 12.76 | - | - | - | - |
+| prototype-flags | take_random_1k | all_true | warm | 20 | 10.55 | 9.81 | 11.22 | 11.22 | - | - | - | - |
+| prototype-flags | scan_summary_full | all_true | fresh-session | 20 | 23.92 | 23.36 | 24.67 | 24.59 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | all_true | fresh-session | 20 | 26.71 | 26.17 | 27.16 | 27.05 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_true:aggregate | fresh-session | 20 | 24.42 | 23.89 | 24.95 | 24.87 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_true:sql | fresh-session | 20 | 32.36 | 31.60 | 34.39 | 33.09 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | all_true | fresh-session | 20 | 13.60 | 13.42 | 13.85 | 13.78 | - | - | - | - |
+| prototype-flags | take_random_1k | all_true | fresh-session | 20 | 12.43 | 11.92 | 12.95 | 12.92 | - | - | - | - |
+| prototype-flags | scan_summary_full | partial_1pct | warm | 20 | 45.79 | 40.76 | 47.44 | 47.33 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | partial_1pct | warm | 20 | 50.41 | 44.32 | 53.56 | 53.06 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | partial_1pct:aggregate | warm | 20 | 47.57 | 43.80 | 51.38 | 49.20 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | partial_1pct:sql | warm | 20 | 65.20 | 58.99 | 66.25 | 65.97 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | partial_1pct | warm | 20 | 12.68 | 12.35 | 12.84 | 12.84 | - | - | - | - |
+| prototype-flags | take_random_1k | partial_1pct | warm | 20 | 10.57 | 10.20 | 11.02 | 10.93 | - | - | - | - |
+| prototype-flags | scan_summary_full | partial_1pct | fresh-session | 20 | 47.18 | 39.14 | 48.75 | 48.35 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | partial_1pct | fresh-session | 20 | 51.60 | 48.22 | 52.95 | 52.44 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | partial_1pct:aggregate | fresh-session | 20 | 47.63 | 41.46 | 48.94 | 48.72 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | partial_1pct:sql | fresh-session | 20 | 65.06 | 59.98 | 66.08 | 66.00 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | partial_1pct | fresh-session | 20 | 13.38 | 13.18 | 20.82 | 19.60 | - | - | - | - |
+| prototype-flags | take_random_1k | partial_1pct | fresh-session | 20 | 12.65 | 12.27 | 13.15 | 13.03 | - | - | - | - |
+| prototype-flags | scan_summary_full | all_pending | warm | 20 | 2.71 | 2.66 | 2.76 | 2.74 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | all_pending | warm | 20 | 5.52 | 5.32 | 5.73 | 5.71 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_pending:aggregate | warm | 20 | 3.17 | 3.12 | 3.25 | 3.24 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_pending:sql | warm | 20 | 6.82 | 6.73 | 6.93 | 6.92 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | all_pending | warm | 20 | 11.77 | 11.62 | 11.95 | 11.93 | - | - | - | - |
+| prototype-flags | take_random_1k | all_pending | warm | 20 | 0.36 | 0.36 | 0.41 | 0.39 | - | - | - | - |
+| prototype-flags | scan_summary_full | all_pending | fresh-session | 20 | 2.71 | 2.66 | 2.75 | 2.73 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | all_pending | fresh-session | 20 | 5.45 | 5.38 | 5.54 | 5.52 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_pending:aggregate | fresh-session | 20 | 3.19 | 3.15 | 3.25 | 3.24 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_pending:sql | fresh-session | 20 | 6.85 | 6.78 | 7.18 | 7.01 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | all_pending | fresh-session | 20 | 12.57 | 12.34 | 12.69 | 12.68 | - | - | - | - |
+| prototype-flags | take_random_1k | all_pending | fresh-session | 20 | 0.38 | 0.37 | 0.42 | 0.42 | - | - | - | - |
+<!-- END results:10m-reads-fix-baseline-first -->
+
+<!-- BEGIN results:10m-reads-fix-prototype-first -->
+## Clean build: 10M reads at `2fd300ac2`, prototype first, flags in round 3 only
+
+Source: `results/10m-reads-fix-prototype-first`
+
+### Environment
+
+| key | value |
+|---|---|
+| scale | `10m` |
+| profile | `release-with-debug` |
+| hw_model | `Mac17,8` |
+| cpu_brand | `Apple M5 Pro` |
+| ncpu | `18` |
+| memsize_bytes | `51539607552` |
+| macos | `26.7 (25G229)` |
+| rustc_baseline | `rustc 1.97.0 (2d8144b78 2026-07-07)` |
+| rustc_prototype | `rustc 1.97.0 (2d8144b78 2026-07-07)` |
+| baseline_sha | `e3671b2f5730eea927a088a42cbf30e273edc43c` |
+| prototype_sha | `2fd300ac2885f07d1357a0a438ceb874d7d6a519` |
+| rounds | `3` |
+| flag_every_round | `False` |
+| run_nice | `0` |
+| config | `{"BENCH_SCALE_ROWS": "10000000", "BENCH_ROWS_PER_FRAGMENT": "100000", "BENCH_SAMPLES": "3", "BENCH_READ_SAMPLES": "20", "BENCH_WARMUP": "1", "BENCH_WORKLOADS": "scan_summary_full,filter_summary_is_null_count,count_summary_vs_star,filter_id_range_project_summary,take_random_1k"}` |
+| baseline_status | dirty: M rust/lance/Cargo.toml; ?? rust/lance/benches/cell_flags_common/; ?? rust/lance/benches/cell_flags_regression.rs; ?? rust/lance/benches/cell_flags_scan_counters.rs |
+| prototype_status | dirty: M prototypes/dependent-cell-flags/bench/REPORT.md;  M rust/lance/Cargo.toml; ?? prototypes/dependent-cell-flags/bench/results/10m-reads-fix-baseline-first/; ?? rust/lance/benches/cell_flags_scan_counters.rs |
+
+Runs (load average before each run):
+
+```
+round	build	started	finished	loadavg_before
+1	prototype	2026-09-26T05:29:05Z	2026-09-26T05:29:47Z	5.09 10.16 12.19
+1	baseline	2026-09-26T05:29:47Z	2026-09-26T05:30:31Z	5.26 9.53 11.87
+2	prototype	2026-09-26T05:30:31Z	2026-09-26T05:31:15Z	4.06 8.58 11.39
+2	baseline	2026-09-26T05:31:15Z	2026-09-26T05:31:58Z	4.67 8.03 11.04
+3	prototype	2026-09-26T05:31:58Z	2026-09-26T05:32:42Z	4.31 7.48 10.70
+3	baseline	2026-09-26T05:32:42Z	2026-09-26T05:33:25Z	4.50 7.05 10.37
+3	prototype-flags	2026-09-26T05:33:25Z	2026-09-26T05:34:17Z	4.85 6.75 10.09
+```
+
+Records: 3600. Simulated UDF iterations: [16]. `udf_ms` is the labeled simulated UDF (FNV-1a rounds), reported apart from read, stage and commit time.
+`warm` reuses one Session; `fresh-session` opens with a new Session per sample. The OS page cache is not controlled, so no state here is a cold read.
+
+### Regression: tables without cell flags, baseline vs prototype
+
+Same harness binary source on both builds. Ratio = prototype / baseline median wall_ms, per round (paired) and the median of those. Conflict workloads are **not correctness-equivalent** (see notes): compare latency and IO only.
+
+| workload | variant | cache | base n | base med ms | base min | base max | base p95 | proto n | proto med ms | proto min | proto max | proto p95 | ratio (med) | ratio per round | base manifest B | proto manifest B | base txn B | proto txn B | base r_iops | proto r_iops | base written B | proto written B | outcome base / proto |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| scan_summary_full | populated | warm | 60 | 24.04 | 23.29 | 26.79 | 26.19 | 60 | 25.82 | 23.74 | 26.56 | 26.41 | 1.070 | 0.928 1.070 1.096 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| filter_summary_is_null_count | populated | warm | 60 | 26.48 | 25.30 | 28.88 | 28.55 | 60 | 27.78 | 25.88 | 28.67 | 28.38 | 1.054 | 0.926 1.054 1.088 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| count_summary_vs_star | populated:aggregate | warm | 60 | 24.61 | 23.67 | 35.79 | 27.06 | 60 | 26.08 | 23.96 | 27.02 | 26.69 | 1.063 | 0.921 1.063 1.089 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| count_summary_vs_star | populated:sql | warm | 60 | 34.06 | 31.79 | 39.61 | 37.07 | 60 | 34.79 | 32.45 | 36.06 | 35.68 | 1.020 | 0.917 1.020 1.064 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| filter_id_range_project_summary | populated | warm | 60 | 13.10 | 12.18 | 18.17 | 15.76 | 60 | 12.50 | 12.18 | 13.12 | 13.05 | 0.974 | 0.944 0.974 0.997 | 24,800 | 24,800 | 7,842 | 7,842 | 113 | 113 | 0 | 0 | - / - |
+| take_random_1k | populated | warm | 60 | 10.64 | 10.19 | 11.09 | 11.02 | 60 | 10.57 | 9.91 | 11.36 | 10.90 | 0.988 | 0.988 0.983 0.998 | 24,800 | 24,800 | 7,842 | 7,842 | 932 | 932 | 0 | 0 | - / - |
+| scan_summary_full | populated | fresh-session | 60 | 24.45 | 23.02 | 26.58 | 26.31 | 60 | 25.78 | 23.81 | 27.25 | 26.70 | 1.060 | 0.926 1.060 1.097 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| filter_summary_is_null_count | populated | fresh-session | 60 | 27.15 | 25.77 | 29.42 | 29.28 | 60 | 28.20 | 25.99 | 29.06 | 28.98 | 1.043 | 0.911 1.043 1.085 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| count_summary_vs_star | populated:aggregate | fresh-session | 60 | 24.95 | 23.99 | 33.89 | 27.28 | 60 | 26.08 | 24.01 | 29.01 | 27.15 | 1.046 | 0.925 1.046 1.102 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| count_summary_vs_star | populated:sql | fresh-session | 60 | 34.39 | 32.46 | 36.10 | 35.81 | 60 | 34.89 | 32.68 | 36.47 | 35.85 | 1.017 | 0.950 1.017 1.067 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| filter_id_range_project_summary | populated | fresh-session | 60 | 13.68 | 13.08 | 14.40 | 14.32 | 60 | 13.41 | 13.09 | 14.07 | 13.87 | 0.976 | 0.976 0.970 0.998 | 24,800 | 24,800 | 7,842 | 7,842 | 418 | 418 | 0 | 0 | - / - |
+| take_random_1k | populated | fresh-session | 60 | 12.51 | 11.59 | 13.39 | 13.35 | 60 | 12.44 | 11.89 | 12.98 | 12.78 | 1.002 | 1.012 0.981 1.002 | 24,800 | 24,800 | 7,842 | 7,842 | 1,132 | 1,132 | 0 | 0 | - / - |
+| scan_summary_full | null_1pct | warm | 60 | 26.44 | 25.11 | 28.03 | 27.86 | 60 | 27.62 | 25.90 | 28.74 | 28.45 | 1.063 | 0.952 1.063 1.076 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| filter_summary_is_null_count | null_1pct | warm | 60 | 30.17 | 29.18 | 32.48 | 32.32 | 60 | 31.31 | 28.90 | 32.87 | 32.47 | 1.055 | 0.939 1.055 1.077 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| count_summary_vs_star | null_1pct:aggregate | warm | 60 | 26.52 | 25.73 | 28.94 | 28.85 | 60 | 28.22 | 25.84 | 29.67 | 28.90 | 1.069 | 0.937 1.069 1.092 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| count_summary_vs_star | null_1pct:sql | warm | 60 | 37.09 | 34.76 | 39.00 | 38.93 | 60 | 38.02 | 35.71 | 44.29 | 40.55 | 1.016 | 0.971 1.016 1.068 | 24,800 | 24,800 | 7,842 | 7,842 | 100 | 100 | 0 | 0 | - / - |
+| filter_id_range_project_summary | null_1pct | warm | 60 | 12.92 | 12.48 | 13.42 | 13.34 | 60 | 12.80 | 12.33 | 13.68 | 13.32 | 0.986 | 1.016 0.972 0.986 | 24,800 | 24,800 | 7,842 | 7,842 | 113 | 113 | 0 | 0 | - / - |
+| take_random_1k | null_1pct | warm | 60 | 10.75 | 10.03 | 13.27 | 11.18 | 60 | 10.70 | 10.13 | 13.53 | 11.24 | 0.997 | 0.989 0.997 1.016 | 24,800 | 24,800 | 7,842 | 7,842 | 932 | 932 | 0 | 0 | - / - |
+| scan_summary_full | null_1pct | fresh-session | 60 | 26.88 | 25.86 | 28.97 | 28.67 | 60 | 28.51 | 26.36 | 29.52 | 29.29 | 1.063 | 0.954 1.063 1.092 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| filter_summary_is_null_count | null_1pct | fresh-session | 60 | 31.12 | 29.23 | 33.07 | 32.79 | 60 | 32.49 | 29.81 | 33.49 | 33.22 | 1.044 | 0.945 1.044 1.078 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| count_summary_vs_star | null_1pct:aggregate | fresh-session | 60 | 27.51 | 26.56 | 29.85 | 29.65 | 60 | 28.74 | 26.91 | 30.39 | 29.88 | 1.056 | 0.925 1.056 1.084 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| count_summary_vs_star | null_1pct:sql | fresh-session | 60 | 36.87 | 35.23 | 39.03 | 38.99 | 60 | 37.51 | 35.81 | 40.09 | 39.09 | 1.018 | 0.942 1.018 1.081 | 24,800 | 24,800 | 7,842 | 7,842 | 300 | 300 | 0 | 0 | - / - |
+| filter_id_range_project_summary | null_1pct | fresh-session | 60 | 13.82 | 13.38 | 14.48 | 14.36 | 60 | 13.59 | 13.15 | 14.15 | 13.89 | 0.982 | 0.982 0.967 0.992 | 24,800 | 24,800 | 7,842 | 7,842 | 418 | 418 | 0 | 0 | - / - |
+| take_random_1k | null_1pct | fresh-session | 60 | 12.67 | 12.16 | 13.24 | 13.00 | 60 | 12.72 | 12.10 | 13.89 | 13.58 | 1.003 | 1.003 0.991 1.043 | 24,800 | 24,800 | 7,842 | 7,842 | 1,132 | 1,132 | 0 | 0 | - / - |
+
+† baseline is NOT correctness-equivalent to the prototype (no dependency tracking).
+
+### Flag overhead: prototype without flags vs prototype with dependent masking flags
+
+Both from the prototype build. Ratio = flags / no-flags median wall_ms (paired by round). Updates run on a fully published table; `groups=2` adds a second output sharing `body`. Reads compare `populated` with `all_true` and `null_1pct` (stored NULLs) with `partial_1pct` (masked by false flags), on the same ids.
+
+| flag workload | variant | cache | compared with | plain n | plain med ms | plain min | plain max | plain p95 | flags n | flags med ms | flags min | flags max | flags p95 | ratio (med) | ratio per round | plain commit ms | flags commit ms | plain manifest B | flags manifest B | plain txn B | flags txn B | plain written B | flags written B |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| scan_summary_full | all_true | warm | scan_summary_full:populated | 60 | 25.82 | 23.74 | 26.56 | 26.41 | 20 | 24.47 | 24.04 | 25.26 | 25.24 | 0.938 | 0.938 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| filter_summary_is_null_count | all_true | warm | filter_summary_is_null_count:populated | 60 | 27.78 | 25.88 | 28.67 | 28.38 | 20 | 26.62 | 26.13 | 27.28 | 27.24 | 0.948 | 0.948 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| count_summary_vs_star | all_true:aggregate | warm | count_summary_vs_star:populated:aggregate | 60 | 26.08 | 23.96 | 27.02 | 26.69 | 20 | 24.74 | 24.32 | 25.30 | 25.19 | 0.937 | 0.937 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| count_summary_vs_star | all_true:sql | warm | count_summary_vs_star:populated:sql | 60 | 34.79 | 32.45 | 36.06 | 35.68 | 20 | 33.04 | 32.36 | 33.94 | 33.70 | 0.939 | 0.939 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| filter_id_range_project_summary | all_true | warm | filter_id_range_project_summary:populated | 60 | 12.50 | 12.18 | 13.12 | 13.05 | 20 | 12.86 | 12.68 | 13.27 | 13.19 | 1.035 | 1.035 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| take_random_1k | all_true | warm | take_random_1k:populated | 60 | 10.57 | 9.91 | 11.36 | 10.90 | 20 | 10.61 | 10.16 | 11.31 | 11.28 | 0.997 | 0.997 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| scan_summary_full | all_true | fresh-session | scan_summary_full:populated | 60 | 25.78 | 23.81 | 27.25 | 26.70 | 20 | 24.70 | 23.90 | 29.01 | 27.83 | 0.941 | 0.941 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| filter_summary_is_null_count | all_true | fresh-session | filter_summary_is_null_count:populated | 60 | 28.20 | 25.99 | 29.06 | 28.98 | 20 | 27.18 | 26.35 | 27.69 | 27.53 | 0.949 | 0.949 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| count_summary_vs_star | all_true:aggregate | fresh-session | count_summary_vs_star:populated:aggregate | 60 | 26.08 | 24.01 | 29.01 | 27.15 | 20 | 25.19 | 24.57 | 25.52 | 25.48 | 0.943 | 0.943 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| count_summary_vs_star | all_true:sql | fresh-session | count_summary_vs_star:populated:sql | 60 | 34.89 | 32.68 | 36.47 | 35.85 | 20 | 33.62 | 32.66 | 34.25 | 34.23 | 0.949 | 0.949 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| filter_id_range_project_summary | all_true | fresh-session | filter_id_range_project_summary:populated | 60 | 13.41 | 13.09 | 14.07 | 13.87 | 20 | 13.82 | 13.60 | 14.17 | 13.97 | 1.035 | 1.035 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| take_random_1k | all_true | fresh-session | take_random_1k:populated | 60 | 12.44 | 11.89 | 12.98 | 12.78 | 20 | 12.57 | 12.07 | 13.00 | 12.90 | 1.004 | 1.004 | - | - | 24,800 | 26,460 | 7,842 | 8,659 | 0 | 0 |
+| scan_summary_full | partial_1pct | warm | scan_summary_full:null_1pct | 60 | 27.62 | 25.90 | 28.74 | 28.45 | 20 | 47.52 | 42.69 | 48.87 | 48.21 | 1.690 | 1.690 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| filter_summary_is_null_count | partial_1pct | warm | filter_summary_is_null_count:null_1pct | 60 | 31.31 | 28.90 | 32.87 | 32.47 | 20 | 52.08 | 49.38 | 60.80 | 53.43 | 1.632 | 1.632 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| count_summary_vs_star | partial_1pct:aggregate | warm | count_summary_vs_star:null_1pct:aggregate | 60 | 28.22 | 25.84 | 29.67 | 28.90 | 20 | 48.17 | 46.29 | 51.00 | 49.28 | 1.686 | 1.686 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| count_summary_vs_star | partial_1pct:sql | warm | count_summary_vs_star:null_1pct:sql | 60 | 38.02 | 35.71 | 44.29 | 40.55 | 20 | 65.38 | 59.89 | 66.40 | 66.02 | 1.697 | 1.697 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| filter_id_range_project_summary | partial_1pct | warm | filter_id_range_project_summary:null_1pct | 60 | 12.80 | 12.33 | 13.68 | 13.32 | 20 | 12.68 | 12.40 | 12.93 | 12.93 | 1.014 | 1.014 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| take_random_1k | partial_1pct | warm | take_random_1k:null_1pct | 60 | 10.70 | 10.13 | 13.53 | 11.24 | 20 | 10.68 | 10.07 | 11.30 | 11.21 | 0.987 | 0.987 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| scan_summary_full | partial_1pct | fresh-session | scan_summary_full:null_1pct | 60 | 28.51 | 26.36 | 29.52 | 29.29 | 20 | 47.99 | 42.38 | 49.00 | 48.97 | 1.656 | 1.656 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| filter_summary_is_null_count | partial_1pct | fresh-session | filter_summary_is_null_count:null_1pct | 60 | 32.49 | 29.81 | 33.49 | 33.22 | 20 | 52.62 | 45.18 | 54.54 | 53.95 | 1.602 | 1.602 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| count_summary_vs_star | partial_1pct:aggregate | fresh-session | count_summary_vs_star:null_1pct:aggregate | 60 | 28.74 | 26.91 | 30.39 | 29.88 | 20 | 48.81 | 43.60 | 49.66 | 49.43 | 1.654 | 1.654 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| count_summary_vs_star | partial_1pct:sql | fresh-session | count_summary_vs_star:null_1pct:sql | 60 | 37.51 | 35.81 | 40.09 | 39.09 | 20 | 66.18 | 60.29 | 66.58 | 66.57 | 1.705 | 1.705 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| filter_id_range_project_summary | partial_1pct | fresh-session | filter_id_range_project_summary:null_1pct | 60 | 13.59 | 13.15 | 14.15 | 13.89 | 20 | 13.39 | 13.09 | 13.57 | 13.55 | 0.994 | 0.994 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| take_random_1k | partial_1pct | fresh-session | take_random_1k:null_1pct | 60 | 12.72 | 12.10 | 13.89 | 13.58 | 20 | 12.55 | 12.20 | 13.18 | 12.85 | 0.952 | 0.952 | - | - | 24,800 | 858,409 | 7,842 | 432,565 | 0 | 0 |
+| scan_summary_full | all_pending | warm | (no counterpart) | - | - | - | - | - | 20 | 2.78 | 2.74 | 2.83 | 2.83 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| filter_summary_is_null_count | all_pending | warm | (no counterpart) | - | - | - | - | - | 20 | 5.48 | 5.41 | 5.60 | 5.53 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| count_summary_vs_star | all_pending:aggregate | warm | (no counterpart) | - | - | - | - | - | 20 | 3.20 | 3.15 | 3.25 | 3.23 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| count_summary_vs_star | all_pending:sql | warm | (no counterpart) | - | - | - | - | - | 20 | 6.83 | 6.79 | 6.99 | 6.94 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| filter_id_range_project_summary | all_pending | warm | (no counterpart) | - | - | - | - | - | 20 | 11.97 | 11.84 | 12.12 | 12.12 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| take_random_1k | all_pending | warm | (no counterpart) | - | - | - | - | - | 20 | 0.38 | 0.37 | 0.41 | 0.40 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| scan_summary_full | all_pending | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 2.77 | 2.73 | 2.83 | 2.81 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| filter_summary_is_null_count | all_pending | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 5.49 | 5.42 | 5.54 | 5.53 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| count_summary_vs_star | all_pending:aggregate | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 3.22 | 3.15 | 3.28 | 3.27 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| count_summary_vs_star | all_pending:sql | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 6.89 | 6.77 | 7.25 | 7.19 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| filter_id_range_project_summary | all_pending | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 12.68 | 12.43 | 12.89 | 12.85 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+| take_random_1k | all_pending | fresh-session | (no counterpart) | - | - | - | - | - | 20 | 0.39 | 0.37 | 0.42 | 0.42 | - | - | - | - | - | 9,550 | - | 62 | - | 0 |
+
+### Refresh under concurrent source writes
+
+A full `summary` refresh staged at V, K source commits of 10 scattered rows each, then the publication at V. `commit ms` is the conflict-checked publication commit. `merge_insert_output_in_place` writes `summary` itself (an output override); it is the only source write here that defers whole groups.
+
+No flagged conflict records.
+
+### Follow-up refresh to completion: saved and repeated computation
+
+From the state the conflicted publication left, each strategy refreshes every pending row and publishes; afterwards every flag is asserted true and every value equal to the UDF of its current inputs. `recompute_all_pending` ignores the report; `reuse_valid_staged` reuses staged values of `PublicationReport::reusable_rows` (Reject returns an error, so it has no report). `total UDF rows` = rows the conflicted publication computed + rows the follow-up recomputed; with N rows, anything above N is repeated computation.
+
+No follow-up records.
+
+### Publication commit latency after K unrelated commits
+
+`wall = commit_ms` of the publication only. Conflict checks read every transaction since the read version.
+
+No publish_after_k records.
+
+### Flag state size as the true set fragments
+
+Head after one in-place `body` write invalidating the given fraction of scattered rows. `groups=0` is the unflagged control with the same data files. `wall` is a fresh-session open (OS page cache not controlled).
+
+No flag_state_size records.
+
+### Every group (wall_ms)
+
+One row per (build, workload, variant, cache) in the input.
+
+| build | workload | variant | cache | n | med ms | min | max | p95 | udf med ms | stage med ms | commit med ms | outcome |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| baseline | scan_summary_full | populated | warm | 60 | 24.04 | 23.29 | 26.79 | 26.19 | - | - | - | - |
+| baseline | filter_summary_is_null_count | populated | warm | 60 | 26.48 | 25.30 | 28.88 | 28.55 | - | - | - | - |
+| baseline | count_summary_vs_star | populated:aggregate | warm | 60 | 24.61 | 23.67 | 35.79 | 27.06 | - | - | - | - |
+| baseline | count_summary_vs_star | populated:sql | warm | 60 | 34.06 | 31.79 | 39.61 | 37.07 | - | - | - | - |
+| baseline | filter_id_range_project_summary | populated | warm | 60 | 13.10 | 12.18 | 18.17 | 15.76 | - | - | - | - |
+| baseline | take_random_1k | populated | warm | 60 | 10.64 | 10.19 | 11.09 | 11.02 | - | - | - | - |
+| baseline | scan_summary_full | populated | fresh-session | 60 | 24.45 | 23.02 | 26.58 | 26.31 | - | - | - | - |
+| baseline | filter_summary_is_null_count | populated | fresh-session | 60 | 27.15 | 25.77 | 29.42 | 29.28 | - | - | - | - |
+| baseline | count_summary_vs_star | populated:aggregate | fresh-session | 60 | 24.95 | 23.99 | 33.89 | 27.28 | - | - | - | - |
+| baseline | count_summary_vs_star | populated:sql | fresh-session | 60 | 34.39 | 32.46 | 36.10 | 35.81 | - | - | - | - |
+| baseline | filter_id_range_project_summary | populated | fresh-session | 60 | 13.68 | 13.08 | 14.40 | 14.32 | - | - | - | - |
+| baseline | take_random_1k | populated | fresh-session | 60 | 12.51 | 11.59 | 13.39 | 13.35 | - | - | - | - |
+| baseline | scan_summary_full | null_1pct | warm | 60 | 26.44 | 25.11 | 28.03 | 27.86 | - | - | - | - |
+| baseline | filter_summary_is_null_count | null_1pct | warm | 60 | 30.17 | 29.18 | 32.48 | 32.32 | - | - | - | - |
+| baseline | count_summary_vs_star | null_1pct:aggregate | warm | 60 | 26.52 | 25.73 | 28.94 | 28.85 | - | - | - | - |
+| baseline | count_summary_vs_star | null_1pct:sql | warm | 60 | 37.09 | 34.76 | 39.00 | 38.93 | - | - | - | - |
+| baseline | filter_id_range_project_summary | null_1pct | warm | 60 | 12.92 | 12.48 | 13.42 | 13.34 | - | - | - | - |
+| baseline | take_random_1k | null_1pct | warm | 60 | 10.75 | 10.03 | 13.27 | 11.18 | - | - | - | - |
+| baseline | scan_summary_full | null_1pct | fresh-session | 60 | 26.88 | 25.86 | 28.97 | 28.67 | - | - | - | - |
+| baseline | filter_summary_is_null_count | null_1pct | fresh-session | 60 | 31.12 | 29.23 | 33.07 | 32.79 | - | - | - | - |
+| baseline | count_summary_vs_star | null_1pct:aggregate | fresh-session | 60 | 27.51 | 26.56 | 29.85 | 29.65 | - | - | - | - |
+| baseline | count_summary_vs_star | null_1pct:sql | fresh-session | 60 | 36.87 | 35.23 | 39.03 | 38.99 | - | - | - | - |
+| baseline | filter_id_range_project_summary | null_1pct | fresh-session | 60 | 13.82 | 13.38 | 14.48 | 14.36 | - | - | - | - |
+| baseline | take_random_1k | null_1pct | fresh-session | 60 | 12.67 | 12.16 | 13.24 | 13.00 | - | - | - | - |
+| prototype | scan_summary_full | populated | warm | 60 | 25.82 | 23.74 | 26.56 | 26.41 | - | - | - | - |
+| prototype | filter_summary_is_null_count | populated | warm | 60 | 27.78 | 25.88 | 28.67 | 28.38 | - | - | - | - |
+| prototype | count_summary_vs_star | populated:aggregate | warm | 60 | 26.08 | 23.96 | 27.02 | 26.69 | - | - | - | - |
+| prototype | count_summary_vs_star | populated:sql | warm | 60 | 34.79 | 32.45 | 36.06 | 35.68 | - | - | - | - |
+| prototype | filter_id_range_project_summary | populated | warm | 60 | 12.50 | 12.18 | 13.12 | 13.05 | - | - | - | - |
+| prototype | take_random_1k | populated | warm | 60 | 10.57 | 9.91 | 11.36 | 10.90 | - | - | - | - |
+| prototype | scan_summary_full | populated | fresh-session | 60 | 25.78 | 23.81 | 27.25 | 26.70 | - | - | - | - |
+| prototype | filter_summary_is_null_count | populated | fresh-session | 60 | 28.20 | 25.99 | 29.06 | 28.98 | - | - | - | - |
+| prototype | count_summary_vs_star | populated:aggregate | fresh-session | 60 | 26.08 | 24.01 | 29.01 | 27.15 | - | - | - | - |
+| prototype | count_summary_vs_star | populated:sql | fresh-session | 60 | 34.89 | 32.68 | 36.47 | 35.85 | - | - | - | - |
+| prototype | filter_id_range_project_summary | populated | fresh-session | 60 | 13.41 | 13.09 | 14.07 | 13.87 | - | - | - | - |
+| prototype | take_random_1k | populated | fresh-session | 60 | 12.44 | 11.89 | 12.98 | 12.78 | - | - | - | - |
+| prototype | scan_summary_full | null_1pct | warm | 60 | 27.62 | 25.90 | 28.74 | 28.45 | - | - | - | - |
+| prototype | filter_summary_is_null_count | null_1pct | warm | 60 | 31.31 | 28.90 | 32.87 | 32.47 | - | - | - | - |
+| prototype | count_summary_vs_star | null_1pct:aggregate | warm | 60 | 28.22 | 25.84 | 29.67 | 28.90 | - | - | - | - |
+| prototype | count_summary_vs_star | null_1pct:sql | warm | 60 | 38.02 | 35.71 | 44.29 | 40.55 | - | - | - | - |
+| prototype | filter_id_range_project_summary | null_1pct | warm | 60 | 12.80 | 12.33 | 13.68 | 13.32 | - | - | - | - |
+| prototype | take_random_1k | null_1pct | warm | 60 | 10.70 | 10.13 | 13.53 | 11.24 | - | - | - | - |
+| prototype | scan_summary_full | null_1pct | fresh-session | 60 | 28.51 | 26.36 | 29.52 | 29.29 | - | - | - | - |
+| prototype | filter_summary_is_null_count | null_1pct | fresh-session | 60 | 32.49 | 29.81 | 33.49 | 33.22 | - | - | - | - |
+| prototype | count_summary_vs_star | null_1pct:aggregate | fresh-session | 60 | 28.74 | 26.91 | 30.39 | 29.88 | - | - | - | - |
+| prototype | count_summary_vs_star | null_1pct:sql | fresh-session | 60 | 37.51 | 35.81 | 40.09 | 39.09 | - | - | - | - |
+| prototype | filter_id_range_project_summary | null_1pct | fresh-session | 60 | 13.59 | 13.15 | 14.15 | 13.89 | - | - | - | - |
+| prototype | take_random_1k | null_1pct | fresh-session | 60 | 12.72 | 12.10 | 13.89 | 13.58 | - | - | - | - |
+| prototype-flags | scan_summary_full | all_true | warm | 20 | 24.47 | 24.04 | 25.26 | 25.24 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | all_true | warm | 20 | 26.62 | 26.13 | 27.28 | 27.24 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_true:aggregate | warm | 20 | 24.74 | 24.32 | 25.30 | 25.19 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_true:sql | warm | 20 | 33.04 | 32.36 | 33.94 | 33.70 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | all_true | warm | 20 | 12.86 | 12.68 | 13.27 | 13.19 | - | - | - | - |
+| prototype-flags | take_random_1k | all_true | warm | 20 | 10.61 | 10.16 | 11.31 | 11.28 | - | - | - | - |
+| prototype-flags | scan_summary_full | all_true | fresh-session | 20 | 24.70 | 23.90 | 29.01 | 27.83 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | all_true | fresh-session | 20 | 27.18 | 26.35 | 27.69 | 27.53 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_true:aggregate | fresh-session | 20 | 25.19 | 24.57 | 25.52 | 25.48 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_true:sql | fresh-session | 20 | 33.62 | 32.66 | 34.25 | 34.23 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | all_true | fresh-session | 20 | 13.82 | 13.60 | 14.17 | 13.97 | - | - | - | - |
+| prototype-flags | take_random_1k | all_true | fresh-session | 20 | 12.57 | 12.07 | 13.00 | 12.90 | - | - | - | - |
+| prototype-flags | scan_summary_full | partial_1pct | warm | 20 | 47.52 | 42.69 | 48.87 | 48.21 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | partial_1pct | warm | 20 | 52.08 | 49.38 | 60.80 | 53.43 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | partial_1pct:aggregate | warm | 20 | 48.17 | 46.29 | 51.00 | 49.28 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | partial_1pct:sql | warm | 20 | 65.38 | 59.89 | 66.40 | 66.02 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | partial_1pct | warm | 20 | 12.68 | 12.40 | 12.93 | 12.93 | - | - | - | - |
+| prototype-flags | take_random_1k | partial_1pct | warm | 20 | 10.68 | 10.07 | 11.30 | 11.21 | - | - | - | - |
+| prototype-flags | scan_summary_full | partial_1pct | fresh-session | 20 | 47.99 | 42.38 | 49.00 | 48.97 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | partial_1pct | fresh-session | 20 | 52.62 | 45.18 | 54.54 | 53.95 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | partial_1pct:aggregate | fresh-session | 20 | 48.81 | 43.60 | 49.66 | 49.43 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | partial_1pct:sql | fresh-session | 20 | 66.18 | 60.29 | 66.58 | 66.57 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | partial_1pct | fresh-session | 20 | 13.39 | 13.09 | 13.57 | 13.55 | - | - | - | - |
+| prototype-flags | take_random_1k | partial_1pct | fresh-session | 20 | 12.55 | 12.20 | 13.18 | 12.85 | - | - | - | - |
+| prototype-flags | scan_summary_full | all_pending | warm | 20 | 2.78 | 2.74 | 2.83 | 2.83 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | all_pending | warm | 20 | 5.48 | 5.41 | 5.60 | 5.53 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_pending:aggregate | warm | 20 | 3.20 | 3.15 | 3.25 | 3.23 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_pending:sql | warm | 20 | 6.83 | 6.79 | 6.99 | 6.94 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | all_pending | warm | 20 | 11.97 | 11.84 | 12.12 | 12.12 | - | - | - | - |
+| prototype-flags | take_random_1k | all_pending | warm | 20 | 0.38 | 0.37 | 0.41 | 0.40 | - | - | - | - |
+| prototype-flags | scan_summary_full | all_pending | fresh-session | 20 | 2.77 | 2.73 | 2.83 | 2.81 | - | - | - | - |
+| prototype-flags | filter_summary_is_null_count | all_pending | fresh-session | 20 | 5.49 | 5.42 | 5.54 | 5.53 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_pending:aggregate | fresh-session | 20 | 3.22 | 3.15 | 3.28 | 3.27 | - | - | - | - |
+| prototype-flags | count_summary_vs_star | all_pending:sql | fresh-session | 20 | 6.89 | 6.77 | 7.25 | 7.19 | - | - | - | - |
+| prototype-flags | filter_id_range_project_summary | all_pending | fresh-session | 20 | 12.68 | 12.43 | 12.89 | 12.85 | - | - | - | - |
+| prototype-flags | take_random_1k | all_pending | fresh-session | 20 | 0.39 | 0.37 | 0.42 | 0.42 | - | - | - | - |
+<!-- END results:10m-reads-fix-prototype-first -->

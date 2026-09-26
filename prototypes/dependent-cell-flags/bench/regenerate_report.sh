@@ -30,4 +30,6 @@ section 10m-reads-clean-baseline-first 'Clean build: 10M reads at `26388225a`, b
 section 10m-reads-clean-prototype-first 'Clean build: 10M reads at `26388225a`, prototype first'
 section 1m-clean 'Clean build: 1M full matrix at `26388225a`, flags in round 3 only'
 section 10m-reads-layout-control 'Control: 10M reads, baseline plus one unused function (records labelled `prototype`), rounds 1-3 baseline first, 4-6 control first'
+section 10m-reads-fix-baseline-first 'Clean build: 10M reads at `2fd300ac2`, baseline first, flags in round 3 only'
+section 10m-reads-fix-prototype-first 'Clean build: 10M reads at `2fd300ac2`, prototype first, flags in round 3 only'
 echo "regenerated the results sections of $REPORT"

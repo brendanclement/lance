@@ -1,0 +1,87 @@
+diff --git a/rust/lance/src/dataset/fragment.rs b/rust/lance/src/dataset/fragment.rs
+index 77341a6ee..0a625e61e 100644
+--- a/rust/lance/src/dataset/fragment.rs
++++ b/rust/lance/src/dataset/fragment.rs
+@@ -3524,6 +3524,64 @@ impl FragmentReader {
+     /// hides. Both address each row by its position in the fragment (its
+     /// `offset_in_frag`, derived from `params`), and the flag governs a value
+     /// whichever file supplies it. A no-op when the fragment has neither.
++    async fn merge_overlays_baseline(
++        &self,
++        merged: ReadBatchTaskStream,
++        params: &ReadBatchParams,
++        total_num_rows: u32,
++    ) -> Result<ReadBatchTaskStream> {
++        let Some(overlay) = &self.overlay else {
++            return Ok(merged);
++        };
++        // The offset_in_frag of every row this read will return, materialized once.
++        // Cost is one u32 per output row (a whole-fragment scan is 4 bytes/row), and
++        // it lets us both prune overlays to the read and slice each batch's offsets
++        // below without reading any data. Only paid when the fragment has overlays.
++        //
++        // TODO(overlay perf): this could be avoided by teaching `ReadBatchParams` to
++        // yield a coverage bitmap directly (for pruning) and to slice per batch (for
++        // the routing below), or by moving `ReadBatchParams` to a roaring bitmap
++        // wholesale — a larger refactor tracked separately.
++        let offsets_in_frag: Arc<Vec<u32>> =
++            Arc::new(params.to_offsets_total(total_num_rows).values().to_vec());
++
++        // Open only the overlay readers this read touches (pruned by row selection).
++        let plans = resolve_overlays(
++            &overlay.planner,
++            &offsets_in_frag,
++            &overlay.fragment,
++            &overlay.read_config,
++        )
++        .await?;
++        if plans.is_empty() {
++            return Ok(merged);
++        }
++        let plans = Arc::new(plans);
++
++        // Batches arrive in physical read order, so a running total of the rows seen
++        // so far gives each batch its starting offset_in_batch into `offsets_in_frag`.
++        let mut rows_seen = 0usize;
++        let stream = merged
++            .map(move |task| {
++                let num_rows = task.num_rows;
++                let start = rows_seen;
++                rows_seen += num_rows as usize;
++                let offsets_in_frag = offsets_in_frag.clone();
++                let plans = plans.clone();
++                let inner = task.task;
++                ReadBatchTask {
++                    num_rows,
++                    task: async move {
++                        let batch_offsets = &offsets_in_frag[start..start + num_rows as usize];
++                        merge_overlay_batch(inner, batch_offsets, &plans).await
++                    }
++                    .boxed(),
++                }
++            })
++            .boxed();
++        Ok(stream)
++    }
++
+     async fn resolve_cells(
+         &self,
+         stream: ReadBatchTaskStream,
+@@ -3699,7 +3757,7 @@ impl FragmentReader {
+             lance_table::utils::stream::merge_streams(read_streams)
+         };
+ 
+-        let merged = self.resolve_cells(merged, &params, total_num_rows).await?;
++        let merged = self.merge_overlays_baseline(merged, &params, total_num_rows).await?;
+ 
+         // Add the row id column (if needed) and delete rows (if a deletion
+         // vector is present).
+@@ -3893,7 +3951,7 @@ impl FragmentReader {
+ 
+         let params = ReadBatchParams::Ranges(ranges);
+         let merged_stream = self
+-            .resolve_cells(merged_stream, &params, total_num_rows)
++            .merge_overlays_baseline(merged_stream, &params, total_num_rows)
+             .await?;
+ 
+         // Add the row id column (if needed) and delete rows (if a deletion

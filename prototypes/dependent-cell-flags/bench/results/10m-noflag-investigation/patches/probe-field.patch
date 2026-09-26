@@ -1,0 +1,31 @@
+diff --git a/rust/lance/src/dataset/fragment.rs b/rust/lance/src/dataset/fragment.rs
+index 9e3dd0e89..5b6db1fe3 100644
+--- a/rust/lance/src/dataset/fragment.rs
++++ b/rust/lance/src/dataset/fragment.rs
+@@ -3347,6 +3347,10 @@ pub struct FragmentReader {
+     /// overlays. Overlays are merged into base batches (by `offset_in_frag`) before
+     /// deletion filtering, opening only the files each read's rows touch.
+     overlay: Option<OverlayReadState>,
++
++    /// Layout probe: an unused field of the size of the prototype's mask field.
++    #[allow(dead_code)]
++    layout_probe: Option<Arc<()>>,
+ }
+ 
+ /// What [`FragmentReader`] needs to resolve overlays at read time: the coverage
+@@ -3387,6 +3391,7 @@ impl Clone for FragmentReader {
+             num_rows: self.num_rows,
+             num_physical_rows: self.num_physical_rows,
+             overlay: self.overlay.clone(),
++            layout_probe: self.layout_probe.clone(),
+         }
+     }
+ }
+@@ -3440,6 +3445,7 @@ impl FragmentReader {
+             num_rows,
+             num_physical_rows,
+             overlay: None,
++            layout_probe: None,
+         })
+     }
+ 

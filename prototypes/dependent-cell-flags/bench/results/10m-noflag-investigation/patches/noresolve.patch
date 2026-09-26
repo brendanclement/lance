@@ -1,0 +1,13 @@
+diff --git a/rust/lance/src/dataset/fragment.rs b/rust/lance/src/dataset/fragment.rs
+index 77341a6ee..010951a06 100644
+--- a/rust/lance/src/dataset/fragment.rs
++++ b/rust/lance/src/dataset/fragment.rs
+@@ -1146,7 +1146,7 @@ impl FileFragment {
+         projection: &Schema,
+         read_config: FragReadConfig,
+     ) -> Result<FragmentReader> {
+-        let cell_flag_masks = CellFlagMasks::resolve(&self.dataset, self.metadata.id, projection)?;
++        let cell_flag_masks: Option<Arc<CellFlagMasks>> = None;
+         let open_files = self.open_readers(projection, &read_config);
+         let deletion_vec_load = self.get_deletion_vector();
+ 

@@ -1,0 +1,52 @@
+start 04:50:42 load { 5.29 14.27 19.02 }
+round 1 baseline load { 5.82 14.23 18.98 }
+round 1 prototype load { 5.82 14.23 18.98 }
+round 1 noresolve load { 5.23 13.83 18.78 }
+round 1 funnel load { 7.20 13.95 18.76 }
+round 1  load { 7.20 13.95 18.76 }
+round 2 prototype load { 7.20 13.95 18.76 }
+round 2 noresolve load { 9.11 14.23 18.83 }
+round 2 funnel load { 9.11 14.23 18.83 }
+round 2  load { 9.11 14.23 18.83 }
+round 2 baseline load { 9.50 14.23 18.80 }
+round 3 noresolve load { 9.50 14.23 18.80 }
+round 3 funnel load { 9.46 14.14 18.75 }
+round 3  load { 9.46 14.14 18.75 }
+round 3 baseline load { 9.46 14.14 18.75 }
+round 3 prototype load { 9.58 14.09 18.70 }
+round 4 funnel load { 9.58 14.09 18.70 }
+round 4  load { 9.58 14.09 18.70 }
+round 4 baseline load { 10.34 14.17 18.70 }
+round 4 prototype load { 10.34 14.17 18.70 }
+round 4 noresolve load { 10.23 14.09 18.65 }
+round 5  load { 10.23 14.09 18.65 }
+round 5 baseline load { 10.23 14.09 18.65 }
+round 5 prototype load { 10.29 14.04 18.60 }
+round 5 noresolve load { 10.29 14.04 18.60 }
+round 5 funnel load { 10.75 14.07 18.58 }
+round 6 baseline load { 10.75 14.07 18.58 }
+round 6 prototype load { 11.33 14.13 18.58 }
+round 6 noresolve load { 11.33 14.13 18.58 }
+round 6 funnel load { 11.06 14.03 18.52 }
+round 6  load { 11.06 14.03 18.52 }
+round 7 prototype load { 11.06 14.03 18.52 }
+round 7 noresolve load { 10.90 13.95 18.46 }
+round 7 funnel load { 10.90 13.95 18.46 }
+round 7  load { 10.90 13.95 18.46 }
+round 7 baseline load { 11.38 14.00 18.45 }
+round 8 noresolve load { 11.38 14.00 18.45 }
+round 8 funnel load { 11.11 13.90 18.39 }
+round 8  load { 11.11 13.90 18.39 }
+round 8 baseline load { 11.11 13.90 18.39 }
+round 8 prototype load { 11.58 13.95 18.38 }
+round 9 funnel load { 11.58 13.95 18.38 }
+round 9  load { 10.82 13.75 18.29 }
+round 9 baseline load { 10.82 13.75 18.29 }
+round 9 prototype load { 11.07 13.75 18.26 }
+round 9 noresolve load { 11.07 13.75 18.26 }
+round 10  load { 11.07 13.75 18.26 }
+round 10 baseline load { 10.83 13.66 18.20 }
+round 10 prototype load { 10.83 13.66 18.20 }
+round 10 noresolve load { 10.84 13.61 18.16 }
+round 10 funnel load { 10.84 13.61 18.16 }
+done 04:52:38
