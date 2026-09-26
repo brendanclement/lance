@@ -3519,65 +3519,39 @@ impl FragmentReader {
         self
     }
 
-    /// Resolve the cells of physical rows in read order, *before* deletion
-    /// filtering: merge overlay values, then null the cells a masking cell flag
-    /// hides. Both address each row by its position in the fragment (its
-    /// `offset_in_frag`, derived from `params`), and the flag governs a value
-    /// whichever file supplies it. A no-op when the fragment has neither.
-    async fn resolve_cells(
+    /// Merge data overlay values onto a stream of base batches.
+    ///
+    /// Runs on physical rows in read order, *before* deletion filtering, so each
+    /// row can be addressed by its position in the fragment (its `offset_in_frag`,
+    /// derived from `params`) and deletions take precedence naturally: an overlay
+    /// value for a deleted row is dropped along with the row downstream. A no-op
+    /// when the fragment has no overlays.
+    ///
+    /// The read's `offset_in_frag` values are known from `params` up front, so
+    /// overlays are resolved here to just the files this read's rows touch — an
+    /// overlay whose cells fall outside the read is not opened at all. Within each
+    /// batch, the overlay reads (only the values that batch needs) are then issued
+    /// concurrently with the base read rather than after it.
+    async fn merge_overlays(
         &self,
-        stream: ReadBatchTaskStream,
+        merged: ReadBatchTaskStream,
         params: &ReadBatchParams,
         total_num_rows: u32,
     ) -> Result<ReadBatchTaskStream> {
-        if self.overlay.is_none() && self.cell_flag_masks.is_none() {
-            return Ok(stream);
-        }
-        // The offset_in_frag of every row this read will return, materialized once
-        // and shared by both steps. Cost is one u32 per output row (a whole-fragment
-        // scan is 4 bytes/row), and it lets us both prune overlays to the read and
-        // slice each batch's offsets without reading any data. Only paid when the
-        // fragment has overlays or a partially masked field.
+        let Some(overlay) = &self.overlay else {
+            return Ok(merged);
+        };
+        // The offset_in_frag of every row this read will return, materialized once.
+        // Cost is one u32 per output row (a whole-fragment scan is 4 bytes/row), and
+        // it lets us both prune overlays to the read and slice each batch's offsets
+        // below without reading any data. Only paid when the fragment has overlays.
         //
         // TODO(overlay perf): this could be avoided by teaching `ReadBatchParams` to
         // yield a coverage bitmap directly (for pruning) and to slice per batch (for
         // the routing below), or by moving `ReadBatchParams` to a roaring bitmap
         // wholesale — a larger refactor tracked separately.
-        let needs_offsets = self.overlay.is_some()
-            || self
-                .cell_flag_masks
-                .as_ref()
-                .is_some_and(|masks| masks.needs_offsets());
-        let offsets_in_frag = needs_offsets
-            .then(|| Arc::new(params.to_offsets_total(total_num_rows).values().to_vec()));
-        let stream = match &offsets_in_frag {
-            Some(offsets_in_frag) => self.merge_overlays(stream, offsets_in_frag).await?,
-            None => stream,
-        };
-        Ok(match &self.cell_flag_masks {
-            Some(masks) => masks.clone().apply(stream, offsets_in_frag),
-            None => stream,
-        })
-    }
-
-    /// Merge data overlay values onto a stream of base batches. Deletions take
-    /// precedence naturally: an overlay value for a deleted row is dropped along
-    /// with the row downstream. A no-op when the fragment has no overlays.
-    ///
-    /// The read's `offset_in_frag` values are known up front, so overlays are
-    /// resolved here to just the files this read's rows touch — an overlay whose
-    /// cells fall outside the read is not opened at all. Within each batch, the
-    /// overlay reads (only the values that batch needs) are then issued
-    /// concurrently with the base read rather than after it.
-    async fn merge_overlays(
-        &self,
-        merged: ReadBatchTaskStream,
-        offsets_in_frag: &Arc<Vec<u32>>,
-    ) -> Result<ReadBatchTaskStream> {
-        let Some(overlay) = &self.overlay else {
-            return Ok(merged);
-        };
-        let offsets_in_frag = offsets_in_frag.clone();
+        let offsets_in_frag: Arc<Vec<u32>> =
+            Arc::new(params.to_offsets_total(total_num_rows).values().to_vec());
 
         // Open only the overlay readers this read touches (pruned by row selection).
         let plans = resolve_overlays(
@@ -3614,6 +3588,26 @@ impl FragmentReader {
             })
             .boxed();
         Ok(stream)
+    }
+
+    /// Null the cells a masking cell flag hides, after overlays are merged and
+    /// before deletions are applied, when rows still line up with their
+    /// physical offsets. Kept a plain function outside `merge_overlays`:
+    /// wrapping that future in another async fn cost full scans of tables
+    /// without cell flags about 3% of their wall time.
+    fn mask_cells(
+        &self,
+        stream: ReadBatchTaskStream,
+        params: &ReadBatchParams,
+        total_num_rows: u32,
+    ) -> ReadBatchTaskStream {
+        let Some(masks) = &self.cell_flag_masks else {
+            return stream;
+        };
+        let offsets_in_frag = masks
+            .needs_offsets()
+            .then(|| Arc::new(params.to_offsets_total(total_num_rows).values().to_vec()));
+        masks.clone().apply(stream, offsets_in_frag)
     }
 
     async fn new_read_impl<'a, F>(
@@ -3699,7 +3693,8 @@ impl FragmentReader {
             lance_table::utils::stream::merge_streams(read_streams)
         };
 
-        let merged = self.resolve_cells(merged, &params, total_num_rows).await?;
+        let merged = self.merge_overlays(merged, &params, total_num_rows).await?;
+        let merged = self.mask_cells(merged, &params, total_num_rows);
 
         // Add the row id column (if needed) and delete rows (if a deletion
         // vector is present).
@@ -3893,8 +3888,9 @@ impl FragmentReader {
 
         let params = ReadBatchParams::Ranges(ranges);
         let merged_stream = self
-            .resolve_cells(merged_stream, &params, total_num_rows)
+            .merge_overlays(merged_stream, &params, total_num_rows)
             .await?;
+        let merged_stream = self.mask_cells(merged_stream, &params, total_num_rows);
 
         // Add the row id column (if needed) and delete rows (if a deletion
         // vector is present).
