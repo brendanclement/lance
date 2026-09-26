@@ -3592,9 +3592,7 @@ impl FragmentReader {
 
     /// Null the cells a masking cell flag hides, after overlays are merged and
     /// before deletions are applied, when rows still line up with their
-    /// physical offsets. Kept a plain function outside `merge_overlays`:
-    /// wrapping that future in another async fn cost full scans of tables
-    /// without cell flags about 3% of their wall time.
+    /// physical offsets.
     fn mask_cells(
         &self,
         stream: ReadBatchTaskStream,
