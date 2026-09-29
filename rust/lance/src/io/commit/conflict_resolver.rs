@@ -2720,16 +2720,24 @@ impl<'a> TransactionRebase<'a> {
                 return Ok((self.transaction, Some(Arc::new(assembly))));
             }
 
-            // A v0 snapshot on a v0 table: the whole-history replacement
-            // contract, byte-identical to the historical behavior.
+            // A v0 snapshot on a v0 table: the whole-history replacement contract.
             {
                 let new_fri = proposed;
-                if self.conflicting_frag_reuse_indices.is_empty() {
+                let mut new_fri_details =
+                    Arc::unwrap_or_clone(load_frag_reuse_index_details(dataset, new_fri).await?);
+                // Stamp the rewrite's own (last) version with the version this attempt
+                // publishes on top of; a retry may land on a newer one.
+                let is_restamped = match new_fri_details.versions.last_mut() {
+                    Some(version) if version.dataset_version != dataset.manifest.version => {
+                        version.dataset_version = dataset.manifest.version;
+                        true
+                    }
+                    _ => false,
+                };
+                if self.conflicting_frag_reuse_indices.is_empty() && !is_restamped {
                     return Ok((self.transaction, None));
                 }
 
-                let mut new_fri_details =
-                    Arc::unwrap_or_clone(load_frag_reuse_index_details(dataset, new_fri).await?);
                 let mut min_dataset_version = new_fri_details
                     .versions
                     .iter()

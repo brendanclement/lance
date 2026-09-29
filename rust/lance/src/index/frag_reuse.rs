@@ -462,6 +462,7 @@ pub(crate) async fn build_new_frag_reuse_index(
     new_fragment_bitmap: RoaringBitmap,
 ) -> lance_core::Result<IndexMetadata> {
     let new_version = FragReuseVersion {
+        // Provisional: `finish_rewrite` restamps it at commit.
         dataset_version: dataset.manifest.version,
         groups: frag_reuse_groups,
     };
