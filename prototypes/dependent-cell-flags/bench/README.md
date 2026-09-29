@@ -22,7 +22,7 @@ Benchmarks for the dependent cell flag prototype (option D). They answer three q
 | `run_layout_control.sh` | The layout control: the baseline against the baseline plus one unused function, 3 rounds in each order. |
 | `regenerate_report.sh` | Rebuilds every generated section of `REPORT.md` with its heading. |
 | `rust/lance/benches/cell_flags_scan_counters.rs` | Reads one shared table without flags and records per sample the wall time and the process's retired instructions, cycles and CPU time (macOS `proc_pid_rusage`). Uses `main` APIs only. |
-| `run_counters_rotation.sh` | Rotates four builds of the counters bench over one shared table in a 4×4 Latin-square order. |
+| `run_counters_rotation.py` | Python standard library only. Builds each checkout, takes the single bench executable cargo reports, records its sha256, source revision and build settings in `run.json`, and rotates four builds (or three and an identical-binary control) over one shared table in a 4×4 Latin-square order, hashing the table before and after. |
 | `analyze_counters.py` | Python standard library only. Per-round ratios of the counters bench to a reference build, with bootstrap intervals and busy cores. |
 
 `mod.rs` and `cell_flags_regression.rs` must be **byte-identical** in the baseline and the
@@ -193,7 +193,8 @@ repeated only as clean builds.
 | `10m-reads-fix-prototype-first` | same | `BENCH_WORKLOADS=$READS ORDER=prototype-first FLAG_EVERY_ROUND=0 ROUNDS=3 RESULTS_DIR=… run_paired.sh 10m` |
 
 The hardware-counter rotations on shared tables (`results/10m-noflag-investigation/`) use
-`cell_flags_scan_counters.rs`, `run_counters_rotation.sh` and `analyze_counters.py`. Their README
+`cell_flags_scan_counters.rs`, `analyze_counters.py` and a driver: runs 01–06 one-off loops, 07–09
+`results/10m-noflag-investigation/driver-runs-07-09.sh`. New runs use `run_counters_rotation.py`. Their README
 has the commands and the variant patches.
 
 A checkout of this branch with `rust/` restored from `26388225a` (see Setup) has the clean runs'

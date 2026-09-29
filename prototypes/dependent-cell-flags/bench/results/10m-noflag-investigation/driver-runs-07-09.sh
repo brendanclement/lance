@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 #
+# Historical: the driver of runs 07-09, committed as bench/run_counters_rotation.sh.
+# It takes the first matching binary under target/$PROFILE/deps, which is
+# ambiguous when several builds share a directory, and records no provenance.
+# New runs use bench/run_counters_rotation.py.
+#
 # Rotate several builds of the cell_flags_scan_counters bench over one shared
 # dataset in a 4x4 Latin-square order, so every build runs in every position
 # equally often. Each build must be a checkout outside any other Lance checkout
