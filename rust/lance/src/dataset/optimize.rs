@@ -6838,7 +6838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_cleanup_and_compaction_rebase_cleanup() {
+    async fn test_cleanup_after_a_stale_remap_keeps_later_compactions() {
         let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
@@ -6948,10 +6948,8 @@ mod tests {
             .unwrap();
         let new_frags3 = frag_reuse_details3.versions.last().unwrap().new_frag_ids();
 
-        // Concurrently commit a frag_reuse_index cleanup operation. dataset_clone
-        // only knows the first reuse version; catch its index up so the cleanup
-        // removes that version. After rebase onto the other compactions it should
-        // contain the new compaction versions.
+        // dataset_clone only knows the first reuse version. Its remap commits at the
+        // latest version, so the cleanup trims only that version.
         remapping::remap_column_index(&mut dataset_clone, &["i"], Some("scalar".into()))
             .await
             .unwrap();
@@ -7240,6 +7238,10 @@ mod tests {
     enum Race {
         Append,
         BuildIndex,
+        /// From another session, so the rebase reads its rewrite from the transaction file.
+        CompactElsewhere {
+            excluded: &'static [u32],
+        },
     }
 
     #[derive(Debug, Default)]
@@ -7303,6 +7305,16 @@ mod tests {
                             .await
                             .unwrap();
                         *self.built.lock().unwrap() = Some((handle, index));
+                    }
+                    Race::CompactElsewhere { excluded } => {
+                        let mut elsewhere = Dataset::open(handle.uri()).await.unwrap();
+                        compact_files(
+                            &mut elsewhere,
+                            deferred_compaction_excluding(excluded),
+                            None,
+                        )
+                        .await
+                        .unwrap();
                     }
                 }
             }
@@ -7506,72 +7518,377 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), rows + appended);
     }
 
-    #[tokio::test]
-    async fn test_concurrent_compactions_with_defer_index_remap() {
+    /// The deletions sit at non-zero offsets, so a mistranslated address loses rows.
+    async fn indexed_dataset(uri: &str, index: BuiltinIndexType) -> Dataset {
         let mut dataset = lance_datagen::gen_batch()
-            .col(
-                "vec",
-                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
-            )
             .col("i", lance_datagen::array::step::<Int32Type>())
-            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .into_dataset_with_params(
+                uri,
+                FragmentCount::from(6),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap();
+        dataset
+            .create_index_builder(
+                &["i"],
+                IndexType::Scalar,
+                &ScalarIndexParams::for_builtin(index),
+            )
+            .name("i_idx".into())
+            .await
+            .unwrap();
+        dataset.delete("i IN (3, 24, 45)").await.unwrap();
+        dataset
+    }
 
-        // Index "i" so the deferred compaction touches indexed data and writes an FRI.
-        create_scalar_index(&mut dataset, "i", false).await;
-
-        let options = CompactionOptions {
-            target_rows_per_fragment: 2_000,
+    fn deferred_compaction_excluding(excluded_fragment_ids: &[u32]) -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: 20,
             defer_index_remap: true,
+            excluded_fragment_ids: excluded_fragment_ids.to_vec(),
             ..Default::default()
-        };
+        }
+    }
 
-        let plan = plan_compaction(&dataset, &options).await.unwrap();
-        let tasks = plan.tasks();
-
-        let mut dataset_clone = dataset.clone();
-
-        // Only compact the first task, record the state of the dataset
-        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options)
-            .await
-            .unwrap();
-
-        commit_compaction(
-            &mut dataset,
-            Vec::from([rewrite_result]),
-            Arc::new(DatasetIndexRemapperOptions::default()),
-            &options,
-        )
-        .await
-        .unwrap();
-
-        // Load and verify the fragment reuse index content
-        let Some(frag_reuse_index_meta) = dataset
-            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+    async fn plan_one_task(dataset: &Dataset, options: &CompactionOptions) -> RewriteResult {
+        let plan = plan_compaction(dataset, options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+        plan.compaction_tasks()
+            .next()
+            .unwrap()
+            .execute(dataset)
             .await
             .unwrap()
-        else {
-            panic!("Fragment reuse index must be available");
-        };
-        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+    }
+
+    async fn commit_one(
+        dataset: &mut Dataset,
+        result: RewriteResult,
+        options: &CompactionOptions,
+    ) -> Result<()> {
+        commit_compaction(
+            dataset,
+            vec![result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            options,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn values_by_address(dataset: &Dataset) -> HashMap<u64, i32> {
+        let batch = dataset
+            .scan()
+            .project(&["i"])
+            .unwrap()
+            .with_row_address()
+            .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(frag_reuse_details.versions.len(), 1);
+        let addrs = batch[lance_core::ROW_ADDR]
+            .as_primitive::<UInt64Type>()
+            .values();
+        let values = batch["i"].as_primitive::<Int32Type>().values();
+        addrs.iter().copied().zip(values.iter().copied()).collect()
+    }
 
-        // Concurrently commit a rewrite should fail
-        let rewrite_result2 =
-            rewrite_files(Cow::Borrowed(&dataset_clone), tasks[1].clone(), &options)
+    async fn values_matching(
+        dataset: &Dataset,
+        column: &str,
+        filter: &str,
+        use_scalar_index: bool,
+    ) -> Vec<i32> {
+        let mut scanner = dataset.scan();
+        scanner.filter(filter).unwrap();
+        scanner.project(&[column]).unwrap();
+        scanner.use_scalar_index(use_scalar_index);
+        let mut values = scanner.try_into_batch().await.unwrap()[column]
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        values.sort_unstable();
+        values
+    }
+
+    async fn assert_index_is_used(dataset: &Dataset, filter: &str, index_name: &str) {
+        let mut scanner = dataset.scan();
+        scanner.filter(filter).unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains(&format!("@{index_name}(")),
+            "{filter}: {plan}"
+        );
+    }
+
+    async fn assert_index_answers_like_a_scan(dataset: &Dataset) {
+        for filter in ["i < 15", "i >= 20 AND i < 35", "i > 40"] {
+            assert_eq!(
+                values_matching(dataset, "i", filter, true).await,
+                values_matching(dataset, "i", filter, false).await,
+                "{filter}"
+            );
+            assert_index_is_used(dataset, filter, "i_idx").await;
+        }
+    }
+
+    async fn assert_mappings_intact(uri: &str, before: &HashMap<u64, i32>) {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let frag_reuse = dataset.frag_reuse_index().await.unwrap();
+        let after = values_by_address(&dataset).await;
+        assert_eq!(after.len(), before.len());
+        for (old_addr, value) in before {
+            let new_addr = frag_reuse
+                .as_ref()
+                .map_or(Some(*old_addr), |index| index.remap_row_id(*old_addr))
+                .unwrap_or_else(|| panic!("live row {value} at {old_addr} maps to a deletion"));
+            assert_eq!(after.get(&new_addr), Some(value), "moved from {old_addr}");
+        }
+        assert_index_answers_like_a_scan(&dataset).await;
+    }
+
+    fn fragments_except(dataset: &Dataset, compacted: &[u32]) -> Vec<u32> {
+        dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .filter(|id| !compacted.contains(id))
+            .collect()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReuseHistoryChange {
+        Created,
+        Replaced,
+        Removed,
+    }
+
+    /// The second commit must conflict whether or not its session saw the first.
+    #[rstest]
+    #[tokio::test]
+    async fn test_concurrent_compactions_with_defer_index_remap(
+        #[values(
+            ReuseHistoryChange::Created,
+            ReuseHistoryChange::Replaced,
+            ReuseHistoryChange::Removed
+        )]
+        change: ReuseHistoryChange,
+        #[values(false, true)] separate_session: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), BuiltinIndexType::ZoneMap).await;
+        if !matches!(change, ReuseHistoryChange::Created) {
+            compact_files(
+                &mut dataset,
+                deferred_compaction_excluding(&[0, 1, 2, 3]),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let untouched: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .filter(|id| *id > 3)
+            .collect();
+        let options_a = deferred_compaction_excluding(&[&[2, 3], untouched.as_slice()].concat());
+        let options_b = deferred_compaction_excluding(&[&[0, 1], untouched.as_slice()].concat());
+        let before = values_by_address(&dataset).await;
+        let result_a = plan_one_task(&dataset, &options_a).await;
+        let result_b = plan_one_task(&dataset, &options_b).await;
+        let open = async || {
+            if separate_session {
+                Dataset::open(dir.as_str()).await.unwrap()
+            } else {
+                dataset.clone()
+            }
+        };
+        let mut committer_a = open().await;
+        let mut committer_b = open().await;
+
+        if matches!(change, ReuseHistoryChange::Removed) {
+            committer_a.drop_index(FRAG_REUSE_INDEX_NAME).await.unwrap();
+        } else {
+            commit_one(&mut committer_a, result_a, &options_a)
                 .await
                 .unwrap();
-        let result = commit_compaction(
-            &mut dataset_clone,
-            Vec::from([rewrite_result2]),
-            Arc::new(DatasetIndexRemapperOptions::default()),
-            &options,
-        )
-        .await;
-        assert!(matches!(result, Err(Error::RetryableCommitConflict { .. })));
+        }
+        let error = commit_one(&mut committer_b, result_b.clone(), &options_b)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        let expected_versions = match change {
+            ReuseHistoryChange::Created => 1,
+            ReuseHistoryChange::Replaced => 2,
+            ReuseHistoryChange::Removed => 0,
+        };
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(
+            frag_reuse_watermarks(&latest).await.len(),
+            expected_versions
+        );
+        if !matches!(change, ReuseHistoryChange::Removed) {
+            assert_mappings_intact(dir.as_str(), &before).await;
+        }
+
+        let mut recommitter = Dataset::open(dir.as_str()).await.unwrap();
+        commit_one(&mut recommitter, result_b, &options_b)
+            .await
+            .unwrap();
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(
+            frag_reuse_watermarks(&latest).await.len(),
+            expected_versions + 1
+        );
+        if !matches!(change, ReuseHistoryChange::Removed) {
+            assert_mappings_intact(dir.as_str(), &before).await;
+        }
+    }
+
+    /// The race lands after the first attempt's check, so only the retry can catch it.
+    #[tokio::test]
+    async fn test_deferred_compaction_rechecks_the_reuse_history_on_every_attempt() {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), BuiltinIndexType::ZoneMap).await;
+        let handler = Arc::new(RaceBeforeRewrite::default());
+        dataset.commit_handler = handler.clone();
+        let before = values_by_address(&dataset).await;
+        let options = deferred_compaction_excluding(&[2, 3, 4, 5]);
+        let result = plan_one_task(&dataset, &options).await;
+
+        handler.arm(&dataset, vec![Race::CompactElsewhere { excluded: &[0, 1] }]);
+        let error = commit_one(&mut dataset, result.clone(), &options)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(handler.races.lock().unwrap().is_empty());
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&latest).await.len(), 1);
+        assert_mappings_intact(dir.as_str(), &before).await;
+
+        let mut recommitter = Dataset::open(dir.as_str()).await.unwrap();
+        commit_one(&mut recommitter, result, &options)
+            .await
+            .unwrap();
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&latest).await.len(), 2);
+        assert_mappings_intact(dir.as_str(), &before).await;
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_cleanup_racing_a_deferred_compaction_keeps_its_mappings(
+        #[values(false, true)] separate_session: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), BuiltinIndexType::BTree).await;
+        let before = values_by_address(&dataset).await;
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[0, 1]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        let mut cleaner = if separate_session {
+            Dataset::open(dir.as_str()).await.unwrap()
+        } else {
+            dataset.clone()
+        };
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[2, 3]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let error = cleanup_frag_reuse_index(&mut cleaner).await.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&latest).await.len(), 2);
+        assert_mappings_intact(dir.as_str(), &before).await;
+
+        cleaner.checkout_latest().await.unwrap();
+        cleanup_frag_reuse_index(&mut cleaner).await.unwrap();
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(
+            frag_reuse_watermarks(&latest).await,
+            frag_reuse_watermarks(&dataset).await[1..]
+        );
+        assert_index_answers_like_a_scan(&latest).await;
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_deferred_compaction_over_a_partial_cleanup_keeps_the_remaining_mappings(
+        #[values(false, true)] separate_session: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), BuiltinIndexType::BTree).await;
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[0, 1]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        let before = values_by_address(&dataset).await;
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[2, 3]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+        let history = frag_reuse_watermarks(&dataset).await;
+        assert_eq!(history.len(), 2);
+        let open = async || {
+            if separate_session {
+                Dataset::open(dir.as_str()).await.unwrap()
+            } else {
+                dataset.clone()
+            }
+        };
+        let mut stale = open().await;
+        let options = deferred_compaction_excluding(&fragments_except(&stale, &[4, 5]));
+        let result = plan_one_task(&stale, &options).await;
+
+        let mut cleaner = open().await;
+        cleanup_frag_reuse_index(&mut cleaner).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&cleaner).await, history[1..]);
+        commit_one(&mut stale, result, &options).await.unwrap();
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(
+            frag_reuse_watermarks(&latest).await,
+            vec![history[1], latest.manifest.version - 1]
+        );
+        assert_mappings_intact(dir.as_str(), &before).await;
+    }
+
+    #[tokio::test]
+    async fn test_distributed_deferred_compaction_keeps_mappings_recorded_before_its_handle() {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), BuiltinIndexType::BTree).await;
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[0, 1]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+        let before = values_by_address(&dataset).await;
+        let options_b = deferred_compaction_excluding(&fragments_except(&dataset, &[4, 5]));
+        let result_b = plan_one_task(&dataset, &options_b).await;
+
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        assert!(frag_reuse_watermarks(&dataset).await.is_empty());
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[2, 3]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let mut driver = Dataset::open(dir.as_str()).await.unwrap();
+        commit_one(&mut driver, result_b, &options_b).await.unwrap();
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&latest).await.len(), 2);
+        assert_mappings_intact(dir.as_str(), &before).await;
     }
 
     #[tokio::test]

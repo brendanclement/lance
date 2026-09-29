@@ -92,6 +92,11 @@ impl Dataset {
 /// Typically run after [`compact_files`] with deferred remap and per-index
 /// [`remap_column_index`] have caught the indexes up.
 ///
+/// # Errors
+///
+/// Returns [`Error::RetryableCommitConflict`] if the fragment reuse index changed
+/// after `dataset`'s version; reload the latest version and run it again.
+///
 /// # Example
 ///
 /// ```no_run
