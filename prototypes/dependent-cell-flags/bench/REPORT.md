@@ -62,22 +62,24 @@ unrelated-field updates 0.98× / 1.11× (`1m`: 1.16× / 1.20×), dense updates 1
 
 - **Tables without flags, 1M rows** (`1m-clean`, 3 rounds): every workload 0.96–1.04× baseline
   (dense `UpdateBuilder` 1.04×, everything else 0.96–1.03×; full-column reads 0.96–1.03×).
-- **Tables without flags, 10M rows, full-column reads**: no extra work, and a code-generation
-  effect of a few percent whose sign depends on the build profile.
-  `results/10m-noflag-investigation/README.md` has the details.
-  - Method: shared tables, 20-round Latin-square rotations, and the process's retired
-    instructions and cycles per sample. Every comparison retired the same instructions to 0.3%.
-  - In the benchmark profile, the prototype measured 3.2–4.4% slower than `main`, with fewer cores
-    busy. Narrowly scoped variants traced this to the `async fn resolve_cells` wrapper around
-    `merge_overlays` in both `FragmentReader` read funnels.
-  - `2fd300ac2` restores `main`'s call. It measured 1.000–1.001× `main` in the run that measured
-    the prototype at 1.032–1.038×, and 1.000–1.032× over four rotations.
-  - Edits that do no work produce the same spread: `main` plus one unused `FragmentReader` field
+- **Tables without flags, 10M rows, full-column reads**: a regression narrowed down but unresolved,
+  and performance acceptance open. `results/10m-noflag-investigation/README.md` has the runs, their
+  limitations and the representative comparison that is still needed.
+  - Method: shared tables, 20-round Latin-square rotations, and the process's retired instructions
+    and cycles per sample.
+  - Every comparison retired nearly equal instructions, within 0.3%. Memory, cache,
+    synchronization and scheduling costs were not measured.
+  - In `release-with-debug`, the prototype measured 3.2–4.4% slower than `main`, with fewer cores
+    busy. Narrowly scoped variants tied this to the `async fn resolve_cells` wrapper around
+    `merge_overlays` in both `FragmentReader` read funnels. The mechanism was not identified.
+  - `2fd300ac2` restores `main`'s call. It measured 1.000–1.001× `main` in the run that measured the
+    prototype at 1.032–1.038×, and 1.000–1.032× over four rotations.
+  - Behavior-free edits give comparable spreads: `main` plus one unused `FragmentReader` field
     measured 1.014–1.021×, and the fix with `main`'s `fragment.rs` 1.056–1.064×.
-  - In the shipping `release` profile (fat LTO, 1 codegen unit), one rotation put the prototype at
-    0.997–1.025×, the fix at 1.032–1.044× and `main` plus the unused field at 1.024–1.032×. So
-    `2fd300ac2` is not a performance fix; it stays because the unmasked read path is structurally
-    `main`'s.
+  - In the local `release` profile (fat LTO, 1 codegen unit), one rotation put the prototype at
+    0.997–1.025×, the fix at 1.032–1.044× and `main` plus the unused field at 1.024–1.032×.
+  - Neither profile matches the Linux wheels (thin LTO, 1 codegen unit, `haswell`, `metrics`).
+    `2fd300ac2` is not a proven performance fix; it stays for maintainability.
   - The paired harness overstated the regression. It writes a new table per process, and writes
     are not byte-identical. Its clean runs put the prototype at **1.06–1.09×**, the
     geometric mean of `10m-reads-clean-baseline-first` (1.05–1.07×) and

@@ -499,32 +499,36 @@ all flags true and 3.0–3.5× on full-column reads with 1% invalidated. With th
 full-column reads with 1% invalidated 1.68–1.80×. At `2fd300ac2` (`10m-reads-fix-*`, one flag
 round per order): 0.92–1.04× and 1.60–1.81×.
 
-**No-flag reads at 10M rows: no extra work, and a code-generation effect of a few percent whose
-sign depends on the build profile.** `bench/results/10m-noflag-investigation/` has the runs.
-Every comparison retired the same instructions to 0.3%.
-- The clean paired runs (`10m-reads-clean-*`) measured full-column reads of tables without flags
-  6–9% slower. That harness writes a new table in each process, and writes are not byte-identical,
-  so each of its 3 rounds compares two physically different tables.
-- On shared tables, in the benchmark profile (`release-with-debug`: thin LTO, 16 codegen units),
-  a hardware-counter rotation (20 rounds, Latin square) measured the prototype 3.2–4.4% slower,
-  with fewer busy cores.
-- Narrowly scoped variants tied that to the `async fn resolve_cells` wrapper around
-  `merge_overlays` in both `FragmentReader` read funnels. Restoring `main`'s call (`funnel`) removed
-  the gap; skipping the per-open mask lookup (`noresolve`) or adding one unused function (`layout`)
-  did not.
-- `2fd300ac2` restores the funnels and applies masks through a plain function (`mask_cells`). In
-  the run that also measured the prototype at 1.032–1.038×, the fix measured 1.000–1.001× `main`.
-- Later rotations measured the fix at 1.000–1.032×, the same range as edits that do no work:
-  - `main` plus one unused `FragmentReader` field: 1.014–1.021×.
-  - The fix with `main`'s `fragment.rs`: 1.056–1.064×.
-- In the shipping profile (`release`: fat LTO, 1 codegen unit), one rotation measured:
-  - the prototype at 0.997–1.025× `main`;
-  - the fix at 1.032–1.044×;
-  - `main` plus the unused field at 1.024–1.032×.
-- The fix's paired harness runs (`10m-reads-fix-*`) measured 1.00–1.07× on full-column reads. In
-  both orders, round 1 favored the fix and rounds 2–3 the baseline.
+**No-flag reads at 10M rows: a regression narrowed down but unresolved, and performance
+acceptance open.** `bench/results/10m-noflag-investigation/` has the runs, their limitations and
+what a representative comparison needs.
+- **Instructions.** Every comparison of builds retired nearly equal instructions, within 0.3%.
+  That rules out a large per-row or per-batch cost. It does not rule out different memory, cache,
+  synchronization or scheduling costs, none of which was measured.
+- **Paired harness.** The clean paired runs (`10m-reads-clean-*`) measured full-column reads 6–9%
+  slower. That harness writes a new table in each process, and writes are not byte-identical, so
+  each of its 3 rounds compares two physically different tables.
+- **Shared-table rotation.** In `release-with-debug` (thin LTO, 16 codegen units), a counter
+  rotation (20 rounds, Latin square) measured the prototype 3.2–4.4% slower, with fewer busy cores.
+  Narrowly scoped variants tied that to the `async fn resolve_cells` wrapper around `merge_overlays`
+  in both `FragmentReader` read funnels. How the wrapper costs overlap was not identified.
+- **`2fd300ac2`.** It restores the funnels and applies masks through a plain function
+  (`mask_cells`).
+  - In the run that measured the prototype at 1.032–1.038×, the fix measured 1.000–1.001× `main`.
+  - Later rotations put it at 1.000–1.032×.
+  - Behavior-free edits give comparable spreads: `main` plus one unused `FragmentReader` field
+    measured 1.014–1.021×, and the fix with `main`'s `fragment.rs` 1.056–1.064×.
+- **Local `release` profile** (fat LTO, 1 codegen unit), one rotation: the prototype measured
+  0.997–1.025× `main`, the fix 1.032–1.044×, and `main` plus the unused field 1.024–1.032×.
+- **Not deployment builds.** Neither profile matches the Linux wheels (thin LTO, 1 codegen unit,
+  `haswell` on x86_64, `metrics` features). Every bench build also enables `lance-io`'s `test-util`,
+  which records each local read under a mutex. All runs used one macOS laptop.
+- **Paired harness at the fix.** The fix's paired runs (`10m-reads-fix-*`) measured 1.00–1.07× on
+  full-column reads. In both orders, round 1 favored the fix and rounds 2–3 the baseline.
 
-`2fd300ac2` stays because it keeps the unmasked read path structurally `main`'s, not for speed.
+`2fd300ac2` is not a proven performance fix. It stays for maintainability: `merge_overlays` and the
+unmasked read path are `main`'s. No representative environment or agreed threshold was available
+for a deployment comparison.
 
 Method caveat: this worktree sits under another Lance checkout (`/Users/brendan/code/lance`), and
 cargo merged both identical `.cargo/config.toml` files, concatenating their `rustflags`, so
@@ -561,14 +565,16 @@ Correctness risks:
 
 Performance bottlenecks:
 
-- **No-flag read overhead is below the code-generation noise floor, not proven zero.**
-  - At 10M rows, reads of tables without flags retire the same instructions as `main`.
-  - Wall time is 1.000–1.032× `main` in the benchmark profile and 1.032–1.044× in the shipping
-    profile (`2fd300ac2`). Behavior-free edits of `main` move the same reads by 1.4–3.2%
-    (`10m-noflag-investigation`).
-  - Any change to the read funnels can move wall time by a few percent in either direction without
-    adding work. Measure such changes with `bench/run_counters_rotation.sh` on a shared table, in
-    both profiles; the 3-round paired harness cannot resolve them.
+- **No-flag read performance is unresolved.**
+  - At 10M rows on one laptop, reads of tables without flags retire nearly the same instructions as
+    `main`.
+  - Wall time varies by build profile: 1.000–1.032× `main` in `release-with-debug` and 1.032–1.044×
+    in the local `release` profile (`2fd300ac2`).
+  - Behavior-free edits move the same reads by 1.4–3.2%.
+  - Memory, cache, synchronization and scheduling costs were not measured, and no deployment build
+    or hardware was.
+  - Measure with `bench/run_counters_rotation.py` on a shared table in a representative
+    environment, with an identical-binary control, before accepting read performance.
 - **Manifest-inline state.** Fragmented true sets make every commit rewrite, and every open decode,
   hundreds of KB (858 KB at 10M rows with 1% scattered invalidation, `10m`). Spill per-fragment
   state to external files, as deletion files or #8655's roots do.

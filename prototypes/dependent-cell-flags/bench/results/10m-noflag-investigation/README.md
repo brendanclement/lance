@@ -1,35 +1,118 @@
 # No-flag read regression at 10M rows: investigation
 
-**Result.** On tables without cell flags, the prototype's read path does no measurable extra
-work. Every comparison of builds retired the same instructions to 0.3%. The wall-time differences
-between builds are code-generation effects, and their size and sign depend on the build profile.
+**Status: narrowed down, unresolved.** Performance acceptance for reads of tables without cell
+flags is open.
 
-- **Benchmark profile** (`release-with-debug`: thin LTO, 16 codegen units).
-  - On one shared table, the prototype's full-column reads were 3.2–4.4% slower than `main`, with
-    fewer cores busy.
-  - Narrowly scoped variants tied this to the prototype's `async fn resolve_cells`, which wraps the
-    `merge_overlays` future in both `FragmentReader` read funnels.
-  - `2fd300ac2` restores `main`'s call and applies masks afterwards through a plain function. In
-    the run that measured the prototype at 1.032–1.038×, it measured 1.000–1.001× `main`. Later
-    rotations put it at 1.000–1.032×.
-  - Edits that do no work produce the same spread: `main` plus one unused field on
-    `FragmentReader` measures 1.014–1.021×, and the fix with `fragment.rs` taken from `main`
-    1.056–1.064×.
-- **Shipping profile** (`release`: fat LTO, 1 codegen unit), one rotation on the same table.
-  - The prototype measures 0.997–1.025× `main`.
-  - The fix measures 1.032–1.044×, which is 1.018–1.043× the prototype.
-  - `main` plus the unused field measures 1.024–1.032×.
+What the measurements establish, on one laptop (see Setup):
+- **Nearly equal instruction counts.** In every comparison of builds, the whole process retired the
+  same number of instructions to within 0.3%.
+- **Build-dependent wall time.** The prototype's full-column reads on one shared table measured:
+  - `release-with-debug` (thin LTO, 16 codegen units): 3.2–4.4% slower than `main` (`4bcfb2585`
+    against `e3671b2f5`), with fewer cores busy;
+  - the repository's local `release` profile (fat LTO, 1 codegen unit): 0.997–1.025× `main`.
+- **Edits that do nothing move the reads comparably.** `main` plus one unused field on
+  `FragmentReader` measured 1.014–1.021× in `release-with-debug` and 1.024–1.032× in `release`.
+  The fix with `fragment.rs` taken from `main` measured 1.056–1.064× in `release-with-debug`.
 
-`2fd300ac2` is therefore not a performance fix: it removes the gap in the benchmark profile and
-costs about as much in the shipping profile. It stays on the branch because it keeps the read path
-for unmasked fields structurally identical to `main`. A per-row or per-batch cost would show up in
-the retired instructions, and none does.
+What they do not establish:
+- **Zero overhead.** Equal instruction counts can still carry different memory, cache,
+  synchronization and scheduling costs. None of those was measured: there are no cache-miss,
+  branch-miss, context-switch or task-scheduling data. The lower busy-core counts in
+  `release-with-debug` point at how fragment reads overlap, not only at code speed.
+- **The cause.** In `release-with-debug`, narrowly scoped variants tied the gap to the
+  prototype's `async fn resolve_cells`, which wraps the `merge_overlays` future in both
+  `FragmentReader` read funnels. The mechanism was not identified, and the attribution did not
+  carry over to `release`. There, `2fd300ac2`, which removes the wrapper, measured 1.032–1.044× `main`
+  against the prototype's 0.997–1.025×.
+- **Representativeness.** The runs use one Apple-silicon laptop running macOS, one table shape and
+  three full-column read workloads. Neither local build profile matches a deployment build (see
+  Limitations).
+
+`2fd300ac2` is not a proven performance fix. It removed the gap in the build and run that also
+measured the prototype, and measured slower in the other profile.
+
+No representative comparison was run, and no performance threshold is agreed, so performance
+acceptance stays open (see "Representative comparison: not run").
+
+## Limitations
+
+- **Hardware and OS.** One Apple M5 Pro laptop (18 cores, 48 GB) running macOS 26.7, with the system
+  allocator, a local APFS SSD, a warm and uncontrolled page cache, and other applications and
+  management daemons running. Deployed Lance runs mostly as Linux wheels on x86_64 (Haswell or newer)
+  and aarch64 servers, usually reading object storage.
+- **Build settings.** Neither local profile matches a shipped build:
+
+  | Build | LTO | codegen units | target CPU | features |
+  |---|---|---|---|---|
+  | `release-with-debug` (runs 01–08) | thin | 16 | `apple-m1` +neon,fp16,fhm,dotprod | `lance` defaults; `lance-io` `test-util` from the dev-dependency |
+  | local `release` (run 09) | fat | 1 | same | same |
+  | Linux wheel (`python/`, `maturin build --release`) | thin | 1 | `haswell` +avx2,fma,f16c on x86_64; generic armv8-a on aarch64 | `lance` defaults plus `dynamodb`, `substrait`, `metrics`; `lance-io` `metrics`; no `test-util` |
+
+  The wheel settings come from `python/.cargo/config.toml`, `python/Cargo.toml` and
+  `.github/workflows/pypi-publish.yml`. The Java JNI build is fat LTO with 1 codegen unit.
+- **IO path.** `cargo bench -p lance` enables `lance-io`'s `test-util` through a dev-dependency. That
+  records every local `get_range` in a `Vec` behind a mutex (`rust/lance-io/src/local.rs`,
+  `utils/tracking_store.rs`), a synchronization cost that wheels do not have, and it is present in
+  every build measured here. Wheels instead wrap stores in the `metrics` meter, which these builds
+  lack.
+- **Counters.** Instructions, cycles and CPU time are whole-process totals from `proc_pid_rusage`,
+  including runtime and IO threads. Cache misses, branch misses, context switches, lock contention
+  and task scheduling were not measured.
+- **Tables and workloads.** One 10M-row, 100-fragment table shape with one string output. Only the
+  full scan, `IS NULL` count and `COUNT` aggregate were rotated. Selective reads (id range, take)
+  have only the paired harness's 3 rounds. Two copies of the same table differ physically, and the
+  runs identify their tables only by label (see Setup).
+- **Statistics.** The intervals are bootstrap intervals over 20 rounds of one table on one machine.
+  They do not cover variation between machines, builds of the same source, or table copies.
+
+## Representative comparison: not run
+
+The comparison needs:
+- a Linux host of the deployed class (x86_64, Haswell or newer; ideally also aarch64);
+- builds of `main` (`e3671b2f5`), the prototype before `2fd300ac2` (`4bcfb2585`) and with it, all
+  with the wheel's settings;
+- one shared table on the storage deployments use;
+- rotated order, with an identical-binary control.
+
+None is available here. The only Linux environment is a Docker VM on this laptop, which is the same
+hardware as the runs above, and provisioning paid infrastructure is out of scope. The repository
+also defines no wheel-matching Rust profile (thin LTO, 1 codegen unit) for Rust benches. No
+performance threshold is documented: `release_process.md` and `CONTRIBUTING.md` mention regressions
+without a number, and `rust-benchmark.yml` sets no alert threshold.
+
+The tooling is ready for when such an environment exists.
+- `rust/lance/benches/cell_flags_scan_counters.rs` builds and runs on Linux, verified in a Linux
+  aarch64 container. There it records CPU time and writes instructions and cycles as null.
+- `run_counters_rotation.py` builds each checkout and takes the single bench executable cargo
+  reports. It records the executable's sha256, the source revision and patch, rustc, rustflags,
+  features and profile. It runs the builds in a Latin square with `--control` as the
+  identical-binary control, and hashes the table before and after.
+- Linux instruction and cycle counts would need `perf_event_open`, which the libc crate exposes only
+  as a syscall number. Until then, `perf stat` around whole runs is the substitute.
+
+## Recommendation on `2fd300ac2`
+
+Keep it, for maintainability rather than speed.
+- **Performance evidence is inconclusive.**
+  - `release-with-debug`: 1.000–1.001× `main` in the run that measured the prototype at
+    1.032–1.038×, and 1.000–1.032× over later runs.
+  - Local `release`: 1.032–1.044× `main`, against the prototype's 0.997–1.025×.
+  - Neither profile is a deployment build, and behavior-free edits of `main` move the same reads by
+    1.4–3.2%.
+- **Maintainability favors it.**
+  - `merge_overlays` is byte-identical to `main`, and both read funnels call it as `main` does.
+  - Each funnel adds one `mask_cells` call, a plain stream stage that returns the stream unchanged
+    when no projected field is masked.
+  - Removing either call fails `test_every_reader_funnel_masks_each_batch`.
+- **Reverting it** would put masking back inside an async wrapper around `merge_overlays`, so the
+  function would differ from `main` again, for no measured benefit in any representative build.
 
 ## Setup
 
 - Checkouts outside any other Lance checkout (see `../../README.md`), built with
   `--profile release-with-debug` (thin LTO, 16 codegen units). Run 09 instead used
-  `--profile release` (fat LTO, 1 codegen unit), the profile of shipped builds. The cargo
+  `--profile release` (fat LTO, 1 codegen unit) from the repository's `.cargo/config.toml`, which
+  is not verified to match any deployment build. The cargo
   fingerprints of every bench binary show identical rustflags (`-C target-cpu=apple-m1 -C
   target-feature=+neon,+fp16,+fhm,+dotprod`, once) and features.
   - `baseline`: `e3671b2f5` plus the benchmark files.
@@ -54,9 +137,9 @@ the retired instructions, and none does.
   - Writes are not byte-identical, although every value is a deterministic function of the row id.
     The data files measure 854,216 KB (baseline-written), 854,184 KB (a second baseline-written
     copy, used only for this comparison) and 854,616 KB (fix-written).
-- `rust/lance/benches/cell_flags_scan_counters.rs` records, per sample, the wall time and the
-  whole process's retired instructions, cycles and CPU time (`proc_pid_rusage`,
-  `RUSAGE_INFO_V4`). "Busy cores" is CPU time divided by wall time.
+- For runs 01–09, `rust/lance/benches/cell_flags_scan_counters.rs` recorded, per sample, the wall
+  time and the whole process's retired instructions, cycles and CPU time (`proc_pid_rusage`,
+  `RUSAGE_INFO_V4`, CPU time in Mach ticks). "Busy cores" is CPU time divided by wall time.
 - Apple M5 Pro, 18 cores, 48 GB, macOS 26.7, local APFS SSD. The OS page cache was warm and not
   controlled. Other desktop applications and management daemons were running.
 
@@ -115,14 +198,16 @@ baseline 9.73, fix 9.75, fragbase 9.49 and layout 9.25 (07); baseline 9.75, fix 
 base-field 9.81 and fragbase-field 9.40 (08); baseline 9.53, prototype 9.54, fix 9.52 and
 base-field 9.40 (09, `release`).
 
-- **The prototype does the same work.** Instructions match to 0.1% and cycles are within noise.
-  In the benchmark profile the lost time is parallelism: fewer cores are busy.
-- **Isolation, in the benchmark profile.** The per-open mask lookup is not the cause, since
+- **Nearly the same instructions, less overlap.** The prototype's instructions match `main` to
+  0.1%, and its cycles are within noise. In `release-with-debug` it keeps fewer cores busy. What
+  the lost overlap consists of (waiting on IO, lock or channel contention, task scheduling, cache
+  behavior) was not measured.
+- **Isolation, in `release-with-debug` only.** The per-open mask lookup is not responsible:
   `noresolve` behaves like the prototype. A pure layout change of similar size moves the reads by
   about 1% (`layout`). Restoring `main`'s funnel structure removes the gap: `funnel` measures
-  1.007–1.013× and `fix` 1.000–1.001×. How the nested future cost overlap between fragment reads
+  1.007–1.013× and `fix` 1.000–1.001×. How the nested future reduces overlap between fragment reads
   was not identified.
-- **Behavior-free edits move the reads as much as the prototype did.**
+- **Behavior-free edits move the reads by comparable amounts.**
   - The fix measured 1.000–1.032× `main` across runs 05–08. On any one table it varies by up to 2
     percentage points between runs.
   - Adding one unused field to `main`'s `FragmentReader` (`base-field`) costs 1.4–2.1%.
@@ -130,12 +215,12 @@ base-field 9.40 (09, `release`).
     the fix's. Adding the same field back (`fragbase-field`) brings it level with the fix. So the
     same field hurt in `main` and helped in the prototype crate.
   - None of these changes alters the instructions retired by more than 0.2%.
-- **The shipping profile reorders the builds** (09). There the prototype is within the range of
-  `base-field` and the fix is the slowest build, with equal busy cores and 3.7–4.5% more cycles.
-  Which read-path shape is fastest depends on how the compiler partitions and inlines the crate,
-  not on what the code does, so no source change here can be relied on to hold wall-time parity.
-  The reliable check for a real cost is the instruction count, measured with this rotation on a
-  shared table.
+  - This sensitivity is consistent with code-generation effects (placement, inlining, future
+    layout), but none was measured directly. It also means differences of this size cannot be
+    attributed to a single source change from these runs alone.
+- **The local `release` profile reorders the builds** (09). There the prototype is within the
+  range of `base-field`, and the fix is the slowest build, with equal busy cores and 3.7–4.5% more
+  cycles.
 - **The regression harness overstated the regression.** `run_paired.sh` writes a new table in
   each process and compares 3 rounds. Each round therefore compares two physically different
   tables. The fix-written table costs both binaries 0.3% more instructions, and the fix reads it
@@ -147,29 +232,36 @@ base-field 9.40 (09, `release`).
 
 ## Reproduce
 
+New runs use `run_counters_rotation.py`. It builds each checkout itself, and each checkout must
+sit outside any other Lance checkout:
+
 ```bash
-# checkouts outside any other Lance checkout, e.g. /abs/lance-base and /abs/lance-fix
-cargo bench -p lance --bench cell_flags_scan_counters --profile release-with-debug --no-run
+# once: write the table with any build of the bench
 BENCH_COUNTERS_MODE=create BENCH_COUNTERS_URI=/abs/articles_10m BENCH_SCALE_ROWS=10000000 \
-  BENCH_ROWS_PER_FRAGMENT=100000 /abs/lance-base/target/release-with-debug/deps/cell_flags_scan_counters-<hash>
-DATASET=/abs/articles_10m OUT=/abs/rotation ROUNDS=20 \
-  BUILDS="baseline=/abs/lance-base fix=/abs/lance-fix fragbase=/abs/lance-fragbase layout=/abs/lance-layout" \
-  prototypes/dependent-cell-flags/bench/run_counters_rotation.sh
+  BENCH_ROWS_PER_FRAGMENT=100000 /abs/lance-main/target/release-with-debug/deps/cell_flags_scan_counters-<hash>
+python3 prototypes/dependent-cell-flags/bench/run_counters_rotation.py \
+  --dataset /abs/articles_10m --out /abs/rotation --profile release-with-debug \
+  --build main=/abs/lance-main --build prototype=/abs/lance-proto --build fix=/abs/lance-fix \
+  --control main
 python3 prototypes/dependent-cell-flags/bench/analyze_counters.py /abs/rotation \
-  --reference baseline --builds fix,fragbase,layout
+  --reference main --builds main-copy,prototype,fix
 ```
+
+Reproduce the recorded runs 01–09 as follows:
+- Analyze their records, which predate the `schema` field and store CPU time in Mach ticks, with
+  `--legacy-mach-timebase 125/3` (Apple silicon). The committed `analysis.md` files regenerate byte
+  for byte.
+- They were driven by one-off loops (01–06, `06-rotation20-data-source/driver.sh`) and
+  `driver-runs-07-09.sh`, the former `bench/run_counters_rotation.sh`. That script takes the first
+  matching binary and records no provenance.
 
 The baseline checkout needs these files copied from this branch, plus their `[[bench]]` entries:
 - `rust/lance/benches/cell_flags_common/mod.rs`
 - `cell_flags_regression.rs` (the counters bench includes the common module)
 - `cell_flags_scan_counters.rs`
 
-For the shipping profile, build with `--profile release` and run the rotation with
-`PROFILE=release`, as `09-rotation20-release/build.sh` did.
-
-A variant is its base checkout with one file of `patches/` applied. `run_counters_rotation.sh`
-takes a directory per build and uses the first `cell_flags_scan_counters-*` binary under
-`target/$PROFILE/deps`. Run 08 pointed it at directories holding only the copied binaries.
-`run_counters_rotation.sh` replaces the one-off drivers of runs 01–05, which followed the same
-design, and `06-rotation20-data-source/driver.sh` is the driver of run 06. The measured copies of
-`cell_flags_scan_counters.rs` differ from the committed one only in comments and formatting.
+A variant is its base checkout with one file of `patches/` applied. Run 08 ran copied binaries
+(`checksums.txt`). Run 09's `build.sh` built the local `release` profile. Runs 01–09 used the
+bench as committed in `060e20459`, apart from comments and formatting; rerun them with that
+revision of `cell_flags_scan_counters.rs`. The current bench writes schema-2 records: CPU time in
+nanoseconds, unavailable counters as null, and a run record with the binary and table identity.
