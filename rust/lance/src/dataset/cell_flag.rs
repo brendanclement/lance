@@ -71,7 +71,8 @@
 //! };
 //!
 //! // Publish what is still valid, and plan the rows the report certifies or
-//! // defers, at the version it names; a moved row is pending at its new address.
+//! // defers, at the version it names; a moved row keeps a valid true flag or is
+//! // pending at its new address.
 //! let result = CommitBuilder::new(read)
 //!     .with_dependency_conflict_policy(DependencyConflictPolicy::Skip)
 //!     .execute_with_report(publication)

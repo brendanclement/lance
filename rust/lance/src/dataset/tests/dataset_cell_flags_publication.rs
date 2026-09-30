@@ -6199,24 +6199,49 @@ async fn test_stager_refuses_an_undeclared_output_between_outputs(
     }
 }
 
-/// With the whole chain declared, a row assigning summary and digest must
-/// assign translation too: publishing summary clears translation where it is
-/// not assigned, and the commit carries that clear on to digest, so the
-/// commit would refuse the row. Leaving digest unassigned, or assigning
-/// translation, stages and commits.
+/// Tweet is computed from digest, at the end of [`DIGEST_CHAIN`].
+const TWEET_CHAIN: [(&str, &str); 4] = [
+    ("summary", "body"),
+    ("translation", "summary"),
+    ("digest", "translation"),
+    ("tweet", "digest"),
+];
+
+/// With the whole chain declared, a row assigning an output and one it
+/// depends on must assign every output between them: publishing summary
+/// clears translation where it is not assigned, and the commit carries that
+/// clear down the chain, through every output the row leaves unassigned, so
+/// the commit would refuse the row. Leaving the downstream output unassigned,
+/// or assigning the outputs between, stages and commits.
 #[rstest]
-#[case::skipping_translation(&[("summary", 0), ("digest", 0)], false)]
-#[case::whole_chain(&[("summary", 0), ("translation", 0), ("digest", 0)], true)]
-#[case::without_digest(&[("summary", 0), ("translation", 0)], true)]
-#[case::summary_alone(&[("summary", 0)], true)]
-#[case::on_different_rows(&[("summary", 0), ("digest", 1)], true)]
+#[case::skipping_translation(
+    &DIGEST_CHAIN,
+    &[("summary", 0), ("digest", 0)],
+    Some(
+        "assigns 'summary' and 'digest' but not 'translation' between them: publishing \
+         'summary' clears 'translation' there, and with it 'digest'"
+    )
+)]
+#[case::whole_chain(&DIGEST_CHAIN, &[("summary", 0), ("translation", 0), ("digest", 0)], None)]
+#[case::without_digest(&DIGEST_CHAIN, &[("summary", 0), ("translation", 0)], None)]
+#[case::summary_alone(&DIGEST_CHAIN, &[("summary", 0)], None)]
+#[case::on_different_rows(&DIGEST_CHAIN, &[("summary", 0), ("digest", 1)], None)]
+#[case::skipping_two_outputs(
+    &TWEET_CHAIN,
+    &[("summary", 0), ("tweet", 0)],
+    Some(
+        "assigns 'summary' and 'tweet' but not 'digest' between them: publishing 'summary' \
+         clears 'digest' there, and with it 'tweet'"
+    )
+)]
 #[tokio::test]
 async fn test_stager_refuses_a_row_skipping_an_output_between_outputs(
+    #[case] chain: &[(&str, &str)],
     #[case] assignments: &[(&str, u32)],
-    #[case] is_accepted: bool,
+    #[case] refusal: Option<&str>,
 ) {
-    let read = computed_outputs(2, &DIGEST_CHAIN).await;
-    let outputs = ["summary", "translation", "digest"];
+    let read = computed_outputs(2, chain).await;
+    let outputs: Vec<&str> = chain.iter().map(|(output, _)| *output).collect();
     let computed_rows = [addr(0, 0), addr(0, 1)];
     let assigned: Vec<(&str, Vec<u64>)> = outputs
         .iter()
@@ -6240,16 +6265,10 @@ async fn test_stager_refuses_a_row_skipping_an_output_between_outputs(
         vec![computed_batch(&read, &computed_rows, &assigned).await],
     )
     .await;
-    if !is_accepted {
+    if let Some(refusal) = refusal {
         let error = staged.unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        assert!(
-            error.to_string().contains(
-                "assigns 'summary' and 'digest' but not 'translation' between them: publishing \
-                 'summary' clears 'translation' there, and with it 'digest'"
-            ),
-            "{error}"
-        );
+        assert!(error.to_string().contains(refusal), "{error}");
         assert_eq!(data_files(&read).await, before);
         return;
     }
@@ -6998,6 +7017,135 @@ async fn test_stager_follow_up_recomputes_downstream_of_a_recomputed_upstream() 
     for column in outputs {
         assert_visible_values_follow_inputs(&completed, column).await;
     }
+}
+
+/// Summary is published on every row before a refresh restages it with
+/// translation on fragment 0, and a newer summary of id 2 defers the group
+/// whole. Id 1's summary is certified but already true, so the plan leaves it
+/// to copy through, and only the report's `UpstreamNotPublished` deferral
+/// plans id 1's translation.
+#[tokio::test]
+async fn test_stager_follow_up_recomputes_a_row_whose_upstream_stays_true() {
+    let dataset = computed_outputs(2, &CHAIN).await;
+    let outputs = ["summary", "translation"];
+    let read = publish_computed(&dataset, &["summary"], &live_addrs(&dataset).await).await;
+    let (summary, translation) = (flag_of(&read, "summary"), flag_of(&read, "translation"));
+    let fragment_0 = [addr(0, 0), addr(0, 1)];
+    let older = stage_batches(
+        &stager_of(&read, &outputs),
+        vec![
+            computed_batch(
+                &read,
+                &fragment_0,
+                &[("summary", &fragment_0), ("translation", &fragment_0)],
+            )
+            .await,
+        ],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let newer = publish_computed(&read, &["summary"], &[addr(0, 1)]).await;
+    let result = commit_staged(&read, older, Skip).await.unwrap();
+    let report = &result.report;
+    assert_eq!(report.committed_version, None);
+    assert_eq!(report.checked_version, newer.version().version);
+    assert_eq!(report.reusable_rows(summary), rows(&[(0, &[0])]));
+    assert!(
+        newer
+            .cell_flag_true_rows(summary)
+            .unwrap()
+            .contains(addr(0, 0))
+    );
+    assert_eq!(
+        report.deferred_rows_of(translation, UpstreamNotPublished),
+        rows(&[(0, &[0])])
+    );
+
+    let plan = stager_of(&newer, &outputs).follow_up(report).await.unwrap();
+    assert_eq!(plan.rows("summary"), Some(&FollowUpRows::default()));
+    assert_eq!(
+        plan.rows("translation"),
+        Some(&FollowUpRows {
+            reuse: RowAddrTreeMap::new(),
+            recompute: rows(&[(0, &[0, 1])]),
+        })
+    );
+    let follow_up = stage_batches(
+        &stager_of(&newer, &outputs),
+        vec![computed_batch(&newer, &fragment_0, &[("translation", &fragment_0)]).await],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let completed = commit_staged(&newer, follow_up, Reject)
+        .await
+        .unwrap()
+        .dataset;
+    assert_eq!(
+        completed.cell_flag_true_rows(summary).unwrap(),
+        full(&[0, 1])
+    );
+    assert_eq!(
+        completed.cell_flag_true_rows(translation).unwrap(),
+        full(&[0])
+    );
+    for column in outputs {
+        assert_visible_values_follow_inputs(&completed, column).await;
+    }
+}
+
+/// A refresh stages summary on every row while newer results publish id 2 and
+/// then id 4, which defers the group of each fragment at its own version. The
+/// plan reuses the rows every group still certifies.
+#[tokio::test]
+async fn test_stager_follow_up_reuses_the_rows_of_every_deferred_group() {
+    let read = computed_outputs(2, &CHAIN[..1]).await;
+    let summary = flag_of(&read, "summary");
+    let every_row = live_addrs(&read).await;
+    let older = stage_batches(
+        &stager_of(&read, &["summary"]),
+        vec![computed_batch(&read, &every_row, &[("summary", &every_row)]).await],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let newer_0 = publish_computed(&read, &["summary"], &[addr(0, 1)]).await;
+    let newer_1 = publish_computed(&newer_0, &["summary"], &[addr(1, 1)]).await;
+    let result = commit_staged(&read, older, Skip).await.unwrap();
+    let report = &result.report;
+    assert_eq!(report.committed_version, None);
+    let mut deferred_at: Vec<(u64, u64)> = report
+        .deferred_groups
+        .iter()
+        .map(|group| (group.fragment_id, group.conflicting_version))
+        .collect();
+    deferred_at.sort();
+    assert_eq!(
+        deferred_at,
+        vec![
+            (0, newer_0.version().version),
+            (1, newer_1.version().version)
+        ]
+    );
+
+    let plan = stager_of(&newer_1, &["summary"])
+        .follow_up(report)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.rows("summary"),
+        Some(&FollowUpRows {
+            reuse: rows(&[(0, &[0]), (1, &[0])]),
+            recompute: RowAddrTreeMap::new(),
+        })
+    );
+    let completed = publish_computed(&newer_1, &["summary"], &[addr(0, 0), addr(1, 0)]).await;
+    assert_eq!(
+        completed.cell_flag_true_rows(summary).unwrap(),
+        full(&[0, 1])
+    );
+    assert_visible_values_follow_inputs(&completed, "summary").await;
 }
 
 /// Summary and translation are added as all-NULL, metadata-only columns. A

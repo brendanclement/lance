@@ -431,6 +431,16 @@ mod tests {
         .unwrap()
     }
 
+    /// `window` with its `_rowaddr` replaced by `addrs`, NULLs allowed.
+    fn with_row_addrs(window: RecordBatch, addrs: Vec<Option<u64>>) -> RecordBatch {
+        let index = window.schema().index_of(ROW_ADDR).unwrap();
+        let mut fields = window.schema().fields().to_vec();
+        fields[index] = Arc::new(ArrowField::new(ROW_ADDR, DataType::UInt64, true));
+        let mut columns = window.columns().to_vec();
+        columns[index] = Arc::new(UInt64Array::from(addrs));
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap()
+    }
+
     /// What `output` computes at `offset`; every third row is a computed NULL.
     fn computed(output: &str, offset: u32) -> Option<String> {
         (offset % 3 != 2).then(|| format!("computed-{output}-{offset}"))
@@ -586,6 +596,18 @@ mod tests {
             u64::from(RowAddress::new_from_parts(FRAGMENT + 1, 0)),
             addr(0)
         )
+    )]
+    #[case::reordered_after_first_row(
+        with_row_addrs(text_window(0, 3), vec![Some(addr(0)), Some(addr(2)), Some(addr(1))]),
+        format!("returned row address {:#x} where {:#x} was expected", addr(2), addr(1))
+    )]
+    #[case::repeated_row(
+        with_row_addrs(text_window(0, 3), vec![Some(addr(0)), Some(addr(0)), Some(addr(1))]),
+        format!("returned row address {:#x} where {:#x} was expected", addr(0), addr(1))
+    )]
+    #[case::null_after_first_row(
+        with_row_addrs(text_window(0, 3), vec![Some(addr(0)), None, Some(addr(2))]),
+        format!("returned row address NULL where {:#x} was expected", addr(1))
     )]
     #[case::past_physical_rows(text_window(0, 5), "returned 5 rows at offset 0, past its 4 physical rows".to_string())]
     #[case::copied_type_mismatch(

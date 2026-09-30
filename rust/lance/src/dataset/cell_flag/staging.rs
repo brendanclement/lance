@@ -88,8 +88,8 @@ const COPY_READ_AHEAD: usize = 2;
 ///     .await?;
 ///
 /// // Plan the rows the report certifies or defers, at the version it names.
-/// // Rows it vacated are not planned: a moved row is pending at its new
-/// // address, for a scan of pending rows to pick up.
+/// // Rows it vacated are not planned: a moved row keeps a valid true flag or
+/// // is pending at its new address, for a scan of pending rows to pick up.
 /// let follow_up = PublicationStager::try_new(Arc::new(result.dataset), &["summary"])?;
 /// let plan = follow_up.follow_up(&result.report).await?;
 /// let rows = plan.rows("summary").expect("summary is staged");
@@ -131,7 +131,9 @@ struct Output {
 /// [`Self::with_assigned`] mask sets. A NULL on an assigned row is a computed
 /// NULL: it is published and its flag set true. The value on an unassigned row
 /// is ignored, and that cell is copied from the snapshot, as is every output
-/// the batch does not carry.
+/// the batch does not carry. Publishing an assigned value clears, on its row,
+/// the flag of every output computed from it that the row does not assign,
+/// and their downstream flags.
 ///
 /// Across the stream, the rows of each fragment arrive in one contiguous run
 /// (fragments in any order) with strictly ascending offsets, so a row appears
@@ -389,9 +391,12 @@ impl PublicationStager {
     /// return the publication: a `DataReplacement` read at the snapshot's
     /// version that sets each output's flag true on exactly the rows assigned.
     /// An output that assigns no row still gets a `CellFlagUpdate`, with no
-    /// rows: its cells in the staged files are copies, and the update is what
-    /// tells the commit so, keeping its flag and its downstream flags. Returns
-    /// `Ok(None)`, and writes nothing, when no row is assigned.
+    /// rows, so its copied cells clear neither its flag nor its downstream
+    /// flags. On a row that assigns a declared output another declared output
+    /// watches, the commit still clears the watching output and its
+    /// downstream flags unless the row assigns it too;
+    /// [`FollowUpRows::recompute`] plans those rows. Returns `Ok(None)`, and
+    /// writes nothing, when no row is assigned.
     ///
     /// Fragments are written one at a time, each while `computed` streams its
     /// rows, and `computed` is pulled only as far as the copy window being
@@ -411,17 +416,19 @@ impl PublicationStager {
     /// an output and one it depends on but not a declared output between them,
     /// whose clear the commit would carry on to the downstream output; and when some outputs
     /// are stored in a fragment's data files and others are not, which one
-    /// replacement file cannot express. Every file staged by the call is
-    /// deleted on any error, including one from `computed`.
+    /// replacement file cannot express. On any error, including one from
+    /// `computed`, every file the call staged is deleted, on a best-effort
+    /// basis: a file whose delete fails is logged and left behind.
     ///
     /// Nothing else deletes them. The files of a returned transaction that is
     /// dropped or fails to commit (as under
     /// [`DependencyConflictPolicy::Reject`](super::DependencyConflictPolicy::Reject)
-    /// on a retryable conflict), the files of groups the commit defers, and
-    /// the files a dropped `stage` future already wrote stay in the data
-    /// directory until [`Dataset::cleanup_old_versions`] removes them as
-    /// unreferenced: only once they are 7 days old, unless `delete_unverified`
-    /// is set, which is safe only while no other write is in progress.
+    /// on a retryable conflict), the files of groups the commit defers, the
+    /// files a dropped `stage` future already wrote, and those whose delete
+    /// failed on an error stay in the data directory until
+    /// [`Dataset::cleanup_old_versions`] removes them as unreferenced: only
+    /// once they are 7 days old, unless `delete_unverified` is set, which is
+    /// safe only while no other write is in progress.
     ///
     /// An output added as an all-NULL (metadata-only) column is not stored on
     /// the fragments where another output was already published. Publishing
@@ -501,9 +508,15 @@ impl PublicationStager {
     /// [`DeferralReason::InputChanged`] or
     /// [`DeferralReason::UpstreamNotPublished`]. Rows vacated by a delete or a
     /// row-moving update, and fragments removed or rewritten, are not
-    /// planned. A moved row is pending at its new address, where a refresh of
-    /// pending rows, a live scan without the rows of
-    /// [`Dataset::cell_flag_true_rows`], picks it up.
+    /// planned. A moved row keeps a flag's state where the update wrote none
+    /// of its inputs, nor those of the flags upstream of it, so a true flag
+    /// stays true with a valid value; its other flags start false. A refresh
+    /// of pending rows, a live scan without the rows of
+    /// [`Dataset::cell_flag_true_rows`], picks up the false ones. To complete
+    /// a row in one round, it must also assign every declared output that
+    /// watches an output it assigns there, as [`FollowUpRows::recompute`]
+    /// does: otherwise [`Self::stage`] refuses the row where an output further
+    /// down is assigned, or the commit clears the watching output again.
     ///
     /// Fails with `InvalidInput` when this stager reads another version, or
     /// when the report certifies rows to reuse for a flag whose output it
