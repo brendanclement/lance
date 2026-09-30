@@ -1160,7 +1160,6 @@ impl Transaction {
                     if columns_covered.is_disjoint(&replacement_ids) {
                         new_frag.files.push(new_file.clone());
                     } else if !replaced_in_place
-                        && replacement_ids.is_subset(&columns_covered)
                         && new_frag.files.iter().all(|file| {
                             file.file_version()
                                 .is_ok_and(|version| version != ConcreteFileVersion::V1)
@@ -1174,7 +1173,9 @@ impl Transaction {
                         // append the new file to answer for them, the idiom
                         // `update_columns` uses. Compaction decides that layout,
                         // so the fields may sit in one wider file or span
-                        // several.
+                        // several. A replaced field no file covers, such as a
+                        // column added as all-NULL after the others were
+                        // stored, has nothing to tombstone.
                         //
                         // Legacy V1 is excluded: its reader derives the page table
                         // offset from the first field in the metadata, so
@@ -3120,29 +3121,91 @@ mod tests {
         assert!(fragment.files.iter().any(|file| file.path == "v-new.lance"));
     }
 
-    #[test]
-    fn test_data_replacement_rejects_fields_spanning_a_legacy_file() {
-        // Spanning is only resolvable while every covering file can be
-        // tombstoned. A V1 file holding one of the replaced fields cannot,
-        // so the replacement must be rejected rather than half applied.
+    /// Replacing fields 4 and 5 is only resolvable while every file covering
+    /// one of them can be tombstoned. A V1 file cannot, so the replacement is
+    /// rejected rather than half applied, whether the fields span it and a V2
+    /// file or field 5 is not stored at all.
+    #[rstest::rstest]
+    #[case::spanning(vec![
+        DataFile::new("ab.lance", vec![3, 4], vec![0, 1], ConcreteFileVersion::V2_0, None, None),
+        DataFile::new_legacy_from_fields("cd.lance", vec![5, 6], None),
+    ])]
+    #[case::partly_covered(vec![DataFile::new_legacy_from_fields("ab.lance", vec![3, 4], None)])]
+    fn test_data_replacement_rejects_fields_of_a_legacy_file(#[case] files: Vec<DataFile>) {
         let mut fragment = Fragment::new(0);
-        fragment.files = vec![
-            DataFile::new(
-                "ab.lance",
-                vec![3, 4],
+        fragment.files = files;
+
+        let error = replace_fields(fragment, vec![4, 5], 1, 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Expected to modify the fragment but no changes were made"),
+            "{error}"
+        );
+    }
+
+    /// Field 5 is stored in no file, as for a column added as all-NULL, while
+    /// field 4 is. One file answers for both: field 4 is tombstoned where it
+    /// lives, a file left with no live field is dropped, and overlays read at
+    /// the snapshot lose both fields.
+    #[rstest::rstest]
+    #[case::own_file(vec![vec![3], vec![4]], vec![vec![3]])]
+    #[case::wider_file(vec![vec![3, 4]], vec![vec![3, TOMBSTONE_FIELD_ID]])]
+    #[case::beside_other_fields(
+        vec![vec![3], vec![4, 6]],
+        vec![vec![3], vec![TOMBSTONE_FIELD_ID, 6]]
+    )]
+    fn test_data_replacement_tombstones_partly_covered_fields(
+        #[case] files: Vec<Vec<i32>>,
+        #[case] survivors: Vec<Vec<i32>>,
+    ) {
+        let mut fragment = Fragment::new(0);
+        fragment.files = files
+            .into_iter()
+            .enumerate()
+            .map(|(index, fields)| {
+                let column_indices = (0..fields.len() as i32).collect();
+                DataFile::new(
+                    format!("{index}.lance"),
+                    fields,
+                    column_indices,
+                    ConcreteFileVersion::V2_0,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: DataFile::new(
+                "o35.lance",
+                vec![3, 5],
                 vec![0, 1],
                 ConcreteFileVersion::V2_0,
                 None,
                 None,
             ),
-            DataFile::new_legacy_from_fields("cd.lance", vec![5, 6], None),
-        ];
+            coverage: OverlayCoverage::sparse(vec![
+                roaring::RoaringBitmap::from_iter([0u32]),
+                roaring::RoaringBitmap::from_iter([0u32]),
+            ]),
+            committed_version: 1,
+        }];
 
-        let result = replace_fields(fragment, vec![4, 5], 1, 1);
-        assert!(
-            result.is_err(),
-            "spanning a legacy file must be rejected, got: {:?}",
-            result.map(|fragment| fragment.files)
+        let fragment = replace_fields(fragment, vec![4, 5], 1, 1).unwrap();
+        let (new_file, existing) = fragment.files.split_last().unwrap();
+        assert_eq!(new_file.path, "v-new.lance");
+        assert_eq!(new_file.fields.as_ref(), &[4, 5]);
+        assert_eq!(
+            existing
+                .iter()
+                .map(|file| file.fields.to_vec())
+                .collect::<Vec<_>>(),
+            survivors
+        );
+        assert_eq!(fragment.overlays.len(), 1);
+        assert_eq!(
+            fragment.overlays[0].data_file.fields.as_ref(),
+            &[3, TOMBSTONE_FIELD_ID]
         );
     }
 

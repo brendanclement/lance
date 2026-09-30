@@ -89,22 +89,31 @@ pub enum Operation {
         /// The fragment reuse index to be created or updated to
         frag_reuse_index: Option<IndexMetadata>,
     },
-    /// Replace data in a column in the dataset with new data. This is used for
-    /// null column population where we replace an entirely null column with a
-    /// new column that has data.
+    /// Replace the values of some columns of existing fragments with new data
+    /// files, one per fragment, each holding every physical row of its
+    /// fragment. Every new file must write the same fields. This populates an
+    /// all-NULL column or recomputes a stored one without rewriting the
+    /// fragment's other columns.
     ///
-    /// This operation will only allow replacing files that contain the same schema
-    /// e.g. if the original files contain columns A, B, C and the new files contain
-    /// only columns A, B then the operation is not allowed. As we would need to split
-    /// the original files into two files, one with column A, B and the other with column C.
+    /// For each fragment, the new file:
     ///
-    /// Corollary to the above: the operation will also not allow replacing files unless the
-    /// affected columns all have the same datafile layout across the fragments being replaced.
+    /// - swaps in place for an existing file that writes exactly the same
+    ///   fields in the same file version;
+    /// - is appended when the fragment's files cover none of its fields, as for
+    ///   a column added as all-NULL;
+    /// - otherwise is appended after the fields it writes are tombstoned in the
+    ///   existing files that cover them. A file left with no live field is
+    ///   dropped. The fields may span several files, and fields no file covers
+    ///   yet need no tombstone, so one file can recompute a stored column and
+    ///   populate an all-NULL one: `frag: [A, B]` replaced with `[B, C]`, where
+    ///   `C` was added as all-NULL, becomes `frag: [A, -2] [B, C]`.
     ///
-    /// e.g. if fragments being replaced contain files with different schema layouts on
-    /// the column being replaced, the operation is not allowed.
-    /// say `frag_1: [A] [B, C]` and `frag_2: [A, B] [C]` and we are trying to replace column A
-    /// with a new column A, the operation is not allowed.
+    /// Tombstoning a field of a legacy (v1) data file would misread its other
+    /// fields, so a replacement that needs one is refused.
+    ///
+    /// Overlays the transaction could have read are superseded on the replaced
+    /// fields. Indices on a replaced field no longer cover the replaced
+    /// fragments.
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
     },

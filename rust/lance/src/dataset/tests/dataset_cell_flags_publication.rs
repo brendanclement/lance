@@ -1962,10 +1962,6 @@ async fn computed_outputs_with(
         ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
         ("body", Arc::new(bodies) as ArrayRef),
     ];
-    // Stored rather than metadata-only: a replacement file must write only
-    // fields its fragment's files cover, or only fields they do not, so a
-    // follow-up could not stage summary with a translation a competitor
-    // already replaced.
     for (output, _) in outputs {
         columns.push((
             *output,
@@ -6287,98 +6283,428 @@ async fn test_stager_refuses_a_row_skipping_an_output_between_outputs(
     }
 }
 
-/// Summary is published on fragment 0, in a file of its own, and keywords is
-/// then added as an all-NULL, metadata-only column with its own flag. One
-/// file cannot replace a stored summary and a metadata-only keywords, which
-/// the build would refuse, so a refresh of both is refused on fragment 0,
-/// after fragment 1, which stores neither, was staged, and leaves nothing
-/// behind. Publishing keywords on its own first, in a separate commit, lets
-/// both refresh together: on fragment 0 from separate files (tombstoned) and
-/// then from one (swapped in place), and on fragment 1 appended.
-#[tokio::test]
-async fn test_stager_rejects_mixed_output_layout() {
-    let mut dataset = articles(false).await;
-    let summary = register_ready(&mut dataset).await;
-    let fragment_0 = [addr(0, 0), addr(0, 1)];
-    let fragment_1 = [addr(1, 0), addr(1, 1)];
-    let mut read = publish_computed(&dataset, &["summary"], &fragment_0).await;
-    let keywords = ArrowSchema::new(vec![ArrowField::new("keywords", DataType::Utf8, true)]);
-    read.add_columns(NewColumnTransform::AllNulls(Arc::new(keywords)), None, None)
+/// Add `output` as an all-NULL, metadata-only column with a masking dependent
+/// flag on `input`, and return the flag's id.
+async fn add_output(dataset: &mut Dataset, output: &str, input: &str) -> u32 {
+    let column = ArrowSchema::new(vec![ArrowField::new(output, DataType::Utf8, true)]);
+    dataset
+        .add_columns(NewColumnTransform::AllNulls(Arc::new(column)), None, None)
         .await
         .unwrap();
-    let keywords = read
+    dataset
         .register_cell_flag(
-            "keywords",
+            output,
             "ready",
             CellFlagOptions::default()
-                .with_clear_on_write(["body"])
+                .with_clear_on_write([input])
                 .with_mask_when_false(true),
         )
         .await
         .unwrap()
-        .flag_id;
-    let siblings = ["summary", "keywords"];
-    let before = data_files(&read).await;
-    let mut batches = Vec::new();
-    for fragment in [&fragment_1, &fragment_0] {
-        let assigned = [("summary", &fragment[..]), ("keywords", &fragment[..])];
-        batches.push(computed_batch(&read, fragment, &assigned).await);
+        .flag_id
+}
+
+/// Each fragment's data files, by the live fields they answer for, such as
+/// `"id body | summary"`.
+fn file_layouts(dataset: &Dataset) -> Vec<String> {
+    let schema = dataset.schema();
+    dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| {
+            fragment
+                .metadata()
+                .files
+                .iter()
+                .map(|file| {
+                    file.fields
+                        .iter()
+                        .filter_map(|id| schema.field_by_id(*id))
+                        .map(|field| field.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect()
+}
+
+fn referenced_files(dataset: &Dataset) -> BTreeSet<String> {
+    dataset
+        .manifest
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.files.iter().map(|file| file.path.clone()))
+        .collect()
+}
+
+/// Summary is published on fragments 0 and 1, which then store it, and
+/// keywords is added as an all-NULL, metadata-only column with its own flag.
+/// One stager of both writes one file per fragment: over the stored summary
+/// on fragments 0 and 1, and where neither is stored on fragments 2 and 3.
+/// Rows assign summary, keywords or both, and id 1's keywords is a computed
+/// NULL. Before the commit, id 6's body changes and a newer keywords of id 7
+/// is published. `Reject` then exposes nothing. `Skip` publishes both outputs
+/// together on fragments 0, 1 and 3, defers id 6 and fragment 2, and keeps
+/// the newer keywords; a follow-up of the report and of the pending rows
+/// completes every row.
+#[rstest]
+#[tokio::test]
+async fn test_stager_publishes_stored_and_unstored_outputs_together(
+    #[values(Reject, Skip)] policy: DependencyConflictPolicy,
+) {
+    /// Ids 1 to 12 as a masked read of `column` shows them: computed from
+    /// their body for `computed_ids`, as `overrides` gives them, and NULL
+    /// elsewhere.
+    fn shown(
+        column: &str,
+        computed_ids: &[i32],
+        overrides: &[(i32, Option<&str>)],
+    ) -> Vec<(i32, Option<String>)> {
+        (1..=12)
+            .map(|id| {
+                let value = match overrides.iter().find(|(overridden, _)| *overridden == id) {
+                    Some((_, value)) => value.map(str::to_string),
+                    None => computed_ids
+                        .contains(&id)
+                        .then(|| computed(column, Some(&format!("b{id}")))),
+                };
+                (id, value)
+            })
+            .collect()
     }
-    let error = stage_batches(&stager_of(&read, &siblings), batches)
-        .await
-        .unwrap_err();
-    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-    assert!(
-        error.to_string().contains(
-            "outputs [summary, keywords] cannot be replaced together on fragment 0: [summary] \
-             are stored in its data files but [keywords] are not, so one commit cannot publish \
-             them together there; publish [keywords] on its own first, then stage them together"
-        ),
-        "{error}"
-    );
-    assert_eq!(data_files(&read).await, before);
-    assert_eq!(
-        latest(&read).await.version().version,
-        read.version().version
-    );
-    let by_hand = stage_rows(&read, 0, &siblings, |column, offset| {
-        Some(format!("{column}-{offset}"))
-    })
+
+    let mut dataset = computed_outputs_with(4, 3, &[], true, false).await;
+    let summary = add_output(&mut dataset, "summary", "body").await;
+    let mut read = publish_computed(
+        &dataset,
+        &["summary"],
+        &[addr(0, 0), addr(1, 0), addr(1, 1)],
+    )
     .await;
-    let error = publish(
-        &read,
-        vec![by_hand],
-        both(summary, keywords, full(&[0])),
-        Reject,
+    let keywords = add_output(&mut read, "keywords", "body").await;
+    let siblings = ["summary", "keywords"];
+    assert_eq!(
+        file_layouts(&read),
+        [
+            "id body | summary",
+            "id body | summary",
+            "id body",
+            "id body"
+        ]
+    );
+    assert_eq!(
+        read.cell_flag_true_rows(summary).unwrap(),
+        rows(&[(0, &[0]), (1, &[0, 1])])
+    );
+    assert!(read.cell_flag_true_rows(keywords).unwrap().is_empty());
+    let (read_summaries, read_keywords) = (
+        shown("summary", &[1, 4, 5], &[]),
+        shown("keywords", &[], &[]),
+    );
+    assert_eq!(column_values(&read, "summary", None).await, read_summaries);
+    assert_eq!(column_values(&read, "keywords", None).await, read_keywords);
+
+    let strings =
+        |values: [Option<String>; 3]| Arc::new(StringArray::from(values.to_vec())) as ArrayRef;
+    let wrong = || Some("WRONG".to_string());
+    let fragment_0 = [addr(0, 0), addr(0, 1), addr(0, 2)];
+    let with_null_keywords = ComputedBatch::new(addressed(
+        &fragment_0,
+        vec![
+            (
+                "summary",
+                strings([
+                    wrong(),
+                    Some(computed("summary", Some("b2"))),
+                    Some(computed("summary", Some("b3"))),
+                ]),
+            ),
+            (
+                "keywords",
+                strings([None, Some(computed("keywords", Some("b2"))), wrong()]),
+            ),
+        ],
+    ))
+    .with_assigned("summary", BooleanBuffer::from(vec![false, true, true]))
+    .with_assigned("keywords", BooleanBuffer::from(vec![true, true, false]));
+    let fragment_1 = [addr(1, 0), addr(1, 1), addr(1, 2)];
+    let fragment_2 = [addr(2, 0), addr(2, 1), addr(2, 2)];
+    let fragment_3 = [addr(3, 0), addr(3, 1)];
+    let batches = vec![
+        with_null_keywords,
+        computed_batch(
+            &read,
+            &fragment_1,
+            &[("summary", &[addr(1, 2)]), ("keywords", &fragment_1)],
+        )
+        .await,
+        computed_batch(
+            &read,
+            &fragment_2,
+            &[("summary", &fragment_2), ("keywords", &fragment_2)],
+        )
+        .await,
+        computed_batch(
+            &read,
+            &fragment_3,
+            &[("summary", &fragment_3), ("keywords", &[addr(3, 1)])],
+        )
+        .await,
+    ];
+    let staged = stage_batches(&stager_of(&read, &siblings), batches)
+        .await
+        .unwrap()
+        .unwrap();
+    let output_ids = siblings.map(|output| read.schema().field(output).unwrap().id);
+    assert_eq!(
+        groups_of(&staged)
+            .iter()
+            .map(|DataReplacementGroup(fragment_id, file)| (*fragment_id, file.fields.to_vec()))
+            .collect::<Vec<_>>(),
+        (0..4)
+            .map(|fragment_id| (fragment_id, output_ids.to_vec()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        updates_of(&staged),
+        vec![
+            published(
+                summary,
+                rows(&[(0, &[1, 2]), (1, &[2]), (2, &[0, 1, 2]), (3, &[0, 1])])
+            ),
+            published(
+                keywords,
+                rows(&[(0, &[0, 1]), (1, &[0, 1, 2]), (2, &[0, 1, 2]), (3, &[1])])
+            ),
+        ]
+    );
+    let staged_files: Vec<String> = groups_of(&staged)
+        .iter()
+        .map(|DataReplacementGroup(_, file)| file.path.clone())
+        .collect();
+
+    let body_written = merge_insert_body(&read, 6, "new").await;
+    let newer = stage_batches(
+        &stager_of(&read, &["keywords"]),
+        vec![addressed(&[addr(2, 0)], vec![("keywords", text([Some("newer")]))]).into()],
     )
     .await
-    .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("Expected to modify the fragment but no changes were made"),
-        "{error}"
+    .unwrap()
+    .unwrap();
+    let head = commit_staged(&read, newer, Reject).await.unwrap().dataset;
+    assert_eq!(
+        head.cell_flag_true_rows(summary).unwrap(),
+        rows(&[(0, &[0]), (1, &[0, 1])])
+    );
+    assert_eq!(
+        head.cell_flag_true_rows(keywords).unwrap(),
+        rows(&[(2, &[0])])
+    );
+    let head_keywords = shown("keywords", &[], &[(7, Some("newer"))]);
+    assert_eq!(column_values(&head, "summary", None).await, read_summaries);
+    assert_eq!(column_values(&head, "keywords", None).await, head_keywords);
+
+    let result = commit_staged(&read, staged.clone(), policy).await;
+    if policy == Reject {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        let latest = latest(&head).await;
+        assert_eq!(latest.version().version, head.version().version);
+        assert_eq!(latest.manifest.fragments, head.manifest.fragments);
+        for flag_id in [summary, keywords] {
+            assert_eq!(
+                latest.cell_flag_true_rows(flag_id).unwrap(),
+                head.cell_flag_true_rows(flag_id).unwrap()
+            );
+        }
+        assert_eq!(
+            column_values(&latest, "summary", None).await,
+            read_summaries
+        );
+        assert_eq!(
+            column_values(&latest, "keywords", None).await,
+            head_keywords
+        );
+        let written = data_files(&latest).await;
+        let referenced = referenced_files(&latest);
+        for path in &staged_files {
+            assert!(
+                written
+                    .iter()
+                    .any(|written| written.ends_with(path.as_str()))
+            );
+            assert!(!referenced.contains(path), "{path} is referenced");
+        }
+        return;
+    }
+
+    let result = result.unwrap();
+    let (written_at, newer_at) = (body_written.version().version, head.version().version);
+    assert_eq!(
+        result.report,
+        PublicationReport {
+            read_version: read.version().version,
+            checked_version: newer_at,
+            committed_version: Some(newer_at + 1),
+            published: vec![
+                published(summary, rows(&[(0, &[1, 2]), (3, &[0, 1])])),
+                published(keywords, rows(&[(0, &[0, 1]), (1, &[0, 1]), (3, &[1])])),
+            ],
+            deferred_rows: vec![
+                deferred(summary, rows(&[(1, &[2])]), InputChanged, written_at),
+                deferred(keywords, rows(&[(1, &[2])]), InputChanged, written_at),
+            ],
+            deferred_groups: vec![DeferredGroup {
+                fragment_id: 2,
+                data_file: groups_of(&staged)[2].1.clone(),
+                reason: NewerResult,
+                conflicting_version: newer_at,
+                // Id 7's staged keywords is still a correct result, though a
+                // newer one is published there.
+                valid_rows: vec![
+                    published(summary, rows(&[(2, &[0, 1, 2])])),
+                    published(keywords, rows(&[(2, &[0, 1, 2])])),
+                ],
+            }],
+        }
+    );
+    let head = result.dataset;
+    assert_eq!(
+        file_layouts(&head),
+        [
+            "id body | summary keywords",
+            "id body | summary keywords",
+            "id body | keywords",
+            "id body | summary keywords",
+        ]
+    );
+    assert!(!referenced_files(&head).contains(&staged_files[2]));
+    assert_eq!(
+        head.cell_flag_true_rows(summary).unwrap(),
+        with_full(rows(&[(1, &[0, 1]), (3, &[0, 1])]), 0)
+    );
+    assert_eq!(
+        head.cell_flag_true_rows(keywords).unwrap(),
+        rows(&[(0, &[0, 1]), (1, &[0, 1]), (2, &[0]), (3, &[1])])
+    );
+    assert_eq!(
+        column_values(&head, "summary", None).await,
+        shown("summary", &[1, 2, 3, 4, 5, 10, 11], &[])
+    );
+    assert_eq!(
+        column_values(&head, "keywords", None).await,
+        shown("keywords", &[2, 4, 5, 11], &[(7, Some("newer"))])
     );
 
-    let mut head = publish_computed(&read, &["keywords"], &fragment_0).await;
-    assert_eq!(head.cell_flag_true_rows(summary).unwrap(), full(&[0]));
-    assert_eq!(head.cell_flag_true_rows(keywords).unwrap(), full(&[0]));
-    for _ in 0..2 {
-        head = publish_computed(&head, &siblings, &live_addrs(&head).await).await;
-    }
-    for flag_id in [summary, keywords] {
-        assert_eq!(head.cell_flag_true_rows(flag_id).unwrap(), full(&[0, 1]));
-    }
-    for (column, input) in [("summary", "t"), ("keywords", "b")] {
-        let expected: Vec<(i32, Option<String>)> = (1..=4)
-            .map(|id| (id, Some(computed(column, Some(&format!("{input}{id}"))))))
+    let plan = stager_of(&head, &siblings)
+        .follow_up(&result.report)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.rows("summary"),
+        Some(&FollowUpRows {
+            reuse: rows(&[(2, &[0, 1, 2])]),
+            recompute: rows(&[(1, &[2])]),
+        })
+    );
+    assert_eq!(
+        plan.rows("keywords"),
+        Some(&FollowUpRows {
+            reuse: rows(&[(2, &[1, 2])]),
+            recompute: rows(&[(1, &[2])]),
+        })
+    );
+    // The pending rows add what the report does not name: rows no one
+    // assigned yet.
+    let planned = |output: &str, pending: Vec<u64>| {
+        let rows = plan.rows(output).unwrap();
+        let mut addrs: BTreeSet<u64> = (rows.reuse.clone() | &rows.recompute)
+            .row_addrs()
+            .unwrap()
+            .map(u64::from)
             .collect();
+        addrs.extend(pending);
+        addrs.into_iter().collect::<Vec<_>>()
+    };
+    let summarized = planned("summary", pending_addrs(&head, "summary").await);
+    let keyworded = planned("keywords", pending_addrs(&head, "keywords").await);
+    assert_eq!(
+        summarized,
+        [addr(1, 2), addr(2, 0), addr(2, 1), addr(2, 2), addr(3, 2)]
+    );
+    assert_eq!(
+        keyworded,
+        [
+            addr(0, 2),
+            addr(1, 2),
+            addr(2, 1),
+            addr(2, 2),
+            addr(3, 0),
+            addr(3, 2)
+        ]
+    );
+    let scanned: Vec<u64> = summarized
+        .iter()
+        .chain(&keyworded)
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let follow_up = stage_batches(
+        &stager_of(&head, &siblings),
+        vec![
+            computed_batch(
+                &head,
+                &scanned,
+                &[("summary", &summarized), ("keywords", &keyworded)],
+            )
+            .await,
+        ],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let completed = commit_staged(&head, follow_up, Reject)
+        .await
+        .unwrap()
+        .dataset;
+    assert_eq!(
+        file_layouts(&completed),
+        [
+            "id body | summary keywords",
+            "id body | summary keywords",
+            "id body | summary keywords",
+            "id body | summary keywords",
+        ]
+    );
+    for flag_id in [summary, keywords] {
         assert_eq!(
-            column_values(&head, column, None).await,
-            expected,
-            "{column}"
+            completed.cell_flag_true_rows(flag_id).unwrap(),
+            full(&[0, 1, 2, 3])
         );
     }
+    let every_other_id: Vec<i32> = (1..=12).filter(|id| *id != 6).collect();
+    let (new_summary, new_keywords) = (
+        computed("summary", Some("new")),
+        computed("keywords", Some("new")),
+    );
+    assert_eq!(
+        column_values(&completed, "summary", None).await,
+        shown("summary", &every_other_id, &[(6, Some(&new_summary))])
+    );
+    assert_eq!(
+        column_values(&completed, "keywords", None).await,
+        shown(
+            "keywords",
+            &every_other_id,
+            &[(1, None), (6, Some(&new_keywords)), (7, Some("newer"))]
+        )
+    );
 }
 
 /// A computed batch, or stream item, that breaks the stager's contract.
@@ -7148,35 +7474,18 @@ async fn test_stager_follow_up_reuses_the_rows_of_every_deferred_group() {
     assert_visible_values_follow_inputs(&completed, "summary").await;
 }
 
-/// Summary and translation are added as all-NULL, metadata-only columns. A
-/// refresh stages both on fragment 0 while a newer summary-only result of
-/// id 2 stores summary alone there, which defers the refresh whole. No one
-/// file can now replace both outputs on fragment 0, so the plan of both
-/// cannot stage. A stager of summary alone plans its reusable row, since the
-/// report only defers translation's rows, and a refresh of pending
-/// translations completes the fragment.
+/// Summary and translation, computed from it, are added as all-NULL,
+/// metadata-only columns. A refresh stages both on fragment 0 while a newer
+/// summary-only result of id 2 stores summary alone there, which defers the
+/// refresh whole. The follow-up plan of both reuses id 1's summary and
+/// recomputes both translations from the summary each row then holds. One
+/// file replaces the stored summary and supplies translation, and completes
+/// the fragment.
 #[tokio::test]
-async fn test_stager_follow_up_plans_stored_outputs_over_a_mixed_layout() {
+async fn test_stager_follow_up_restages_a_chain_over_a_mixed_layout() {
     let mut read = computed_outputs(2, &[]).await;
-    let columns = ArrowSchema::new(vec![
-        ArrowField::new("summary", DataType::Utf8, true),
-        ArrowField::new("translation", DataType::Utf8, true),
-    ]);
-    read.add_columns(NewColumnTransform::AllNulls(Arc::new(columns)), None, None)
-        .await
-        .unwrap();
-    for (output, input) in CHAIN {
-        read.register_cell_flag(
-            output,
-            "ready",
-            CellFlagOptions::default()
-                .with_clear_on_write([input])
-                .with_mask_when_false(true),
-        )
-        .await
-        .unwrap();
-    }
-    let (summary, translation) = (flag_of(&read, "summary"), flag_of(&read, "translation"));
+    let summary = add_output(&mut read, "summary", "body").await;
+    let translation = add_output(&mut read, "translation", "summary").await;
     let outputs = ["summary", "translation"];
     let fragment_0 = [addr(0, 0), addr(0, 1)];
     let older = stage_batches(
@@ -7200,23 +7509,9 @@ async fn test_stager_follow_up_plans_stored_outputs_over_a_mixed_layout() {
     assert_eq!(report.checked_version, newer.version().version);
     assert_eq!(report.reusable_rows(summary), rows(&[(0, &[0])]));
     assert!(report.reusable_rows(translation).is_empty());
+    assert_eq!(file_layouts(&newer), ["id body | summary", "id body"]);
 
-    let error = stage_batches(
-        &stager_of(&newer, &outputs),
-        vec![computed_batch(&newer, &[addr(0, 0)], &[("summary", &[addr(0, 0)])]).await],
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("outputs [summary, translation] cannot be replaced together on fragment 0"),
-        "{error}"
-    );
-    let plan = stager_of(&newer, &["summary"])
-        .follow_up(report)
-        .await
-        .unwrap();
+    let plan = stager_of(&newer, &outputs).follow_up(report).await.unwrap();
     assert_eq!(
         plan.rows("summary"),
         Some(&FollowUpRows {
@@ -7224,13 +7519,35 @@ async fn test_stager_follow_up_plans_stored_outputs_over_a_mixed_layout() {
             recompute: RowAddrTreeMap::new(),
         })
     );
-    assert_eq!(plan.rows("translation"), None);
-
-    let reused = publish_computed(&newer, &["summary"], &[addr(0, 0)]).await;
-    let mut pending = pending_addrs(&reused, "translation").await;
-    pending.retain(|addr| RowAddress::from(*addr).fragment_id() == 0);
-    assert_eq!(pending, fragment_0);
-    let completed = publish_computed(&reused, &["translation"], &pending).await;
+    assert_eq!(
+        plan.rows("translation"),
+        Some(&FollowUpRows {
+            reuse: RowAddrTreeMap::new(),
+            recompute: rows(&[(0, &[0, 1])]),
+        })
+    );
+    let follow_up = stage_batches(
+        &stager_of(&newer, &outputs),
+        vec![
+            computed_batch(
+                &newer,
+                &fragment_0,
+                &[("summary", &[addr(0, 0)]), ("translation", &fragment_0)],
+            )
+            .await,
+        ],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let completed = commit_staged(&newer, follow_up, Reject)
+        .await
+        .unwrap()
+        .dataset;
+    assert_eq!(
+        file_layouts(&completed),
+        ["id body | summary translation", "id body"]
+    );
     for flag_id in [summary, translation] {
         assert_eq!(completed.cell_flag_true_rows(flag_id).unwrap(), full(&[0]));
     }

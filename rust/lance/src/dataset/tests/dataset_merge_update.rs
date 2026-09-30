@@ -987,8 +987,11 @@ async fn test_datafile_partial_replacement() {
     );
 }
 
+/// A file answering for the stored `a` and the all-NULL `b` added since
+/// tombstones `a` where it lives, which drops that file, and supplies `b`.
+/// This layout was refused before.
 #[tokio::test]
-async fn test_datafile_replacement_error() {
+async fn test_datafile_replacement_of_stored_and_unstored_fields() {
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
         "a",
         DataType::Int32,
@@ -1034,25 +1037,39 @@ async fn test_datafile_replacement_error() {
     .await
     .unwrap();
 
-    // find the datafile we want to replace
+    let object_writer = dataset
+        .object_store
+        .create(&Path::from("data/test.lance"))
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_2::create_writer(
+        object_writer,
+        extended_schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        extended_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![4, 5, 6])),
+            Arc::new(Int32Array::from(vec![7, 8, 9])),
+        ],
+    )
+    .unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    writer.finish().await.unwrap();
+
     let new_data_file = DataFile {
         path: "test.lance".to_string(),
-        // the second column in the dataset
-        fields: Arc::from([1]),
-        // is located in the first column of this datafile
-        column_indices: Arc::from([0]),
+        fields: Arc::from([0, 1]),
+        column_indices: Arc::from([0, 1]),
         file_major_version: 2,
-        file_minor_version: 0,
+        file_minor_version: 2,
         file_size_bytes: CachedFileSize::unknown(),
         base_id: None,
     };
 
-    let new_data_file = DataFile {
-        fields: Arc::from([0, 1]),
-        ..new_data_file
-    };
-
-    let err = Dataset::commit(
+    let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset.clone())),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
@@ -1065,13 +1082,16 @@ async fn test_datafile_replacement_error() {
         false,
     )
     .await
-    .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("Expected to modify the fragment but no changes were made"),
-        "Expected Error::DataFileReplacementError, got {:?}",
-        err
-    );
+    .unwrap();
+    dataset.validate().await.unwrap();
+
+    let files = &dataset.get_fragments()[0].metadata.files;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "test.lance");
+    assert_eq!(files[0].fields.as_ref(), &[0, 1]);
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch["a"].as_primitive::<Int32Type>().values(), &[4, 5, 6]);
+    assert_eq!(batch["b"].as_primitive::<Int32Type>().values(), &[7, 8, 9]);
 }
 
 #[tokio::test]

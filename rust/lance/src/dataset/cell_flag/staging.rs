@@ -414,11 +414,11 @@ impl PublicationStager {
     /// assigns a row deleted at the snapshot, a row past its fragment's
     /// physical rows, or NULL to a non-nullable output, or assigns on one row
     /// an output and one it depends on but not a declared output between them,
-    /// whose clear the commit would carry on to the downstream output; and when some outputs
-    /// are stored in a fragment's data files and others are not, which one
-    /// replacement file cannot express. On any error, including one from
-    /// `computed`, every file the call staged is deleted, on a best-effort
-    /// basis: a file whose delete fails is logged and left behind.
+    /// whose clear the commit would carry on to the downstream output; and when
+    /// a legacy (v1) data file of a staged fragment stores an output. On any
+    /// error, including one from `computed`, every file the call staged is
+    /// deleted, on a best-effort basis: a file whose delete fails is logged and
+    /// left behind.
     ///
     /// Nothing else deletes them. The files of a returned transaction that is
     /// dropped or fails to commit (as under
@@ -430,11 +430,9 @@ impl PublicationStager {
     /// once they are 7 days old, unless `delete_unverified` is set, which is
     /// safe only while no other write is in progress.
     ///
-    /// An output added as an all-NULL (metadata-only) column is not stored on
-    /// the fragments where another output was already published. Publishing
-    /// it there takes an extra, separate commit of it alone first; only then
-    /// can the two refresh together, so on such fragments their first
-    /// publication is not atomic.
+    /// The outputs need not be stored alike: an output added as an all-NULL
+    /// (metadata-only) column publishes in the same file, and the same
+    /// commit, as outputs a fragment already stores.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -521,9 +519,8 @@ impl PublicationStager {
     /// Fails with `InvalidInput` when this stager reads another version, or
     /// when the report certifies rows to reuse for a flag whose output it
     /// does not stage. The rows it only defers for such a flag are left to a
-    /// refresh of that output's pending rows. So where the outputs cannot
-    /// stage together, as on a fragment that stores only some of them, a
-    /// stager of the stored ones can plan the report.
+    /// refresh of that output's pending rows, so a stager of fewer outputs can
+    /// still plan the report.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -692,67 +689,28 @@ impl PublicationStager {
         ))
     }
 
-    // TODO: the smallest extension that lifts the mixed-layout refusal is in
-    // the manifest build's DataReplacement: where the new file covers V2
-    // files only partially, tombstone the covered fields in the existing files
-    // and append the new file, as its fully covered path already does.
-    /// Refuse the layouts the manifest build cannot replace in one file: it
-    /// swaps or tombstones the outputs where every one is stored, or appends
-    /// the file where none is, and fails otherwise.
+    /// Refuse the one layout the manifest build cannot replace in one file:
+    /// it swaps, tombstones or supplies the outputs wherever they are stored,
+    /// but tombstones fields in V2 files only.
     fn check_layout(&self, fragment: &Fragment) -> Result<()> {
-        let schema = self.snapshot.schema();
         let replaced = self.output_field_ids.as_ref();
-        let mut covered = HashSet::new();
-        for file in &fragment.files {
-            covered.extend(file.schema(schema).field_ids());
-            covered.extend(file.fields.iter().copied());
-        }
-        if covered.is_disjoint(replaced) {
+        if fragment.files.iter().all(|file| {
+            file.file_version()
+                .is_ok_and(|version| version != ConcreteFileVersion::V1)
+                || file.fields.iter().all(|field| !replaced.contains(field))
+        }) {
             return Ok(());
         }
-        let names = |outputs: &[&Output]| {
-            outputs
-                .iter()
-                .map(|output| output.field.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let all: Vec<&Output> = self.outputs.iter().collect();
-        if replaced.is_subset(&covered) {
-            // The build tombstones fields in V2 files only.
-            if fragment.files.iter().all(|file| {
-                file.file_version()
-                    .is_ok_and(|version| version != ConcreteFileVersion::V1)
-                    || file.fields.iter().all(|field| !replaced.contains(field))
-            }) {
-                return Ok(());
-            }
-            return Err(Error::invalid_input(format!(
-                "outputs [{}] cannot be replaced on fragment {}: a legacy (v1) data file stores \
-                 them",
-                names(&all),
-                fragment.id
-            )));
-        }
-        let (stored, unstored): (Vec<&Output>, Vec<&Output>) =
-            all.iter().copied().partition(|output| {
-                Schema {
-                    fields: vec![output.field.clone()],
-                    metadata: Default::default(),
-                }
-                .field_ids()
-                .iter()
-                .all(|id| covered.contains(id))
-            });
+        let names: Vec<&str> = self
+            .outputs
+            .iter()
+            .map(|output| output.field.name.as_str())
+            .collect();
         Err(Error::invalid_input(format!(
-            "outputs [{}] cannot be replaced together on fragment {}: [{}] are stored in its \
-             data files but [{}] are not, so one commit cannot publish them together there; \
-             publish [{}] on its own first, then stage them together",
-            names(&all),
-            fragment.id,
-            names(&stored),
-            names(&unstored),
-            names(&unstored)
+            "outputs [{}] cannot be replaced on fragment {}: a legacy (v1) data file stores \
+             one of them",
+            names.join(", "),
+            fragment.id
         )))
     }
 

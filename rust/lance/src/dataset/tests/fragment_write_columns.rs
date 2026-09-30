@@ -22,6 +22,7 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_core::{Error, ROW_ADDR, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_encoding::constants::PACKED_STRUCT_META_KEY;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use rstest::rstest;
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
@@ -897,6 +898,120 @@ async fn test_existing_paths_unchanged() {
         files_after_first,
         "exact-match replacement swaps in place rather than appending"
     );
+}
+
+/// One file recomputes the stored `v` and populates `w`, added as all-NULL
+/// since. `v` is tombstoned where it lives: its own file is dropped, and a
+/// compacted file holding `id` too survives on `id`. The other fragment and
+/// its row lineage are untouched.
+#[rstest]
+#[tokio::test]
+async fn test_replaces_stored_and_all_null_columns_together(
+    #[values(false, true)] is_compacted: bool,
+) {
+    let mut dataset = id_dataset_of(4, 2).await;
+    declare_all_null(&mut dataset, "v").await;
+    let mut backfill = Vec::new();
+    for (index, fragment) in dataset.get_fragments().iter().enumerate() {
+        let base = index as i32 * 20;
+        backfill.push(
+            stage_column(
+                &dataset,
+                fragment.id() as u64,
+                "v",
+                vec![base + 10, base + 20],
+            )
+            .await,
+        );
+    }
+    let mut dataset = commit(&dataset, backfill).await.unwrap();
+    if is_compacted {
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+    }
+    declare_all_null(&mut dataset, "w").await;
+    let (v_id, w_id) = (
+        dataset.schema().field("v").unwrap().id,
+        dataset.schema().field("w").unwrap().id,
+    );
+
+    let fragment = dataset.get_fragments()[0].clone();
+    let rows = fragment.physical_rows().await.unwrap() as i32;
+    let schema = LanceSchema {
+        fields: ["v", "w"]
+            .map(|name| dataset.schema().field(name).unwrap().clone())
+            .to_vec(),
+        metadata: Default::default(),
+    };
+    let batch = batch_of(
+        vec![
+            ArrowField::new("v", DataType::Int32, true),
+            ArrowField::new("w", DataType::Int32, true),
+        ],
+        vec![
+            ints((0..rows).map(|row| 100 + row).collect()),
+            ints((0..rows).map(|row| 200 + row).collect()),
+        ],
+    );
+    let group = fragment
+        .write_columns(stream::iter([Ok(batch)]), &schema)
+        .await
+        .unwrap();
+    let before = dataset.get_fragments()[1..]
+        .iter()
+        .map(|fragment| fragment.metadata().clone())
+        .collect::<Vec<_>>();
+    let dataset = commit(&dataset, vec![group]).await.unwrap();
+    dataset.validate().await.unwrap();
+
+    let id = dataset.schema().field("id").unwrap().id;
+    let layout: Vec<Vec<i32>> = dataset.get_fragments()[0]
+        .metadata()
+        .files
+        .iter()
+        .map(|file| file.fields.to_vec())
+        .collect();
+    let expected_layout = if is_compacted {
+        vec![vec![id, TOMBSTONE_FIELD_ID], vec![v_id, w_id]]
+    } else {
+        vec![vec![id], vec![v_id, w_id]]
+    };
+    assert_eq!(layout, expected_layout);
+    let after = dataset.get_fragments()[1..]
+        .iter()
+        .map(|fragment| fragment.metadata().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(after, before, "only the replaced fragment changes");
+
+    let batch = dataset
+        .scan()
+        .project(&["id", "v", "w", ROW_LAST_UPDATED_AT_VERSION])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(values(&batch, "id"), (1..=4).map(Some).collect::<Vec<_>>());
+    let (expected_v, expected_w): (Vec<Option<i32>>, Vec<Option<i32>>) = (0..4)
+        .map(|row| {
+            if row < rows {
+                (Some(100 + row), Some(200 + row))
+            } else {
+                (Some(10 * (row + 1)), None)
+            }
+        })
+        .unzip();
+    assert_eq!(values(&batch, "v"), expected_v);
+    assert_eq!(values(&batch, "w"), expected_w);
+    let version = dataset.version().version;
+    let updated_at = batch[ROW_LAST_UPDATED_AT_VERSION].as_primitive::<UInt64Type>();
+    for row in 0..4 {
+        assert_eq!(
+            updated_at.value(row as usize) == version,
+            row < rows,
+            "row {row} lineage"
+        );
+    }
 }
 
 /// Dropping a sibling that shares the wider file must not leave that file
