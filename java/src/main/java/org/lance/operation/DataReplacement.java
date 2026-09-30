@@ -21,15 +21,28 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Replace data in a column in the dataset with new data. This is used for null column population
- * where we replace an entirely null column with a new column that has data.
+ * Replace the values of some columns of existing fragments with new data files, one per fragment,
+ * each holding every physical row of its fragment. Every new file must write the same fields. This
+ * populates an all-NULL column or recomputes a stored one without rewriting the fragment's other
+ * columns.
  *
- * <p>This operation will only allow replacing files that contain the same schema e.g. if the
- * original files contain columns A, B, C and the new files contain only columns A, B then the
- * operation is not allowed.
+ * <p>For each fragment, the new file:
  *
- * <p>Corollary to the above: the operation will also not allow replacing files unless the affected
- * columns all have the same datafile layout across the fragments being replaced.
+ * <ul>
+ *   <li>swaps in place for an existing file that writes exactly the same fields in the same file
+ *       version;
+ *   <li>is appended when the fragment's files cover none of its fields, as for a column added as
+ *       all-NULL;
+ *   <li>otherwise is appended after the fields it writes are tombstoned in the existing files that
+ *       cover them. A file left with no live field is dropped. The fields may span several files,
+ *       and fields no file covers yet need no tombstone, so one file can recompute a stored column
+ *       and populate an all-NULL one: {@code frag: [A, B]} replaced with {@code [B, C]}, where
+ *       {@code C} was added as all-NULL, becomes {@code frag: [A, -2] [B, C]}.
+ * </ul>
+ *
+ * <p>Tombstoning a field of a legacy (v1) data file would misread its other fields, so a
+ * replacement that needs one is refused. Indices on a replaced field no longer cover the replaced
+ * fragments.
  */
 public class DataReplacement implements Operation {
   private final List<DataReplacementGroup> replacements;

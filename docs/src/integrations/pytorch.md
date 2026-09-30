@@ -111,5 +111,10 @@ Available samplers:
 (a `FixedSizeList` or `FixedShapeTensor` value) becomes a row of NaN, whatever
 values are stored under it. Integers have no NaN, so an integer column or vector
 that holds a NULL becomes `float64`, and its dtype then depends on whether the
-batch holds a NULL. Pass `filter="vec IS NOT NULL"` to skip NULL vectors, or a
-`to_tensor_fn` to choose another representation.
+batch holds a NULL. `float64` holds integers exactly only up to 2^53, so larger
+`int64` and `uint64` values in such a batch lose precision.
+
+To skip NULL vectors, pass `filter="vec IS NOT NULL"`. Sampled reads
+(`samples=`) do not support this filter, so drop the NaN rows after conversion
+instead. Pass a `to_tensor_fn` to choose another representation, for example to
+keep exact 64-bit integers.

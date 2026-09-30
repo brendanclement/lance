@@ -206,9 +206,9 @@ impl CellFlagMasks {
                         let column = &columns[index];
                         if matches!(column.data_type(), DataType::FixedSizeList(..)) {
                             // `nullif` would keep the stored vector under the
-                            // NULL slot, and vector readers such as
-                            // `lance.torch` read the child values as a dense
-                            // matrix without the list's validity.
+                            // NULL slot, and a reader that reshapes the child
+                            // values into a dense matrix ignores the list's
+                            // validity.
                             let null = Scalar::new(new_null_array(column.data_type(), 1));
                             zip(&is_masked, &null, column)?
                         } else {

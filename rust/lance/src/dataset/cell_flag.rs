@@ -132,8 +132,8 @@ pub struct CellFlagOptions {
     /// be indexed, by a vector index either, so nearest-neighbor search over a
     /// masked vector is a flat search that skips masked rows, and `fast_search`
     /// finds nothing. A masked vector's child values read as NULL too, so a
-    /// reader that takes the list's values without its validity, as
-    /// `lance.torch` does, never sees the stored vector. MemWAL rows carry no
+    /// reader that takes the list's values without its validity, such as a
+    /// reshape of `values`, never sees the stored vector. MemWAL rows carry no
     /// flag state to mask them with, so a masking flag cannot be registered
     /// while MemWAL is initialized, MemWAL cannot be initialized or written
     /// while one is registered, and LSM reads over a version that has one

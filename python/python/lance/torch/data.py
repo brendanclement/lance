@@ -104,7 +104,8 @@ def _fsl_to_tensor(arr: pa.FixedSizeListArray, dimension: int) -> torch.Tensor:
     A NULL list becomes a row of NaN, whatever values are stored under its
     slot, just as a NULL item becomes NaN. Integer lists become float64 when
     the array holds a NULL list or item, following pyarrow's conversion of
-    integer arrays with NULLs. An array without NULLs is not copied.
+    integer arrays with NULLs, so values beyond 2**53 lose precision. An array
+    without NULLs is not copied.
     """
     # FixedSizeListArray.values ignores the array's offset and length.
     values = arr.values.slice(arr.offset * dimension, len(arr) * dimension)
@@ -130,7 +131,8 @@ def _to_tensor(
     """Convert a pyarrow RecordBatch to torch Tensor.
 
     NULL numeric values become NaN, and a NULL vector becomes a row of NaN. An
-    integer column or vector that holds a NULL becomes float64.
+    integer column or vector that holds a NULL becomes float64, so values
+    beyond 2**53 lose precision.
     """
     ret = {}
 
@@ -332,7 +334,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
             argument, plus optional keyword arguments ``hf_converter`` and
             ``use_blob_api``. The default converts NULL numeric values to NaN
             and a NULL vector to a row of NaN; an integer column or vector that
-            holds a NULL becomes float64.
+            holds a NULL becomes float64, so values beyond 2**53 lose precision.
         auto_detect_rank: bool = True, optional
             If set true, the rank and world_size will be detected automatically.
         """

@@ -222,8 +222,7 @@ What the numbers show:
 
 **Decision input.**
 - The guarantee that no raw reader of the child values sees a stored vector is worth keeping:
-  `lance.torch`'s own `kmeans.py`, `.values` reshapes and Arrow C Data consumers read the values
-  buffer directly.
+  `.values` reshapes and Arrow C Data consumers can read the values buffer directly.
 - But `zip` is the wrong way to provide it. A replacement that overwrites only the masked slots'
   values (in place when the buffer is uniquely owned, otherwise one copy of the values buffer) and
   sets their child validity would cost about one copy of the batch at most. That is an estimate,

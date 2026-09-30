@@ -352,8 +352,9 @@ scan.nearest("embedding", &query, 10)?.project(&["id"])?;
   postfilters, `distance_range`, batch queries and restricted fragments. `fast_search` returns
   nothing, as it does for any unindexed column.
 - *Stored values.* The child values under a masked slot read as NULL too. Readers that take a
-  fixed-size list's values as a dense matrix without its validity, such as `lance.torch`,
-  therefore never see a stored vector.
+  fixed-size list's values as a dense matrix without its validity, such as a reshape of
+  `FixedSizeListArray.values`, therefore never see a stored vector. `lance.torch` maps a NULL
+  vector to a NaN row itself.
 - *Indexes.* Every vector index is refused on a masked embedding: at build (IVF_FLAT, IVF_HNSW_SQ,
   prebuilt segments) and at commit. Masking an indexed embedding is refused too.
 

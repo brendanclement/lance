@@ -6,6 +6,7 @@ from itertools import chain
 from pathlib import Path
 
 import lance
+import lance.arrow
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -486,11 +487,15 @@ def _assert_rows(tensor: torch.Tensor, expected: torch.Tensor):
 )
 def test_null_float_vectors_become_nan_rows(dtype, null_items, start, length):
     arr = _vectors(dtype, NULL_ROWS, _items_of(NULL_ROWS) if null_items else ())
+    stored = arr.values.to_pylist()
 
     tensor = _to_tensor(pa.record_batch({"vec": arr.slice(start, length)}))
 
     assert tensor.dtype == TORCH_DTYPES[dtype]
     _assert_rows(tensor, _expected(start, length, NULL_ROWS))
+    # The NaN rows must not be written into the Arrow buffer the tensor may
+    # have been viewing; `arr.to_pylist()` would hide that under the NULLs.
+    assert arr.values.to_pylist() == stored
 
 
 @pytest.mark.parametrize("dtype", ["uint8", "int32", "int64"])

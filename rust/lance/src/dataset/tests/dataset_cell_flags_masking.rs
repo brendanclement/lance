@@ -1657,8 +1657,8 @@ fn id_embeddings(batch: &RecordBatch) -> Vec<(i32, Option<Vec<f32>>)> {
 }
 
 /// The child values under the list slot of each of `ids` in `batch`, which a
-/// reader of the list's values, such as `lance.torch`, takes whatever the
-/// slot's validity.
+/// reader of the list's values, such as a reshape of `values`, takes whatever
+/// the slot's validity.
 fn embedding_children(batch: &RecordBatch, ids: &[i32]) -> Vec<(i32, Vec<Option<f32>>)> {
     let rows: HashMap<i32, usize> = batch["id"]
         .as_primitive::<Int32Type>()

@@ -8342,10 +8342,9 @@ mod tests {
         /// Fragments can carry the same column in different data-file layouts:
         /// one whose `tag` still lives in the file it was written with, another
         /// whose `tag` has already been moved to a patch file by an earlier
-        /// merge. `Operation::DataReplacement` refuses that case outright, so
-        /// this asserts `RewriteColumns` does not inherit the restriction — it
-        /// appends a new data file per fragment rather than swapping one in, so
-        /// each fragment's existing layout is irrelevant.
+        /// merge. This asserts `RewriteColumns` handles both: it appends a new
+        /// data file per fragment rather than swapping one in, so each
+        /// fragment's existing layout is irrelevant.
         #[tokio::test]
         async fn test_merge_insert_subcols_in_place_heterogeneous_layouts() {
             let schema = Arc::new(Schema::new(vec![
