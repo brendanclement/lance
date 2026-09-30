@@ -1,12 +1,13 @@
-# Vector masking read cost (prepared, not measured)
+# Vector masking read cost
 
-**Status: prepared only. The timed rotation has not run.** This directory has the benchmark's
-setup, the patch for the second build, and the command for the timed rotation. The only runs so
-far are a pipeline smoke run at 50,000 rows and a two-sample calibration run. Neither is a
-measurement (see Smoke run).
+**Status: measured once, on one laptop.** The timed rotation `rotation12-zip-nullif/` ran on
+2026-09-30. It had 12 rounds and 20 samples per workload, with the builds `zip`, `nullif` and
+`zip-copy`, an identical-binary control. See Results.
 
-The measurements are meant to inform one decision: whether masked vector slots keep their NULL
-child values. They are not a performance acceptance test and do not represent production.
+The measurements inform one decision: whether masked vector slots keep their NULL child values.
+They are not a performance acceptance test and do not represent production. The rotation used
+one Apple M5 Pro laptop running macOS, a `release-with-debug` build (thin LTO, 16 codegen units),
+a local SSD with a warm page cache, and flat search only.
 
 ## Questions
 
@@ -164,6 +165,69 @@ into a directory here, but not `bins/`.
 | Copy cost | `allocated_bytes` and `allocations` of those workloads |
 | Masking against equal visible data | the `--pair` ratios within `zip` (and within `nullif`, for what masking would cost without child-nulling) |
 | Cost of a registered, fully published flag | `ready` against `plain` |
+
+## Results
+
+Source: `rotation12-zip-nullif/`, with `analysis.md` produced by the analyzer command above.
+- **Builds:** `zip` (sha256 `1716f294c457…`) and `nullif` (`335bc13c18fd…`), both at `f8cc8a0a8`;
+  `nullif` also has `patches/nullif-fixed-size-list.patch`. `zip-copy` runs `zip`'s executable.
+  `run.json` records the rest.
+- **Load:** the 1-minute load average was 3.6–16.9 before each run. The first rounds ran while it
+  fell from an earlier build.
+- **Table:** unchanged across the rotation (`dataset_before == dataset_after`).
+- **Figures:** medians over every sample. Ratios are geometric means of per-round medians, with
+  bootstrap 95% intervals.
+
+| Workload | `zip` ms | `nullif` ms | `nullif` / `zip` | `zip` MiB allocated | `nullif` MiB |
+|---|---|---|---|---|---|
+| `scan_partial_1pct` | 235.94 | 13.03 | 0.055 [0.055, 0.056] | 2429.8 | 986.1 |
+| `scan_partial_50pct` | 136.87 | 13.54 | 0.099 [0.098, 0.100] | 2100.4 | 986.1 |
+| `nearest_partial_1pct` | 256.00 | 226.49 | 0.887 [0.875, 0.899] | 2955.4 | 1511.6 |
+| `nearest_partial_50pct` | 163.41 | 121.44 | 0.747 [0.738, 0.757] | 2376.7 | 1262.4 |
+| `take_partial_1pct` | 7.76 | 7.80 | 1.008 [0.971, 1.045] | 5.8 | 5.0 |
+| `take_partial_50pct` | 7.75 | 7.86 | 1.013 [0.973, 1.054] | 6.4 | 5.0 |
+
+**Noise floor.**
+- `zip-copy` against `zip` is 0.990–1.002 on every workload.
+- The 18 workloads the patch cannot reach are 0.993–1.014, except `scan_null_1pct` at 0.960.
+
+**Masking against equal visible data**, medians in ms with `zip`:
+
+| Reads | Flagged table | Table without flags |
+|---|---|---|
+| all visible | `ready`: scan 12.97, nearest 15.99, take 7.52 | `plain`: 13.05, 16.05, 7.44 |
+| 1% hidden | `partial_1pct`: scan 235.94 (13.03 under `nullif`), nearest 256.00 | `null_1pct`: 30.16, 239.36 |
+| 50% hidden | `partial_50pct`: scan 136.87 (13.54), nearest 163.41 | `null_50pct`: 27.19, 133.10 |
+| none visible | `masked`: scan 14.74, nearest 18.81 | `null_all`: 4.16, 7.84 |
+
+What the numbers show:
+- **Child-nulling is the whole cost of a partly masked scan.**
+  - `arrow_select::zip` against a NULL scalar takes 10–18× the time of `nullif` and allocates
+    about 2.5× the bytes.
+  - With `nullif`, a partly masked scan (13.0 ms) costs no more than an all-visible one (13.0 ms).
+    It is also cheaper than the table storing the same rows as NULL vectors (30.2 ms), whose
+    decoder builds validity for the stored NULLs.
+- **A registered, fully published flag costs nothing measurable.** `ready` matches `plain` in
+  every read.
+- **Flat search with any NULL vector in the column is slow in this build, flags or not.**
+  - `nearest_null_1pct` (no flags) takes 239 ms against 16 ms for `nearest_plain`, and keeps
+    about 1.6 cores busy against about 10.
+  - Masking inherits this, which is why `nullif` saves less on search than on scans.
+  - It does not come from masking. It is a separate issue in the flat KNN path on `main`, worth
+    its own investigation.
+- **A fully masked fragment still decodes the stored vectors before replacing them.** `scan_masked`
+  takes 14.7 ms, while all-NULL pages take 4.2 ms. Skipping the decode of a fully masked column
+  would recover that.
+- **Takes are unaffected.** 1,000 rows cost the same everywhere.
+
+**Decision input.**
+- The guarantee that no raw reader of the child values sees a stored vector is worth keeping:
+  `lance.torch`'s own `kmeans.py`, `.values` reshapes and Arrow C Data consumers read the values
+  buffer directly.
+- But `zip` is the wrong way to provide it. A replacement that overwrites only the masked slots'
+  values (in place when the buffer is uniquely owned, otherwise one copy of the values buffer) and
+  sets their child validity would cost about one copy of the batch at most. That is an estimate,
+  not measured here.
 
 ## Smoke run
 

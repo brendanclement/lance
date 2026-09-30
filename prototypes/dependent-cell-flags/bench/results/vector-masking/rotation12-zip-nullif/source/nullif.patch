@@ -1,0 +1,13 @@
+diff --git a/rust/lance/src/dataset/fragment/cell_flag_mask.rs b/rust/lance/src/dataset/fragment/cell_flag_mask.rs
+index 999addc41..d4fa33d5f 100644
+--- a/rust/lance/src/dataset/fragment/cell_flag_mask.rs
++++ b/rust/lance/src/dataset/fragment/cell_flag_mask.rs
+@@ -204,7 +204,7 @@ impl CellFlagMasks {
+                         }
+                         let is_masked = BooleanArray::new(is_masked, None);
+                         let column = &columns[index];
+-                        if matches!(column.data_type(), DataType::FixedSizeList(..)) {
++                        if false && matches!(column.data_type(), DataType::FixedSizeList(..)) {
+                             // `nullif` would keep the stored vector under the
+                             // NULL slot, and vector readers such as
+                             // `lance.torch` read the child values as a dense
