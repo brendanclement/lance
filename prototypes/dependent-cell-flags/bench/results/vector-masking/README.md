@@ -5,6 +5,8 @@
 `zip-copy`, an identical-binary control. See Results.
 
 The measurements inform one decision: whether masked vector slots keep their NULL child values.
+**Outcome:** they do not. `b56278dc8` removed child-nulling after this rotation, so the `nullif`
+build is the implementation now and the guarantee covers only readers that respect list validity.
 They are not a performance acceptance test and do not represent production. The rotation used
 one Apple M5 Pro laptop running macOS, a `release-with-debug` build (thin LTO, 16 codegen units),
 a local SSD with a warm page cache, and flat search only.
@@ -77,8 +79,9 @@ record) is `3c9e9a1c1577bcf8521622ffc68306bd86a21761784be2d74bbcaa1565f05f2f`.
 Both checkouts are git worktrees outside any other checkout. Each has its own `target/` and was
 built with `cargo bench -p lance --bench cell_flags_vector_masking --profile release-with-debug
 --no-run`. The patch changes one condition so that `FixedSizeList` falls through to `nullif`, and
-the compiler drops the `zip` branch. `nullif` is a measurement variant only: it exposes stored
-vectors under masked slots to readers of the child values.
+the compiler drops the `zip` branch. `nullif` was a measurement variant when this ran, and
+`b56278dc8` later made it the implementation. It exposes stored vectors under masked slots to
+readers of the child values.
 
 The patch reaches only partly masked batches. Those occur in the `partial_1pct` and
 `partial_50pct` workloads (scan, nearest, take). The other 18 workloads never run the changed
@@ -227,6 +230,8 @@ What the numbers show:
   values (in place when the buffer is uniquely owned, otherwise one copy of the values buffer) and
   sets their child validity would cost about one copy of the batch at most. That is an estimate,
   not measured here.
+- After this rotation the guarantee was narrowed to validity-aware readers instead, and
+  `b56278dc8` removed child-nulling.
 
 ## Smoke run
 

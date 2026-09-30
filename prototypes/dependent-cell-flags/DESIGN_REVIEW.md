@@ -6,7 +6,7 @@
 
 - **Branch:** `brendan/dependency-aware-cell-flags`.
 - **Baseline:** `e3671b2f5`.
-- **Final code:** `19bb42a65` (the last commit that changes code).
+- **Final code:** `b56278dc8` (the last commit that changes code).
 - **Research record** (kept separately):
   - [`README.md`](README.md): the detailed log of every decision, check and departure;
   - [`bench/REPORT.md`](bench/REPORT.md) and `bench/results/`: every benchmark run with raw
@@ -96,7 +96,8 @@ input change are tracked as different things.
 - SQL and flat full-text search;
 - unindexed vector search.
 
-A masked vector's child values read as NULL too.
+Masking nulls a vector's list slot only: the stored vector, stale or never published, can remain
+in the child array under it (`b56278dc8`).
 
 **Torch consumers.** `lance.torch` maps a NULL vector (masked, computed NULL, or ordinary) to a NaN
 row whatever values sit under its slot. Integer vectors in a batch holding a NULL become float64
@@ -135,8 +136,9 @@ with NaN rows. Arrays without NULLs stay zero-copy.
 - **Hand-built publications** (without the stager) must copy every unassigned row unchanged.
 - **Staged files:** files of a publication that is dropped, rejected or partly deferred stay until
   `cleanup_old_versions` removes them, after 7 days by default. There is no lease.
-- **Vectors:** readers outside Lance should still respect the list validity. Child-nulling
-  protects raw readers today, but that protection's cost is an open decision.
+- **Vectors:** readers must respect the list validity. A reader that takes a fixed-size list's
+  values without it (a `.values` reshape, a user `to_tensor_fn`, an Arrow C Data consumer in
+  another engine) can see a masked slot's stored vector.
 
 ## Unsupported (explicit errors)
 
@@ -159,7 +161,15 @@ Float16/32/64.
 
 ## Tests actually run
 
-All on the final code, `19bb42a65`.
+**On the final code, `b56278dc8`** (macOS), after removing child-nulling:
+- `cargo fmt --all` and `cargo clippy -p lance --tests --benches -- -D warnings`: clean.
+- `cargo test -p lance --lib -- cell_flag`: 422 passed, 1 ignored (the fixture generator).
+- `python/python/tests/torch_tests/` and `test_torch.py`, against a `pylance` built from
+  `b56278dc8`: 90 passed, 3 skipped (CUDA). The torch fixture test now reads a stale vector under a
+  masked slot.
+
+Everything below ran on `19bb42a65`, which differs only in `mask_batch`, its rustdoc and the
+tests' child-value assertions.
 
 **macOS (Apple M5 Pro):**
 - `cargo fmt --all -- --check` and `cargo clippy --all --tests --benches -- -D warnings`: clean.
@@ -231,24 +241,19 @@ agreed threshold was available.
 - **Vector masking**, 1M × 128 Float32, 12-round rotation with an identical-binary control inside
   ±1.4%:
   - a published flag costs nothing measurable;
-  - child-nulling through `arrow_select::zip` makes a partly masked scan 10–18× slower than
+  - child-nulling through `arrow_select::zip` made a partly masked scan 10–18× slower than
     parent-only masking (236 ms against 13 ms at 1% masked), with about 2.5× the allocated bytes;
+    `b56278dc8` removed it;
   - takes are unaffected.
 - **Flat search with any NULL vector is slow, flags or not:** 239 ms against 16 ms, with about 1.6
   busy cores. This looks like a separate flat KNN issue on `main`.
 
 ## Decisions needed before production work
 
-1. **Vector child-nulling.**
-   - The guarantee that no raw reader sees a masked vector's stored values is worth keeping.
-     `lance.torch` now respects vector validity (`90c31aad8`, and `58e4a4dc1` for `KMeans`), but
-     `.values` reshapes, user `to_tensor_fn`s and Arrow C Data consumers in other engines still
-     read the values buffer directly.
-   - The `zip` implementation is too expensive.
-   - Recommendation: keep the guarantee, and replace `zip` with an in-place (or single-copy)
-     overwrite of the masked slots plus their child validity.
-   - The alternative is to narrow the guarantee to validity-aware readers and make it a caller
-     obligation. That needs the design review's explicit sign-off.
+1. **Vector child values (decided: validity only).** `b56278dc8` removed child-nulling, so
+   reading a masked vector correctly is a caller obligation (see above). `lance.torch` respects
+   vector validity (`90c31aad8`, and `58e4a4dc1` for `KMeans`). Confirm the contract, and whether
+   other consumers need it documented.
 2. **`DataReplacement` partial coverage.** This changes `main`'s rule for every caller: a file
    that writes a stored field next to an unstored one now tombstones and appends instead of
    failing.
