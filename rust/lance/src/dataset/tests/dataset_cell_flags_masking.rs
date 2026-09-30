@@ -2009,6 +2009,22 @@ async fn test_embedding_publication_through_the_stager() {
     assert_eq!(scan_id_embeddings(&result.dataset, None).await, published);
 }
 
+/// Writes [`masked_embeddings`] to the directory named by
+/// `LANCE_MASKED_EMBEDDINGS_FIXTURE`: the fixture through which the
+/// `lance.torch` tests read masked embeddings, since Python has no cell flag
+/// API. See `python/python/tests/torch_tests/fixtures/README.md`.
+#[tokio::test]
+#[ignore = "writes a fixture for the Python tests"]
+async fn write_masked_embeddings_fixture() {
+    let uri = std::env::var("LANCE_MASKED_EMBEDDINGS_FIXTURE")
+        .expect("LANCE_MASKED_EMBEDDINGS_FIXTURE names the directory to write");
+    let (dataset, _) = masked_embeddings_at(&uri, false).await;
+    assert_eq!(
+        scan_id_embeddings(&dataset, None).await,
+        visible_embeddings(&LIVE_IDS)
+    );
+}
+
 /// Vectors of every float width mask alike on every v2 storage version, whose
 /// encoders write the publication's nullable vectors. Every row is written
 /// with [`QUERY`]. The publication of fragments 0 and 1 computes a NULL for

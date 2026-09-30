@@ -9,6 +9,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.file import LanceFileReader
 from lance.sampler import ShardedBatchSampler, ShardedFragmentSampler
 
 torch = pytest.importorskip("torch")
@@ -16,6 +17,7 @@ from lance.torch.data import (  # noqa: E402
     LanceDataset,
     SafeLanceDataset,
     _bf16_to_tensor,
+    _to_tensor,
 )
 
 
@@ -417,6 +419,222 @@ def test_bf16_to_tensor_clones_when_nulls_present():
     assert tensor[0].to(torch.float32).item() == pytest.approx(1.0)
     assert torch.isnan(tensor[1])
     assert tensor[2].to(torch.float32).item() == pytest.approx(3.0)
+
+
+DIM = 3
+NUM_VECTORS = 6
+NULL_ROWS = [1, 4]
+
+TORCH_DTYPES = {
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "float64": torch.float64,
+    "bfloat16": torch.bfloat16,
+    "int32": torch.int32,
+}
+
+
+def _vectors(dtype: str, null_rows=(), null_items=()) -> pa.FixedSizeListArray:
+    """Six 3-d vectors of `dtype` whose items are 1 to 18 in order, NULL on
+    `null_rows` over whatever items sit under them, and with the items at the
+    positions `null_items` NULL."""
+    items = np.arange(1, NUM_VECTORS * DIM + 1)
+    item_nulls = np.isin(np.arange(len(items)), null_items)
+    if dtype == "bfloat16":
+        children = lance.arrow.bfloat16_array(
+            [None if null else float(item) for item, null in zip(items, item_nulls)]
+        )
+    else:
+        children = pa.array(items.astype(dtype), mask=item_nulls)
+    list_nulls = pa.array(np.isin(np.arange(NUM_VECTORS), null_rows))
+    return pa.FixedSizeListArray.from_arrays(children, DIM, mask=list_nulls)
+
+
+def _items_of(rows) -> list[int]:
+    return [row * DIM + i for row in rows for i in range(DIM)]
+
+
+def _expected(start: int, length: int, null_rows=(), null_items=()) -> torch.Tensor:
+    """Rows `start` to `start + length` of `_vectors` as float64, NaN where a
+    list or an item is NULL."""
+    items = np.arange(1, NUM_VECTORS * DIM + 1, dtype=np.float64)
+    items[list(null_items)] = np.nan
+    rows = items.reshape(NUM_VECTORS, DIM)
+    rows[list(null_rows)] = np.nan
+    return torch.from_numpy(rows[start : start + length])
+
+
+def _assert_rows(tensor: torch.Tensor, expected: torch.Tensor):
+    torch.testing.assert_close(
+        tensor.to(torch.float64), expected, rtol=0, atol=0, equal_nan=True
+    )
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32", "float64", "bfloat16"])
+@pytest.mark.parametrize(
+    "null_items", [False, True], ids=["over_stored_items", "over_null_items"]
+)
+@pytest.mark.parametrize(
+    ("start", "length"),
+    [
+        pytest.param(0, 6, id="whole"),
+        pytest.param(1, 5, id="from_a_null"),
+        pytest.param(2, 4, id="after_a_null"),
+        pytest.param(3, 3, id="unaligned"),
+        pytest.param(2, 2, id="between_nulls"),
+    ],
+)
+def test_null_float_vectors_become_nan_rows(dtype, null_items, start, length):
+    arr = _vectors(dtype, NULL_ROWS, _items_of(NULL_ROWS) if null_items else ())
+
+    tensor = _to_tensor(pa.record_batch({"vec": arr.slice(start, length)}))
+
+    assert tensor.dtype == TORCH_DTYPES[dtype]
+    _assert_rows(tensor, _expected(start, length, NULL_ROWS))
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "int32", "int64"])
+@pytest.mark.parametrize(
+    ("null_rows", "null_items"),
+    [
+        pytest.param(NULL_ROWS, [], id="lists_over_stored_items"),
+        pytest.param(NULL_ROWS, _items_of(NULL_ROWS), id="lists_over_null_items"),
+        pytest.param([], [4], id="items"),
+    ],
+)
+def test_null_integer_vectors_become_float64_nan_rows(dtype, null_rows, null_items):
+    arr = _vectors(dtype, null_rows, null_items).slice(1)
+
+    tensor = _to_tensor(pa.record_batch({"vec": arr}))
+
+    assert tensor.dtype == torch.float64
+    _assert_rows(tensor, _expected(1, 5, null_rows, null_items))
+
+
+def test_null_fixed_shape_tensors_become_nan_rows():
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), [DIM])
+    arr = pa.ExtensionArray.from_storage(tensor_type, _vectors("float32", NULL_ROWS))
+
+    tensor = _to_tensor(pa.record_batch({"vec": arr.slice(2)}))
+
+    assert tensor.dtype == torch.float32
+    _assert_rows(tensor, _expected(2, 4, NULL_ROWS))
+
+
+@pytest.mark.parametrize(
+    "dtype", ["float16", "float32", "float64", "bfloat16", "int32"]
+)
+def test_vectors_without_nulls_are_not_copied(dtype):
+    # The rows between the NULL lists hold no NULL.
+    arr = _vectors(dtype, NULL_ROWS).slice(2, 2)
+
+    tensor = _to_tensor(pa.record_batch({"vec": arr}))
+
+    assert tensor.dtype == TORCH_DTYPES[dtype]
+    _assert_rows(tensor, _expected(2, 2))
+    items = arr.values.storage if dtype == "bfloat16" else arr.values
+    first_item = items.offset + arr.offset * DIM
+    assert (
+        tensor.data_ptr()
+        == items.buffers()[1].address + first_item * tensor.element_size()
+    )
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32", "float64", "bfloat16"])
+def test_null_vectors_read_as_nan_rows(tmp_path: Path, dtype):
+    table = pa.table(
+        {
+            "id": pa.array(range(NUM_VECTORS), pa.int32()),
+            "vec": _vectors(dtype, NULL_ROWS),
+        }
+    )
+    lance.write_dataset(table, tmp_path, max_rows_per_file=4)
+
+    batches = list(LanceDataset(tmp_path, batch_size=3, columns=["id", "vec"]))
+
+    assert torch.cat([batch["id"] for batch in batches]).tolist() == list(
+        range(NUM_VECTORS)
+    )
+    vectors = torch.cat([batch["vec"] for batch in batches])
+    assert vectors.dtype == TORCH_DTYPES[dtype]
+    _assert_rows(vectors, _expected(0, NUM_VECTORS, NULL_ROWS))
+
+
+# Written by `write_masked_embeddings_fixture` in rust/lance; see fixtures/README.md.
+MASKED_EMBEDDINGS = Path(__file__).parent / "fixtures" / "masked_embeddings.lance"
+MASKED_EMBEDDINGS_LIVE_IDS = [0, 1, 2, 4, 5, 7, 8, 10, 11]
+MASKED_EMBEDDINGS_PENDING_IDS = [5, 7, 8, 10, 11]
+# What the flag hides under pending rows that were never published.
+MASKED_EMBEDDINGS_QUERY = [5.25, 0.0, 0.0, 1.0]
+
+
+def _masked_embedding_rows(ids) -> torch.Tensor:
+    """What reads of the masked embedding fixture show for `ids`: only ids 0,
+    2 and 4 have a visible embedding, `[id, 0, 0, 1]`. Id 1 is computed NULL
+    and the others are pending over stored values."""
+    return torch.tensor(
+        [
+            [float(row_id), 0.0, 0.0, 1.0] if row_id in (0, 2, 4) else [np.nan] * 4
+            for row_id in ids
+        ],
+        dtype=torch.float64,
+    )
+
+
+@pytest.fixture
+def masked_embeddings(monkeypatch) -> lance.LanceDataset:
+    # Release builds refuse a dataset with cell flags without it.
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_CELL_FLAGS", "1")
+    return lance.dataset(MASKED_EMBEDDINGS)
+
+
+@pytest.mark.parametrize("batch_size", [2, 16])
+def test_masked_embeddings_read_as_nan_rows(masked_embeddings, batch_size):
+    # Fragment 2 was never published: the flag hides the vectors it was
+    # written with.
+    [data_file] = masked_embeddings.get_fragment(2).data_files()
+    stored = LanceFileReader(
+        str(MASKED_EMBEDDINGS / "data" / data_file.path), columns=["embedding"]
+    )
+    assert (
+        stored.read_all().to_table()["embedding"].to_pylist()
+        == [MASKED_EMBEDDINGS_QUERY] * 4
+    )
+
+    batches = list(
+        LanceDataset(
+            masked_embeddings, batch_size=batch_size, columns=["id", "embedding"]
+        )
+    )
+
+    ids = torch.cat([batch["id"] for batch in batches]).tolist()
+    assert ids == MASKED_EMBEDDINGS_LIVE_IDS
+    embeddings = torch.cat([batch["embedding"] for batch in batches])
+    assert embeddings.dtype == torch.float32
+    _assert_rows(embeddings, _masked_embedding_rows(ids))
+
+
+@pytest.mark.parametrize("children", ["as_read", "populated"])
+def test_masked_embeddings_do_not_rely_on_null_children(masked_embeddings, children):
+    table = masked_embeddings.to_table(columns=["id", "embedding"])
+    embedding = table["embedding"].combine_chunks()
+    null_items = embedding.values.is_null().to_numpy(zero_copy_only=False)
+    pending = np.isin(table["id"].to_numpy(), MASKED_EMBEDDINGS_PENDING_IDS)
+    # Lance nulls the items under a masked slot.
+    assert null_items[np.repeat(pending, 4)].all()
+    if children == "populated":
+        # As if every NULL embedding, computed or masked, were read over a
+        # stored vector.
+        null_rows = embedding.is_null().to_numpy(zero_copy_only=False)
+        items = embedding.values.to_numpy(zero_copy_only=False).reshape(-1, 4)
+        items[null_rows] = MASKED_EMBEDDINGS_QUERY
+        embedding = pa.FixedSizeListArray.from_arrays(
+            pa.array(items.ravel(), pa.float32()), 4, mask=embedding.is_null()
+        )
+
+    tensor = _to_tensor(pa.record_batch({"embedding": embedding}))
+
+    _assert_rows(tensor, _masked_embedding_rows(table["id"].to_pylist()))
 
 
 def test_safe_lance_dataset_worker_uses_dataset_options(tmp_path: Path):

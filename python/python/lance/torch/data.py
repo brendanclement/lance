@@ -98,16 +98,24 @@ def _bf16_to_tensor(arr: pa.Array) -> torch.Tensor:
     return tensor
 
 
-# Convert an Arrow FSL array into a 2D torch tensor
 def _fsl_to_tensor(arr: pa.FixedSizeListArray, dimension: int) -> torch.Tensor:
-    # Note: FixedSizeListArray.values does not take offset/len into account and
-    # so may we need to slice here
-    values = arr.values
-    start = arr.offset * dimension
-    num_vals = len(arr) * dimension
-    values = values.slice(start, num_vals)
-    # Convert to numpy
+    """Convert an Arrow FixedSizeList array into a 2D tensor, one row per list.
+
+    A NULL list becomes a row of NaN, whatever values are stored under its
+    slot, just as a NULL item becomes NaN. Integer lists become float64 when
+    the array holds a NULL list or item, following pyarrow's conversion of
+    integer arrays with NULLs. An array without NULLs is not copied.
+    """
+    # FixedSizeListArray.values ignores the array's offset and length.
+    values = arr.values.slice(arr.offset * dimension, len(arr) * dimension)
     nparr = values.to_numpy(zero_copy_only=False).reshape(-1, dimension)
+    if arr.null_count > 0:
+        if not np.issubdtype(nparr.dtype, np.floating):
+            nparr = nparr.astype(np.float64)
+        elif not nparr.flags.writeable:
+            # A zero-copy view of the Arrow buffer.
+            nparr = nparr.copy()
+        nparr[arr.is_null().to_numpy(zero_copy_only=False)] = np.nan
     return torch.from_numpy(nparr)
 
 
@@ -119,7 +127,11 @@ def _to_tensor(
     use_blob_api: bool = False,
     **kwargs,
 ) -> Union[dict[str, torch.Tensor], torch.Tensor]:
-    """Convert a pyarrow RecordBatch to torch Tensor."""
+    """Convert a pyarrow RecordBatch to torch Tensor.
+
+    NULL numeric values become NaN, and a NULL vector becomes a row of NaN. An
+    integer column or vector that holds a NULL becomes float64.
+    """
     ret = {}
 
     cols = (
@@ -158,6 +170,12 @@ def _to_tensor(
             num_vals = len(arr) * arr.type.list_size
             values = values.slice(start, num_vals)
             tensor = _bf16_to_tensor(values).view(-1, arr.type.list_size)
+            if arr.null_count > 0:
+                if values.null_count == 0:
+                    # A view of the Arrow buffer.
+                    tensor = tensor.clone()
+                null_rows = arr.is_null().to_numpy(zero_copy_only=False)
+                tensor[torch.from_numpy(null_rows)] = float("nan")
         elif (
             pa.types.is_integer(arr.type)
             or pa.types.is_floating(arr.type)
@@ -312,7 +330,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
             A function that converts a pyarrow RecordBatch to torch.Tensor.
             Should accept a batch (RecordBatch or Dict[str, pa.Array]) as the first
             argument, plus optional keyword arguments ``hf_converter`` and
-            ``use_blob_api``.
+            ``use_blob_api``. The default converts NULL numeric values to NaN
+            and a NULL vector to a row of NaN; an integer column or vector that
+            holds a NULL becomes float64.
         auto_detect_rank: bool = True, optional
             If set true, the rank and world_size will be detected automatically.
         """

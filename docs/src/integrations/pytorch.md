@@ -104,3 +104,12 @@ Available samplers:
     For multiprocessing you should probably not use fork as lance is
     multi-threaded internally and fork and multi-thread do not work well.
     Refer to [this discussion](https://discuss.python.org/t/concerns-regarding-deprecation-of-fork-with-alive-threads/33555). 
+
+## NULL values
+
+`LanceDataset` converts NULL numeric values to NaN by default. A NULL vector
+(a `FixedSizeList` or `FixedShapeTensor` value) becomes a row of NaN, whatever
+values are stored under it. Integers have no NaN, so an integer column or vector
+that holds a NULL becomes `float64`, and its dtype then depends on whether the
+batch holds a NULL. Pass `filter="vec IS NOT NULL"` to skip NULL vectors, or a
+`to_tensor_fn` to choose another representation.
