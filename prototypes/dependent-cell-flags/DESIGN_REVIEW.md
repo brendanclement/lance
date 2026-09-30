@@ -12,7 +12,9 @@
   - [`bench/REPORT.md`](bench/REPORT.md) and `bench/results/`: every benchmark run with raw
     samples;
   - [`bench/results/10m-noflag-investigation/`](bench/results/10m-noflag-investigation/README.md)
-    and [`bench/results/vector-masking/`](bench/results/vector-masking/README.md).
+    and [`bench/results/vector-masking/`](bench/results/vector-masking/README.md);
+  - [`bench/results/feature-costs/`](bench/results/feature-costs/README.md): the cost of each
+    operation, with the cost table.
 
 ## What it is
 
@@ -219,34 +221,51 @@ Its new scanner test and two of its three unit cases fail on `main` without the 
 
 ## Performance evidence and uncertainties
 
-All numbers come from one Apple M5 Pro laptop running macOS, with local profiles that do not
-match deployment builds. The Linux wheels use thin LTO, 1 codegen unit, `haswell` on x86_64, and
-the `metrics` features. **Performance acceptance is open:** no representative environment or
-agreed threshold was available.
+Measurements of the current prototype (`b56278dc8`), on one Apple M5 Pro laptop running macOS
+with a local SSD and a warm page cache, in `release-with-debug`, on 2026-09-30. None of it
+describes production builds or object storage. The Linux wheels use thin LTO, 1 codegen unit,
+`haswell` on x86_64, and the `metrics` features. **Performance acceptance is open:** no
+representative environment or agreed threshold was available. The full cost table, its
+evidence and what was not measured are in
+[`bench/results/feature-costs/`](bench/results/feature-costs/README.md). At 1M rows in 10
+fragments, against tables without flags:
 
-- **Reads of tables without flags:** narrowed down, unresolved.
-  - Retired instructions match `main` to within 0.3%.
-  - Wall time depends on the build profile: 1.000–1.032× `main` in `release-with-debug`,
-    1.032–1.044× in the local `release` profile.
-  - Edits that do no work move the same reads by 1.4–3.2%.
-  - `2fd300ac2` is a maintainability choice, not a proven speed-up.
-  - Memory, cache, synchronization and scheduling costs were not measured.
-- **Source writes with flags**, at 1M rows (earlier matrix):
-  - sparse updates 1.02–1.15×;
-  - dense updates 1.39–1.53×, with the manifest growing to hundreds of KB (flag state lives inline
-    in the manifest);
-  - publication commit after 0–64 unrelated commits 1.00–1.07×.
-- **Masked text reads:** 1.5–1.8× a plain NULL column with 1% invalidated; about 1.0× when all
-  flags are true.
-- **Vector masking**, 1M × 128 Float32, 12-round rotation with an identical-binary control inside
-  ±1.4%:
-  - a published flag costs nothing measurable;
-  - child-nulling through `arrow_select::zip` made a partly masked scan 10–18× slower than
-    parent-only masking (236 ms against 13 ms at 1% masked), with about 2.5× the allocated bytes;
-    `b56278dc8` removed it;
-  - takes are unaffected.
-- **Flat search with any NULL vector is slow, flags or not:** 239 ms against 16 ms, with about 1.6
-  busy cores. This looks like a separate flat KNN issue on `main`.
+- **Reads without flags:** 1.014–1.023× `main` at 10M rows, with intervals that include 1.0; an
+  identical binary reads 1.017–1.027× `main`. Instructions +0.1%, allocations identical.
+  Unresolved, as before; `2fd300ac2` stays a maintainability choice, not a proven speed-up.
+- **Masked reads:** free when every fragment's flags are whole (0.98–0.99×). When fragments have
+  lost rows, reads cost 1.72× even with every flag true: a per-row mask is built from the
+  fragment's row-set state. 1% masked costs 1.65–1.69× equal ordinary NULLs. A fully masked
+  column still decodes its stored values: 2.5–3.0× all-NULL scans, 16× takes. Masked vectors
+  cost 1.01× an all-valid table at 1% masked, and 0.46× equal NULL vectors. Takes are unaffected
+  unless every row is masked.
+- **Writes:** unrelated writes cost 0.99–1.01×, and sparse source writes 1.00×. A dense source
+  write (100k rows moved) costs 1.24–1.25× (+15 ms), and leaves 163 KB of manifest flag state for
+  one flag, 323 KB for two, against 2.5 KB.
+- **Refresh:** staging pending rows that sit in a new fragment is 20× faster than the
+  `merge_insert` a plain table would use (0.56 ms against 11 ms). Staging 100 rows scattered in
+  place rewrites every touched fragment: 65.6 ms against 23.9 ms for `merge_insert`
+  `RewriteColumns`, which rewrites them too, and 117× the same rows staged in a new fragment.
+  Backfills stage 3.5–5.4× slower than a plain `write_columns`. Commits (validation and
+  publication) cost 0.99–1.15×. Finding pending rows with the documented live scan costs 10.7 ms
+  per 1M rows. Complete cycles cost 0.84–0.96× (row-moving sparse), 1.16–1.30× (dense) and
+  1.40–1.49× (in place) the plain cycle.
+- **Races:** a `Reject` retry redoes the whole refresh (0.97–1.06× the first attempt), and
+  recomputes twice the rows. A `Skip` follow-up of an in-place race costs 0.59–0.73× of the first
+  refresh at 10 fragments and 0.20–0.22× at 40, because it restages every fragment a raced row is
+  in.
+- **Over time:** a publication after 32 unrelated commits costs the same as plain Lance
+  (1.00–1.01×). Opens after 16–64 updates cost 1.09–1.31× (+0.02–0.05 ms), and appends and
+  updates 0.96–1.05×. Holes at moved rows stay in the flag state after a refresh.
+- **Flat search with any NULL vector is slow, flags or not:** 219–230 ms against 15 ms. This looks
+  like a separate flat KNN issue on `main`.
+
+What these costs come from:
+- The semantics require the flag clears and conflict checks.
+- Inline storage causes the manifest and transaction growth.
+- Whole-fragment `DataReplacement` causes the in-place and `Skip` rewrites.
+- The prototype's own code causes the stager's speed and the row-set mask path.
+- The refresher's own code causes the pending-row scan.
 
 ## Decisions needed before production work
 
@@ -261,20 +280,31 @@ agreed threshold was available.
    - Consider validating the new file's field ids against the schema.
    - The Java `DataReplacement` Javadoc now matches (`19bb42a65`); no Java runtime was available to
      check its formatting.
-3. **Flag state storage.** Inline manifest state is too large for fragmented true sets. Spilling
-   it to external per-fragment files is needed before production.
-4. **Index maintenance over masked outputs** (scalar, full-text and ANN) and **compaction** that
+3. **Flag state storage.** Inline state grows with holes and flags. A dense update leaves
+   163 KB per flag. A 50% in-place clear leaves 163 KB, and writes a 331 KB transaction twice:
+   inline and as the transaction file. Holes at moved rows are permanent without compaction.
+   Locally this added only 0.02–0.15 ms to opens and commits. Object-storage latency on every
+   open and commit was not measured. Decide whether to spill the state to external per-fragment
+   files before production.
+4. **Publication granularity and stager speed.** Whole-fragment `DataReplacement` makes a refresh
+   of 100 scattered rows rewrite 13.8 MiB per output, and makes `Skip` follow-ups rewrite again.
+   The stager is also 2.6–5.4× slower than plain Lance writes of the same columns, though it uses
+   far less memory. Decide whether a finer-grained publication, a faster stager, or both are
+   needed. Measurement only so far.
+5. **Index maintenance over masked outputs** (scalar, full-text and ANN) and **compaction** that
    remaps flag state. Both are refused today.
-5. **Bindings.** Python and Java APIs are needed for real use.
-6. **Staged-file lifecycle.** Leases, or explicit discard, for uncommitted publications.
-7. **Performance acceptance.** Agree an environment (Linux x86_64 wheel builds), a threshold and a
-   wheel-matching Rust profile. Run `bench/run_counters_rotation.py` there with an
-   identical-binary control.
-8. **Torch NULL representation** (`90c31aad8`).
+6. **Bindings.** Python and Java APIs are needed for real use.
+7. **Staged-file lifecycle.** Leases, or explicit discard, for uncommitted publications.
+8. **Performance acceptance.** Agree an environment (Linux x86_64 wheel builds, object storage), a
+   threshold and a wheel-matching Rust profile. Run `bench/run_costs.sh` there; each rotation has
+   an identical-binary control.
+9. **Torch NULL representation** (`90c31aad8`).
    - Float NULL vectors become NaN rows.
    - Integer vectors with NULLs become float64 with NaN rows, a dtype that depends on the batch.
    - Accept or change this. It was tested only on the cached torch 2.11, not the locked 2.14.
-9. **Upstream fixes, independent of cell flags.**
+10. **Upstream fixes, independent of cell flags.**
    - The flat-search null-offset fix is ready on the local branch `brendan/flat-search-null-offset`
      (`8d09fb623`), also saved as `upstream/0001-flat-search-null-offset.patch`.
    - The flat KNN slowdown with NULL vectors needs its own investigation.
+  - A `take` of 1,000 rows from a table with 1% of rows moved takes 1.5 s, with or without
+    flags. Not investigated.

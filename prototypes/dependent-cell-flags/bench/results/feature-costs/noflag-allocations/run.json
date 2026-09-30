@@ -1,0 +1,154 @@
+{
+  "started": "2026-09-30T20:11:25+00:00",
+  "config": {
+    "bench": "cell_flags_scan_counters",
+    "profile": "release-with-debug",
+    "rounds": 3,
+    "samples": 4,
+    "warmup": 2,
+    "workloads": [
+      "scan_summary_full",
+      "filter_summary_is_null_count",
+      "count_summary_aggregate"
+    ],
+    "control": "final",
+    "allow_build_differences": false
+  },
+  "host": {
+    "platform": "macOS-26.7-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu_count": 18,
+    "python": "3.9.6",
+    "cpu": "Apple M5 Pro",
+    "memory_bytes": "51539607552"
+  },
+  "dataset_before": {
+    "path": "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/costs/roots/articles-10m",
+    "files": 208,
+    "bytes": 875249540,
+    "sha256": "30c545c5f93bec18519d43e87164a33db0461878aadc1dc933249f8b6ea57f05"
+  },
+  "builds": [
+    {
+      "name": "main",
+      "checkout": "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/vbench/zip",
+      "source": {
+        "head": "e3671b2f5730eea927a088a42cbf30e273edc43c",
+        "status": [
+          " M rust/lance/Cargo.toml",
+          "?? rust/lance/benches/cell_flags_common/alloc.rs",
+          "?? rust/lance/benches/cell_flags_common/counters.rs",
+          "?? rust/lance/benches/cell_flags_common/mod.rs",
+          "?? rust/lance/benches/cell_flags_scan_counters.rs"
+        ],
+        "working_tree": "3de569c8398dd5250db197341953225fe366e3e5",
+        "patch": "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/costs/results/noflag-allocations/source/main.patch",
+        "untracked": {
+          "rust/lance/benches/cell_flags_common/alloc.rs": "a295e98b88823802560e3dc67539b6972f5f7d53ecc0e7eff258735ecee9d9cd",
+          "rust/lance/benches/cell_flags_common/counters.rs": "ac7dd36a98c62db7ed59bf826fca3c7a3971c612e9a5f9a3b7949c5ef1023228",
+          "rust/lance/benches/cell_flags_common/mod.rs": "38c7a7a220cd81dc724708207107b506672a696e31ff5196c0db790b4368bfc3",
+          "rust/lance/benches/cell_flags_scan_counters.rs": "9b8419d59330e9e1370622ebcb94a6aeaa7f2c232810ad2dc102b1121592bbce"
+        }
+      },
+      "executable": "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/vbench/zip/target/release-with-debug/deps/cell_flags_scan_counters-0e7dfad2f7e8d4d9",
+      "binary": "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/costs/results/noflag-allocations/bins/main-01c7da6bef82",
+      "sha256": "01c7da6bef825a797789fab61e0fa2f8bc1ea4cedaa7490319df7f0e89b5f3ce",
+      "fresh": true,
+      "profile_name": "release-with-debug",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 2,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": true
+      },
+      "features": [
+        "aws",
+        "azure",
+        "default",
+        "gcp",
+        "geo",
+        "goosefs",
+        "huggingface",
+        "oss",
+        "tencent",
+        "tos"
+      ],
+      "fingerprint_rustflags": [
+        "-C",
+        "target-cpu=apple-m1",
+        "-C",
+        "target-feature=+neon,+fp16,+fhm,+dotprod"
+      ],
+      "fingerprint_features": "[\"aws\", \"azure\", \"default\", \"gcp\", \"geo\", \"goosefs\", \"huggingface\", \"oss\", \"tencent\", \"tos\"]",
+      "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)\nbinary: rustc\ncommit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3\ncommit-date: 2026-07-07\nhost: aarch64-apple-darwin\nrelease: 1.97.0\nLLVM version: 22.1.6\n",
+      "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)\nrelease: 1.97.0\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.7.1 (sys:0.4.88+curl-8.20.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Mac OS 26.7.0 [64-bit]\n",
+      "cargo_configs": {
+        "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/vbench/zip/.cargo/config.toml": "3a91fd668c40a72fc8f5e4e9051bac3aff1bd4c3c151f0e61bc43d3e56504406",
+        "/Users/brendan/.cargo/config.toml": "c26d4285b09a5234c80f18447ac5802edf07d9d776f8b8fd1ebb7f30a44972bb"
+      },
+      "environment": {}
+    },
+    {
+      "name": "final",
+      "checkout": "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/vbench/nullif",
+      "source": {
+        "head": "dc98f0c06434322f2c9d256eb943edc212641a52",
+        "status": [],
+        "working_tree": "400696167fdde651652b65a86fbd4e78247c05c5",
+        "patch": "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/costs/results/noflag-allocations/source/final.patch",
+        "untracked": {}
+      },
+      "executable": "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/vbench/nullif/target/release-with-debug/deps/cell_flags_scan_counters-0e7dfad2f7e8d4d9",
+      "binary": "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/costs/results/noflag-allocations/bins/final-c16c2538a006",
+      "sha256": "c16c2538a006338a3032fd286c24b409041dbdce8f75badf03d64fac659547e9",
+      "fresh": true,
+      "profile_name": "release-with-debug",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 2,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": true
+      },
+      "features": [
+        "aws",
+        "azure",
+        "default",
+        "gcp",
+        "geo",
+        "goosefs",
+        "huggingface",
+        "oss",
+        "tencent",
+        "tos"
+      ],
+      "fingerprint_rustflags": [
+        "-C",
+        "target-cpu=apple-m1",
+        "-C",
+        "target-feature=+neon,+fp16,+fhm,+dotprod"
+      ],
+      "fingerprint_features": "[\"aws\", \"azure\", \"default\", \"gcp\", \"geo\", \"goosefs\", \"huggingface\", \"oss\", \"tencent\", \"tos\"]",
+      "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)\nbinary: rustc\ncommit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3\ncommit-date: 2026-07-07\nhost: aarch64-apple-darwin\nrelease: 1.97.0\nLLVM version: 22.1.6\n",
+      "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)\nrelease: 1.97.0\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.7.1 (sys:0.4.88+curl-8.20.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Mac OS 26.7.0 [64-bit]\n",
+      "cargo_configs": {
+        "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/vbench/nullif/.cargo/config.toml": "3a91fd668c40a72fc8f5e4e9051bac3aff1bd4c3c151f0e61bc43d3e56504406",
+        "/Users/brendan/.cargo/config.toml": "c26d4285b09a5234c80f18447ac5802edf07d9d776f8b8fd1ebb7f30a44972bb"
+      },
+      "environment": {}
+    }
+  ],
+  "labels": {
+    "main": "main",
+    "final": "final",
+    "final-copy": "final"
+  },
+  "dataset_after": {
+    "path": "/private/tmp/claude-501/-Users-brendan-code-lance--claude-worktrees-dependency-aware-cell-flags-43fc32/74020bc7-5e3b-4fa2-a700-40b87904a7b1/scratchpad/costs/roots/articles-10m",
+    "files": 208,
+    "bytes": 875249540,
+    "sha256": "30c545c5f93bec18519d43e87164a33db0461878aadc1dc933249f8b6ea57f05"
+  },
+  "finished": "2026-09-30T20:11:44+00:00"
+}

@@ -1,0 +1,14 @@
+diff --git a/rust/lance/Cargo.toml b/rust/lance/Cargo.toml
+index 468b06976..1bf31d2e4 100644
+--- a/rust/lance/Cargo.toml
++++ b/rust/lance/Cargo.toml
+@@ -332,5 +332,9 @@ harness = false
+ name = "hamming"
+ harness = false
+ 
++[[bench]]
++name = "cell_flags_scan_counters"
++harness = false
++
+ [lints]
+ workspace = true

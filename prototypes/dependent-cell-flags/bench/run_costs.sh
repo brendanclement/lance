@@ -66,25 +66,25 @@ case "${1:?step}" in
       BENCH_SCALE_ROWS=10000000 "$(bench_binary cell_flags_scan_counters)"
     ;;
   reads)
-    costs reads "$ROOTS/costs-1m" "$(costs_workloads "$READS")" 6 20 2
+    costs reads "$ROOTS/costs-1m" "$(costs_workloads "$READS")" 8 30 2
     ;;
   mutations)
-    costs mutations "$ROOTS/costs-1m" "$(costs_workloads "^" | tr , '\n' | grep -Ev "$READS" | paste -sd, -)" 4 5 1
+    costs mutations "$ROOTS/costs-1m" "$(costs_workloads "^" | tr , '\n' | grep -Ev "$READS" | paste -sd, -)" 8 10 2
     ;;
   allocations)
-    BENCH_COUNT_ALLOCATIONS=1 costs allocations "$ROOTS/costs-1m" "$(costs_workloads "^")" 2 3 1
+    BENCH_COUNT_ALLOCATIONS=1 costs allocations "$ROOTS/costs-1m" "$(costs_workloads "^")" 2 4 2
     ;;
   scaling)
-    BENCH_SCALE_ROWS=4000000 costs scaling-4m "$ROOTS/costs-4m" "$SCALING_WORKLOADS" 4 5 1
-    costs scaling-1m-40frag "$ROOTS/costs-1m-40frag" "$SCALING_WORKLOADS" 4 5 1
+    BENCH_SCALE_ROWS=4000000 costs scaling-4m "$ROOTS/costs-4m" "$SCALING_WORKLOADS" 4 6 2
+    costs scaling-1m-40frag "$ROOTS/costs-1m-40frag" "$SCALING_WORKLOADS" 4 6 2
     ;;
   vector)
     python3 "$DRIVER" --bench cell_flags_vector_masking --dataset "$VECTOR_TABLES" \
       --out "$OUT/vector" --profile "$PROFILE" --build final="$FINAL" --control final \
-      --rounds 6 --samples 20 --warmup 2
+      --rounds 8 --samples 20 --warmup 2
     BENCH_COUNT_ALLOCATIONS=1 python3 "$DRIVER" --bench cell_flags_vector_masking \
       --dataset "$VECTOR_TABLES" --out "$OUT/vector-allocations" --profile "$PROFILE" \
-      --build final="$FINAL" --control final --rounds 2 --samples 5 --warmup 1
+      --build final="$FINAL" --control final --rounds 2 --samples 4 --warmup 2
     ;;
   noflag)
     # Both builds must run the same bench source, allocator included.
@@ -98,7 +98,7 @@ case "${1:?step}" in
     BENCH_COUNT_ALLOCATIONS=1 python3 "$DRIVER" --dataset "$ROOTS/articles-10m" \
       --out "$OUT/noflag-allocations" --profile "$PROFILE" \
       --build main="$MAIN" --build final="$FINAL" --control final \
-      --rounds 3 --samples 5 --warmup 1
+      --rounds 3 --samples 4 --warmup 2
     ;;
   *)
     echo "unknown step $1" >&2
