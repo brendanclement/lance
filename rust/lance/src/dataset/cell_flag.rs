@@ -127,11 +127,16 @@ pub struct CellFlagOptions {
     /// `clear_on_write` sources: writes that re-read rows through the masked
     /// scan, such as a row-moving update, write masked cells back as NULL,
     /// which only a dependent flag tolerates, since a publication sets it true
-    /// together with fresh values. The field must be a nullable scalar and must
-    /// not be indexed. MemWAL rows carry no flag state to mask them with, so a
-    /// masking flag cannot be registered while MemWAL is initialized, MemWAL
-    /// cannot be initialized or written while one is registered, and LSM reads
-    /// over a version that has one fail.
+    /// together with fresh values. The field must be nullable, and a scalar or
+    /// a vector: a fixed-size list of Float16, Float32 or Float64. It must not
+    /// be indexed, by a vector index either, so nearest-neighbor search over a
+    /// masked vector is a flat search that skips masked rows, and `fast_search`
+    /// finds nothing. Masking nulls only a vector's list slot: the stored
+    /// values under it can remain in the child array, where a reader that
+    /// ignores the list's validity sees them. MemWAL rows carry no flag state
+    /// to mask them with, so a masking flag cannot be registered while MemWAL
+    /// is initialized, MemWAL cannot be initialized or written while one is
+    /// registered, and LSM reads over a version that has one fail.
     pub mask_when_false: bool,
 }
 

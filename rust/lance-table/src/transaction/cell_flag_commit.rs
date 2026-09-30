@@ -930,6 +930,14 @@ fn unknown_flag(flag_id: u32, change: &str) -> Error {
 }
 
 fn is_maskable_type(data_type: &DataType) -> bool {
+    if let DataType::FixedSizeList(item, _) = data_type {
+        // A float vector. Lance stores a fixed-size list of primitives as one
+        // leaf field, so no projection of a child can read around the mask.
+        return matches!(
+            item.data_type(),
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        );
+    }
     matches!(
         data_type,
         DataType::Boolean
@@ -1070,7 +1078,8 @@ fn validate_registration(
         if output.is_blob() || !is_maskable_type(&output.data_type()) {
             return Err(Error::not_supported(format!(
                 "cannot register masking cell flag '{name}': {} has type {}{}, and masking \
-                 supports only boolean, numeric, decimal, string, binary and temporal fields",
+                 supports only boolean, numeric, decimal, string, binary and temporal fields, \
+                 and vectors: fixed-size lists of Float16, Float32 or Float64",
                 field_label(schema, field_id),
                 output.data_type(),
                 if output.is_blob() { " (blob)" } else { "" }
@@ -1609,11 +1618,18 @@ mod tests {
     const LANG: i32 = 5;
     const TAGS: i32 = 6;
     const BLOB: i32 = 8;
+    const VECTOR: i32 = 9;
+    const MULTIVECTOR: i32 = 10;
     const ROWS: usize = 10;
+
+    fn vector_of(item: DataType, dimension: i32) -> DataType {
+        DataType::FixedSizeList(Arc::new(ArrowField::new("item", item, true)), dimension)
+    }
 
     fn schema() -> Schema {
         let blob_metadata =
             StdHashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let multivector = ArrowField::new("item", vector_of(DataType::Float32, 2), true);
         let arrow = ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
             ArrowField::new("title", DataType::Utf8, true),
@@ -1634,10 +1650,14 @@ mod tests {
                 true,
             ),
             ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(blob_metadata),
+            ArrowField::new("vector", vector_of(DataType::Float32, 4), true),
+            ArrowField::new("multivector", DataType::List(Arc::new(multivector)), true),
         ]);
         let schema = Schema::try_from(&arrow).unwrap();
         assert_eq!(schema.field("meta.lang").unwrap().id, LANG);
         assert_eq!(schema.field("blob").unwrap().id, BLOB);
+        assert_eq!(schema.field("vector").unwrap().id, VECTOR);
+        assert_eq!(schema.field("multivector").unwrap().id, MULTIVECTOR);
         schema
     }
 
@@ -2620,6 +2640,7 @@ mod tests {
     #[case::list_mask(registration_of(TAGS, "x", &[TITLE], true), false, "masking supports only")]
     #[case::struct_mask(registration_of(META, "x", &[TITLE], true), false, "masking supports only")]
     #[case::blob_mask(registration_of(BLOB, "x", &[TITLE], true), false, "(blob)")]
+    #[case::multivector_mask(registration_of(MULTIVECTOR, "x", &[TITLE], true), false, "masking supports only")]
     fn registration_validation_errors(
         #[case] registration: CellFlagRegistration,
         #[case] is_invalid_input: bool,
@@ -2645,6 +2666,52 @@ mod tests {
             assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         }
         assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn masking_registration_accepts_a_float_vector() {
+        let head = commit(
+            &manifest(),
+            &register_txn(1, vec![registration_of(VECTOR, "ready", &[BODY], true)]),
+        )
+        .unwrap();
+        let flag = registry_of(&head).masking_flag(VECTOR).unwrap();
+        assert_eq!(
+            (flag.name.as_str(), flag.clear_on_write.as_slice()),
+            ("ready", &[BODY][..])
+        );
+    }
+
+    #[rstest]
+    #[case::float16(vector_of(DataType::Float16, 4), true)]
+    #[case::float32(vector_of(DataType::Float32, 4), true)]
+    #[case::float64(vector_of(DataType::Float64, 4), true)]
+    #[case::int8(vector_of(DataType::Int8, 4), false)]
+    #[case::uint8(vector_of(DataType::UInt8, 4), false)]
+    #[case::utf8(vector_of(DataType::Utf8, 4), false)]
+    #[case::bfloat16(
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::FixedSizeBinary(2), true).with_metadata(
+                StdHashMap::from([(
+                    lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                    lance_arrow::bfloat16::BFLOAT16_EXT_NAME.to_string(),
+                )]),
+            )),
+            4,
+        ),
+        false
+    )]
+    #[case::of_struct(
+        vector_of(DataType::Struct(Fields::from(vec![ArrowField::new("x", DataType::Float32, true)])), 4),
+        false
+    )]
+    #[case::nested(vector_of(vector_of(DataType::Float32, 2), 2), false)]
+    #[case::multivector(
+        DataType::List(Arc::new(ArrowField::new("item", vector_of(DataType::Float32, 2), true))),
+        false
+    )]
+    fn only_float_vector_lists_are_maskable(#[case] data_type: DataType, #[case] maskable: bool) {
+        assert_eq!(is_maskable_type(&data_type), maskable, "{data_type}");
     }
 
     #[test]
