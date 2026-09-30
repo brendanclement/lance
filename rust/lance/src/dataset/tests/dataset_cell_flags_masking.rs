@@ -58,7 +58,7 @@ use crate::dataset::mem_wal::scanner::{
 use crate::dataset::mem_wal::{DatasetMemWalExt, ShardWriter, ShardWriterConfig};
 use crate::dataset::scanner::{AggregateExpr, ColumnOrdering, MaterializationStyle};
 use crate::dataset::schema_evolution::NewColumnTransform;
-use crate::dataset::transaction::{DataReplacementGroup, Operation};
+use crate::dataset::transaction::{DataReplacementGroup, Operation, Transaction};
 use crate::dataset::write::CommitBuilder;
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use crate::dataset::{
@@ -1235,6 +1235,125 @@ async fn test_indexing_a_masked_field_fails_before_building(#[case] index_type: 
     assert!(latest.load_indices().await.unwrap().is_empty());
 }
 
+/// How a vector index built before a masking flag was registered is
+/// committed after it.
+#[derive(Debug, Clone, Copy)]
+enum LateIndexCommit {
+    /// A `CreateIndex` transaction read at the registration's version, as a
+    /// distributed build commits its segments.
+    AtRegistration,
+    /// The same transaction read at the version the index was built on.
+    AtBuild,
+    /// `commit_existing_index_segments` on the handle the index was built on.
+    ExistingSegments,
+    /// `create_index` on a handle opened before the registration.
+    CreateIndex,
+}
+
+/// A vector index trained before a masking flag is registered holds the
+/// stored vectors, and only the commit refuses it: a raw `CreateIndex`
+/// transaction skips the checks before a build, and a handle opened before
+/// the registration passes them. No publication follows the registration,
+/// since it would turn the stale commits into a retryable conflict first.
+#[rstest]
+#[case::at_registration(LateIndexCommit::AtRegistration)]
+#[case::at_build(LateIndexCommit::AtBuild)]
+#[case::existing_segments(LateIndexCommit::ExistingSegments)]
+#[case::create_index(LateIndexCommit::CreateIndex)]
+#[tokio::test]
+async fn test_committing_a_vector_index_built_before_masking_is_refused(
+    #[case] commit: LateIndexCommit,
+) {
+    let vectors: Vec<_> = (0..12).map(|id| Some(embedding_of(id as f32))).collect();
+    let batch = RecordBatch::try_from_iter_with_nullable([
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..12)) as ArrayRef,
+            false,
+        ),
+        (
+            "body",
+            Arc::new(StringArray::from_iter_values(
+                (0..12).map(|id| format!("b{id}")),
+            )) as ArrayRef,
+            false,
+        ),
+        ("embedding", embeddings(&vectors), true),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let mut built_on = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = VectorIndexParams::ivf_flat(1, DistanceType::L2);
+    let segment = built_on
+        .create_index_builder(&["embedding"], IndexType::IvfFlat, &params)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let mut registered = built_on.clone();
+    let ready = registered
+        .register_cell_flag(
+            "embedding",
+            "ready",
+            CellFlagOptions::default()
+                .with_clear_on_write(["body"])
+                .with_mask_when_false(true),
+        )
+        .await
+        .unwrap();
+
+    let create_index = |read: &Dataset| {
+        Transaction::new(
+            read.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![segment.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        )
+    };
+    let error = match commit {
+        LateIndexCommit::AtRegistration => CommitBuilder::new(Arc::new(registered.clone()))
+            .execute(create_index(&registered))
+            .await
+            .unwrap_err(),
+        LateIndexCommit::AtBuild => CommitBuilder::new(Arc::new(built_on.clone()))
+            .execute(create_index(&built_on))
+            .await
+            .unwrap_err(),
+        LateIndexCommit::ExistingSegments => built_on
+            .commit_existing_index_segments(&segment.name, "embedding", vec![segment.clone()])
+            .await
+            .unwrap_err(),
+        LateIndexCommit::CreateIndex => built_on
+            .create_index(&["embedding"], IndexType::IvfFlat, None, &params, false)
+            .await
+            .unwrap_err(),
+    };
+    let field_id = registered.schema().field("embedding").unwrap().id;
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error.to_string().contains(&format!(
+            "CreateIndex is not supported on a dataset with cell flag 'ready' (flag id {}) on \
+             'embedding' (field id {field_id}): index 'embedding_idx' would serve the values the \
+             flag masks",
+            ready.flag_id
+        )),
+        "{error}"
+    );
+    let latest = latest(&registered).await;
+    assert_eq!(latest.version().version, registered.version().version);
+    assert!(latest.load_indices().await.unwrap().is_empty());
+}
+
 #[rstest]
 #[case::btree("summary", IndexType::BTree)]
 #[case::ivf_flat("embedding", IndexType::IvfFlat)]
@@ -1716,7 +1835,11 @@ async fn update_body(dataset: &Dataset, id: i32, body: &str) -> Dataset {
 #[derive(Debug, Clone, Copy)]
 enum Knn {
     Plain,
+    /// A prefilter answered by a BTree on `id`, which the dataset must have.
     Prefilter(&'static str),
+    /// A prefilter answered by scanning, with `use_scalar_index(false)`.
+    UnindexedPrefilter(&'static str),
+    /// A filter of the top `k`.
     Postfilter(&'static str),
     /// `use_index(false)` and `refine(1)`, which a flat search ignores.
     FlatRefined,
@@ -1747,6 +1870,12 @@ async fn nearest_hits(
     match knn {
         Knn::Prefilter(filter) => {
             scan.prefilter(true).filter(filter).unwrap();
+        }
+        Knn::UnindexedPrefilter(filter) => {
+            scan.prefilter(true)
+                .filter(filter)
+                .unwrap()
+                .use_scalar_index(false);
         }
         Knn::Postfilter(filter) => {
             scan.filter(filter).unwrap();
@@ -1787,6 +1916,11 @@ async fn nearest_hits(
     } else {
         assert!(plan.contains("KNNVectorDistance"), "{plan}");
         assert!(!plan.contains("ANN"), "{plan}");
+    }
+    match knn {
+        Knn::Prefilter(_) => assert!(plan.contains("ScalarIndexQuery"), "{plan}"),
+        Knn::UnindexedPrefilter(_) => assert!(!plan.contains("ScalarIndexQuery"), "{plan}"),
+        _ => {}
     }
     let batch = scan.try_into_batch().await.unwrap();
     let mut hits = vec![Vec::new(); queries.len()];
@@ -1875,33 +2009,42 @@ async fn test_embedding_publication_through_the_stager() {
     assert_eq!(scan_id_embeddings(&result.dataset, None).await, published);
 }
 
-/// Float16 and Float64 vectors mask as Float32 ones do. Fragments 0 and 1
-/// are published and id 5's body is then rewritten, leaving e5 stale in a
-/// partly masked fragment; fragment 2 is never published, so every row of it
-/// is masked. A leak of either adds a row to a search that asks for all 12.
+/// Vectors of every float width mask alike on every v2 storage version, whose
+/// encoders write the publication's nullable vectors. Every row is written
+/// with [`QUERY`]. The publication of fragments 0 and 1 computes a NULL for
+/// id 1 and leaves id 7 unassigned, carrying [`QUERY`], so the stager
+/// interleaves computed and copied rows; id 5's body is then rewritten,
+/// leaving e5 stale in a partly masked fragment, and fragment 2 is never
+/// published. A leak of any of them adds a row to a search that asks for all
+/// 12.
 #[rstest]
-#[case::float16(DataType::Float16)]
-#[case::float64(DataType::Float64)]
 #[tokio::test]
-async fn test_vectors_of_every_float_width_mask(#[case] item: DataType) {
+async fn test_vectors_of_every_float_width_mask(
+    #[values(DataType::Float16, DataType::Float32, DataType::Float64)] item: DataType,
+    #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+    storage: LanceFileVersion,
+) {
     let vector_type = DataType::FixedSizeList(Arc::new(ArrowField::new("item", item, true)), DIM);
-    let vectors = |ids: &[i32]| {
-        let values: Vec<_> = ids
-            .iter()
-            .map(|id| Some(embedding_of(*id as f32)))
-            .collect();
-        arrow_cast::cast(&embeddings(&values), &vector_type).unwrap()
-    };
-    let ids: Vec<i32> = (0..12).collect();
-    let bodies = StringArray::from_iter_values(ids.iter().map(|id| format!("b{id}")));
+    let float32 = DataType::FixedSizeList(
+        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+        DIM,
+    );
+    let vectors =
+        |values: &[Option<Vec<f32>>]| arrow_cast::cast(&embeddings(values), &vector_type).unwrap();
     let batch = RecordBatch::try_from_iter_with_nullable([
         (
             "id",
-            Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+            Arc::new(Int32Array::from_iter_values(0..12)) as ArrayRef,
             false,
         ),
-        ("body", Arc::new(bodies) as ArrayRef, false),
-        ("embedding", vectors(&ids), true),
+        (
+            "body",
+            Arc::new(StringArray::from_iter_values(
+                (0..12).map(|id| format!("b{id}")),
+            )) as ArrayRef,
+            false,
+        ),
+        ("embedding", vectors(&vec![Some(QUERY.to_vec()); 12]), true),
     ])
     .unwrap();
     let schema = batch.schema();
@@ -1910,6 +2053,7 @@ async fn test_vectors_of_every_float_width_mask(#[case] item: DataType) {
         "memory://",
         Some(WriteParams {
             max_rows_per_file: 4,
+            data_storage_version: Some(storage),
             ..Default::default()
         }),
     )
@@ -1926,57 +2070,70 @@ async fn test_vectors_of_every_float_width_mask(#[case] item: DataType) {
         .await
         .unwrap();
     let addrs: Vec<u64> = (0..8).map(|row| addr(row / 4, row % 4)).collect();
+    let values: Vec<_> = (0..8)
+        .map(|id| match id {
+            1 => None,
+            7 => Some(QUERY.to_vec()),
+            _ => Some(embedding_of(id as f32)),
+        })
+        .collect();
     let rows = RecordBatch::try_from_iter([
         (ROW_ADDR, Arc::new(UInt64Array::from(addrs)) as ArrayRef),
-        ("embedding", vectors(&ids[..8])),
+        ("embedding", vectors(&values)),
     ])
     .unwrap();
-    let published = publish_embeddings(
-        &dataset,
-        ComputedBatch::new(rows),
-        DependencyConflictPolicy::Reject,
-    )
-    .await
-    .unwrap()
-    .dataset;
-    let dataset = merge_insert_body(&published, 5, "b50").await;
-
-    let batch = dataset
-        .scan()
-        .project(&["id", "embedding"])
-        .unwrap()
-        .try_into_batch()
+    let computed = ComputedBatch::new(rows)
+        .with_assigned("embedding", BooleanBuffer::collect_bool(8, |row| row != 7));
+    let published = publish_embeddings(&dataset, computed, DependencyConflictPolicy::Reject)
         .await
-        .unwrap();
-    let float32 = DataType::FixedSizeList(
-        Arc::new(ArrowField::new("item", DataType::Float32, true)),
-        DIM,
-    );
-    let as_float32 = RecordBatch::try_from_iter([
-        ("id", batch["id"].clone()),
-        (
-            "embedding",
-            arrow_cast::cast(&batch["embedding"], &float32).unwrap(),
-        ),
-    ])
-    .unwrap();
-    let visible: Vec<_> = ids
-        .iter()
-        .map(|id| (*id, (*id < 8 && *id != 5).then(|| embedding_of(*id as f32))))
+        .unwrap()
+        .dataset;
+    let dataset = merge_insert_body(&published, 5, "b50").await;
+    let as_float32 = |batch: RecordBatch| {
+        RecordBatch::try_from_iter([
+            ("id", batch["id"].clone()),
+            (
+                "embedding",
+                arrow_cast::cast(&batch["embedding"], &float32).unwrap(),
+            ),
+        ])
+        .unwrap()
+    };
+
+    let batch = as_float32(scan_embeddings(&dataset, None).await);
+    let visible: Vec<_> = (0..12)
+        .map(|id| {
+            (
+                id,
+                [0, 2, 3, 4, 6]
+                    .contains(&id)
+                    .then(|| embedding_of(id as f32)),
+            )
+        })
         .collect();
-    assert_eq!(id_embeddings(&as_float32), visible);
+    assert_eq!(id_embeddings(&batch), visible);
     assert_eq!(
         nearest_hits(&dataset, &[QUERY], 12, Knn::Plain, None).await,
         [[
             (6, 0.5625),
             (4, 1.5625),
-            (7, 3.0625),
             (3, 5.0625),
             (2, 10.5625),
-            (1, 18.0625),
             (0, 27.5625),
         ]]
     );
+
+    // The stager wrote id 7 as its masked NULL, not the value it carried, and
+    // id 1 as its computed NULL.
+    let mut unmasked = dataset.clone();
+    unmasked.drop_cell_flag("embedding", "ready").await.unwrap();
+    let mut stored = visible;
+    stored[5] = (5, Some(embedding_of(5.0)));
+    for (_, embedding) in &mut stored[8..] {
+        *embedding = Some(QUERY.to_vec());
+    }
+    let batch = as_float32(scan_embeddings(&unmasked, None).await);
+    assert_eq!(id_embeddings(&batch), stored);
 }
 
 /// Writing a row's body masks its embedding in the version of the write,
@@ -2168,8 +2325,19 @@ async fn test_masked_embeddings_on_scan_filter_and_take(
 #[case::plain(Knn::Plain, &[QUERY], 12, vec![NEAREST.to_vec()])]
 #[case::nearest_two(Knn::Plain, &[QUERY], 2, vec![NEAREST[..2].to_vec()])]
 #[case::indexed_prefilter(Knn::Prefilter("id >= 4"), &[QUERY], 1, vec![vec![NEAREST[0]]])]
-#[case::prefilter(Knn::Prefilter("id < 4"), &[QUERY], 1, vec![vec![NEAREST[1]]])]
-#[case::postfilter(Knn::Postfilter("id < 4"), &[QUERY], 3, vec![NEAREST[1..].to_vec()])]
+#[case::unindexed_prefilter(
+    Knn::UnindexedPrefilter("id >= 4"),
+    &[QUERY],
+    1,
+    vec![vec![NEAREST[0]]]
+)]
+#[case::indexed_prefilter_past_deleted(
+    Knn::Prefilter("id < 4"),
+    &[QUERY],
+    1,
+    vec![vec![NEAREST[1]]]
+)]
+#[case::postfilter(Knn::Postfilter("id < 4"), &[QUERY], 2, vec![vec![NEAREST[1]]])]
 #[case::flat_refined(Knn::FlatRefined, &[QUERY], 12, vec![NEAREST.to_vec()])]
 #[case::distance_range(Knn::DistanceRange(0.0, 2.0), &[QUERY], 12, vec![vec![NEAREST[0]]])]
 #[case::partial_fragment(Knn::Fragment(1), &[QUERY], 12, vec![vec![NEAREST[0]]])]
@@ -2297,7 +2465,7 @@ async fn test_nearest_over_sliced_batches_skips_masked_embeddings(
         let knn = Knn::BatchBytes(bytes);
         assert_eq!(
             nearest_hits(&dataset, &[QUERY], 8, knn, None).await,
-            [nearest.clone()],
+            std::slice::from_ref(&nearest),
             "{bytes} bytes"
         );
         assert_eq!(

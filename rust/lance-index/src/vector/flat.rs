@@ -167,7 +167,7 @@ mod tests {
         #[case] expected: [Option<f32>; 4],
     ) {
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            (0..8).map(|row| (row % 5 != 1).then(|| [Some(row as f32), Some(0.0)])),
+            (0..8).map(|row| (row % 5 != 1).then_some([Some(row as f32), Some(0.0)])),
             2,
         );
         let mut columns = vec![("vector", Arc::new(vectors) as ArrayRef)];
