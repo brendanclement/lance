@@ -56,3 +56,19 @@ def test_torch_kmeans_nans(tmp_path: Path):
             assert part_ids[1] == -1
         else:
             assert part_ids[idx] != -1
+
+
+def test_torch_kmeans_null_vectors():
+    # The NULL vector is stored over [100, 100], as is the row the slice drops.
+    values = pa.array([100, 100, 0, 0, 2, 2, 100, 100, 10, 10, 12, 12], pa.float32())
+    nulls = pa.array([False, False, False, True, False, False])
+    fsl = pa.FixedSizeListArray.from_arrays(values, 2, mask=nulls).slice(1)
+    centroids = torch.tensor([[0.0, 0.0], [10.0, 10.0]])
+
+    kmeans = KMeans(2, centroids=centroids, device="cpu")
+    assert kmeans.transform(fsl).tolist() == [0, 0, -1, 1, 1]
+
+    kmeans.fit(fsl)
+    torch.testing.assert_close(
+        kmeans.centroids, torch.tensor([[1.0, 1.0], [11.0, 11.0]])
+    )

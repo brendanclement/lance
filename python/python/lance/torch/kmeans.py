@@ -17,7 +17,7 @@ from lance.log import LOGGER
 from lance.util import MetricType, _normalize_metric_type
 
 from . import preferred_device
-from .data import TensorDataset
+from .data import TensorDataset, _fsl_to_tensor
 from .distance import dot_distance, l2_distance
 
 __all__ = ["KMeans"]
@@ -92,10 +92,7 @@ class KMeans:
         self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]
     ) -> torch.Tensor:
         if isinstance(data, pa.FixedSizeListArray):
-            np_tensor = data.values.to_numpy(zero_copy_only=False).reshape(
-                -1, data.type.list_size
-            )
-            data = torch.from_numpy(np_tensor)
+            data = _fsl_to_tensor(data, data.type.list_size)
         elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
         elif isinstance(data, torch.Tensor):
@@ -142,7 +139,7 @@ class KMeans:
         """
         start = time.time()
         if isinstance(data, pa.FixedSizeListArray):
-            data = np.stack(data.to_numpy(zero_copy_only=False))
+            data = _fsl_to_tensor(data, data.type.list_size)
         elif isinstance(data, pa.FixedShapeTensorArray):
             data = data.to_numpy_ndarray()
         if (_check_for_torch(data) and isinstance(data, torch.Tensor)) or (
