@@ -131,13 +131,13 @@ pub struct CellFlagOptions {
     /// a vector: a fixed-size list of Float16, Float32 or Float64. It must not
     /// be indexed, by a vector index either, so nearest-neighbor search over a
     /// masked vector is a flat search that skips masked rows, and `fast_search`
-    /// finds nothing. A masked vector's child values read as NULL too, so a
-    /// reader that takes the list's values without its validity, such as a
-    /// reshape of `values`, never sees the stored vector. MemWAL rows carry no
-    /// flag state to mask them with, so a masking flag cannot be registered
-    /// while MemWAL is initialized, MemWAL cannot be initialized or written
-    /// while one is registered, and LSM reads over a version that has one
-    /// fail.
+    /// finds nothing. Masking nulls only a vector's list slot: the stored
+    /// values under it can remain in the child array, where a reader that
+    /// ignores the list's validity, such as a reshape of `values`, sees them.
+    /// MemWAL rows carry no flag state to mask them with, so a masking flag
+    /// cannot be registered while MemWAL is initialized, MemWAL cannot be
+    /// initialized or written while one is registered, and LSM reads over a
+    /// version that has one fail.
     pub mask_when_false: bool,
 }
 

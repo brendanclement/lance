@@ -625,8 +625,8 @@ def test_masked_embeddings_do_not_rely_on_null_children(masked_embeddings, child
     embedding = table["embedding"].combine_chunks()
     null_items = embedding.values.is_null().to_numpy(zero_copy_only=False)
     pending = np.isin(table["id"].to_numpy(), MASKED_EMBEDDINGS_PENDING_IDS)
-    # Lance nulls the items under a masked slot.
-    assert null_items[np.repeat(pending, 4)].all()
+    # Masking nulls only the slot: id 5's stale vector stays under it.
+    assert not null_items[np.repeat(pending, 4)].all()
     if children == "populated":
         # As if every NULL embedding, computed or masked, were read over a
         # stored vector.
