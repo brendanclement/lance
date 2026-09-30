@@ -423,6 +423,12 @@ impl PublicationStager {
     /// unreferenced: only once they are 7 days old, unless `delete_unverified`
     /// is set, which is safe only while no other write is in progress.
     ///
+    /// An output added as an all-NULL (metadata-only) column is not stored on
+    /// the fragments where another output was already published. Publishing
+    /// it there takes an extra, separate commit of it alone first; only then
+    /// can the two refresh together, so on such fragments their first
+    /// publication is not atomic.
+    ///
     /// ```
     /// # use std::sync::Arc;
     /// # use arrow_array::RecordBatch;
@@ -670,6 +676,10 @@ impl PublicationStager {
         ))
     }
 
+    // TODO: the smallest extension that lifts the mixed-layout refusal is in
+    // the manifest build's DataReplacement: where the new file covers V2
+    // files only partially, tombstone the covered fields in the existing files
+    // and append the new file, as its fully covered path already does.
     /// Refuse the layouts the manifest build cannot replace in one file: it
     /// swaps or tombstones the outputs where every one is stored, or appends
     /// the file where none is, and fails otherwise.
@@ -720,8 +730,8 @@ impl PublicationStager {
             });
         Err(Error::invalid_input(format!(
             "outputs [{}] cannot be replaced together on fragment {}: [{}] are stored in its \
-             data files but [{}] are not; publish [{}] on its own first, or in a separate \
-             transaction",
+             data files but [{}] are not, so one commit cannot publish them together there; \
+             publish [{}] on its own first, then stage them together",
             names(&all),
             fragment.id,
             names(&stored),

@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-    RecordBatchIterator, StringArray, UInt64Array, record_batch,
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+    RecordBatch, RecordBatchIterator, StringArray, UInt64Array, record_batch,
 };
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -25,6 +25,7 @@ use lance_arrow::json::ARROW_JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_META_KEY};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::tempfile::TempStrDir;
 use lance_core::{Error, ROW_ADDR, ROW_ID};
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -6267,35 +6268,60 @@ async fn test_stager_refuses_a_row_skipping_an_output_between_outputs(
     }
 }
 
-/// A fragment where summary has its own file and keywords is still
-/// metadata-only cannot take one file writing both, which the build would
-/// refuse. Stored in separate files, or in none, they stage together.
+/// Summary is published on fragment 0, in a file of its own, and keywords is
+/// then added as an all-NULL, metadata-only column with its own flag. One
+/// file cannot replace a stored summary and a metadata-only keywords, which
+/// the build would refuse, so a refresh of both is refused on fragment 0,
+/// after fragment 1, which stores neither, was staged, and leaves nothing
+/// behind. Publishing keywords on its own first, in a separate commit, lets
+/// both refresh together: on fragment 0 from separate files (tombstoned) and
+/// then from one (swapped in place), and on fragment 1 appended.
 #[tokio::test]
 async fn test_stager_rejects_mixed_output_layout() {
-    let (dataset, summary, keywords, _) = sibling_outputs().await;
+    let mut dataset = articles(false).await;
+    let summary = register_ready(&mut dataset).await;
     let fragment_0 = [addr(0, 0), addr(0, 1)];
+    let fragment_1 = [addr(1, 0), addr(1, 1)];
+    let mut read = publish_computed(&dataset, &["summary"], &fragment_0).await;
+    let keywords = ArrowSchema::new(vec![ArrowField::new("keywords", DataType::Utf8, true)]);
+    read.add_columns(NewColumnTransform::AllNulls(Arc::new(keywords)), None, None)
+        .await
+        .unwrap();
+    let keywords = read
+        .register_cell_flag(
+            "keywords",
+            "ready",
+            CellFlagOptions::default()
+                .with_clear_on_write(["body"])
+                .with_mask_when_false(true),
+        )
+        .await
+        .unwrap()
+        .flag_id;
     let siblings = ["summary", "keywords"];
-    let read = publish_computed(&dataset, &["summary"], &fragment_0).await;
     let before = data_files(&read).await;
-    let batch = computed_batch(
-        &read,
-        &fragment_0,
-        &[("summary", &fragment_0), ("keywords", &fragment_0)],
-    )
-    .await;
-    let error = stage_batches(&stager_of(&read, &siblings), vec![batch])
+    let mut batches = Vec::new();
+    for fragment in [&fragment_1, &fragment_0] {
+        let assigned = [("summary", &fragment[..]), ("keywords", &fragment[..])];
+        batches.push(computed_batch(&read, fragment, &assigned).await);
+    }
+    let error = stage_batches(&stager_of(&read, &siblings), batches)
         .await
         .unwrap_err();
     assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
     assert!(
         error.to_string().contains(
             "outputs [summary, keywords] cannot be replaced together on fragment 0: [summary] \
-             are stored in its data files but [keywords] are not; publish [keywords] on its own \
-             first, or in a separate transaction"
+             are stored in its data files but [keywords] are not, so one commit cannot publish \
+             them together there; publish [keywords] on its own first, then stage them together"
         ),
         "{error}"
     );
     assert_eq!(data_files(&read).await, before);
+    assert_eq!(
+        latest(&read).await.version().version,
+        read.version().version
+    );
     let by_hand = stage_rows(&read, 0, &siblings, |column, offset| {
         Some(format!("{column}-{offset}"))
     })
@@ -6315,15 +6341,24 @@ async fn test_stager_rejects_mixed_output_layout() {
         "{error}"
     );
 
-    // Keywords on its own first; then both are stored, in separate files
-    // (tombstoned) and then in one (swapped in place). Fragment 1 stores
-    // neither, so its file is appended.
     let mut head = publish_computed(&read, &["keywords"], &fragment_0).await;
+    assert_eq!(head.cell_flag_true_rows(summary).unwrap(), full(&[0]));
+    assert_eq!(head.cell_flag_true_rows(keywords).unwrap(), full(&[0]));
     for _ in 0..2 {
         head = publish_computed(&head, &siblings, &live_addrs(&head).await).await;
     }
     for flag_id in [summary, keywords] {
         assert_eq!(head.cell_flag_true_rows(flag_id).unwrap(), full(&[0, 1]));
+    }
+    for (column, input) in [("summary", "t"), ("keywords", "b")] {
+        let expected: Vec<(i32, Option<String>)> = (1..=4)
+            .map(|id| (id, Some(computed(column, Some(&format!("{input}{id}"))))))
+            .collect();
+        assert_eq!(
+            column_values(&head, column, None).await,
+            expected,
+            "{column}"
+        );
     }
 }
 
@@ -6972,6 +7007,156 @@ async fn test_stager_follow_up_recomputes_downstream_of_a_recomputed_upstream() 
     }
 }
 
+/// A refresh's work: the live rows of `dataset` whose `output` flag is false,
+/// in scan order.
+async fn pending_addrs(dataset: &Dataset, output: &str) -> Vec<u64> {
+    let true_rows = dataset
+        .cell_flag_true_rows(flag_of(dataset, output))
+        .unwrap();
+    let mut pending = live_addrs(dataset).await;
+    pending.retain(|addr| !true_rows.contains(*addr));
+    pending
+}
+
+/// A refresh stages every pending row at one snapshot. Before it commits, a
+/// row-moving update gives id 2 a new body, and so a new address, and an
+/// in-place write changes id 4's body. Under `Skip` the publication reports
+/// id 2 vacated and defers id 4, so the follow-up plan recomputes id 4 alone.
+/// The moved row is pending at its new address, where a scan of pending rows
+/// finds it. The two refreshes complete every live row, once, with values
+/// computed from its current inputs.
+#[rstest]
+#[case::summary(&CHAIN[..1])]
+#[case::chain(&CHAIN)]
+#[tokio::test]
+async fn test_stager_refresh_finds_rows_moved_during_publication(
+    #[case] chain: &[(&str, &str)],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let read = computed_outputs_with(2, 3, chain, true, stable_row_ids).await;
+    let outputs: Vec<&str> = chain.iter().map(|(output, _)| *output).collect();
+    let stage_pending = |read: Dataset, pending: Vec<u64>| {
+        let outputs = outputs.clone();
+        async move {
+            let assigned: Vec<(&str, &[u64])> = outputs
+                .iter()
+                .map(|output| (*output, pending.as_slice()))
+                .collect();
+            let batch = computed_batch(&read, &pending, &assigned).await;
+            stage_batches(&stager_of(&read, &outputs), vec![batch])
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    let staged = stage_pending(read.clone(), pending_addrs(&read, "summary").await).await;
+
+    let moved_at = update_where(&read, "id = 2", "body", "b2-moved").await;
+    let written_at = merge_insert_body(&moved_at, 4, "b4-edited").await;
+    let result = commit_staged(&read, staged, Skip).await.unwrap();
+    let report = &result.report;
+    assert_eq!(
+        report.committed_version,
+        Some(written_at.version().version + 1)
+    );
+    assert!(report.deferred_groups.is_empty());
+    assert_eq!(report.deferred_rows.len(), 2 * outputs.len());
+    // The body write clears every output on id 4, downstream ones included.
+    for output in &outputs {
+        let flag_id = flag_of(&read, output);
+        assert_eq!(
+            report.published_rows(flag_id),
+            rows(&[(0, &[0, 2]), (1, &[1, 2])]),
+            "{output}"
+        );
+        assert_eq!(
+            report.deferred_rows_of(flag_id, RowVacated),
+            rows(&[(0, &[1])]),
+            "{output}"
+        );
+        assert_eq!(
+            report.deferred_rows_of(flag_id, InputChanged),
+            rows(&[(1, &[0])]),
+            "{output}"
+        );
+    }
+
+    let head = result.dataset;
+    let moved = values_by_addr(&head, "body")
+        .await
+        .into_iter()
+        .find_map(|(addr, body)| (body.as_deref() == Some("b2-moved")).then_some(addr))
+        .unwrap();
+    assert_ne!(RowAddress::from(moved).fragment_id(), 0);
+    // Neither id 2's vacated address nor its new one is planned.
+    let plan = stager_of(&head, &outputs).follow_up(report).await.unwrap();
+    for output in &outputs {
+        assert_eq!(
+            plan.rows(output),
+            Some(&FollowUpRows {
+                reuse: RowAddrTreeMap::new(),
+                recompute: rows(&[(1, &[0])]),
+            }),
+            "{output}"
+        );
+    }
+    let follow_up = stage_pending(head.clone(), vec![addr(1, 0)]).await;
+    let followed = commit_staged(&head, follow_up, Reject)
+        .await
+        .unwrap()
+        .dataset;
+
+    for output in &outputs {
+        assert_eq!(
+            pending_addrs(&followed, output).await,
+            vec![moved],
+            "{output}"
+        );
+    }
+    let refresh = stage_pending(followed.clone(), vec![moved]).await;
+    let completed = commit_staged(&followed, refresh, Reject)
+        .await
+        .unwrap()
+        .dataset;
+
+    let bodies = column_values(&completed, "body", None).await;
+    assert_eq!(
+        bodies,
+        (1..=6)
+            .map(|id| {
+                let body = match id {
+                    2 => "b2-moved".to_string(),
+                    4 => "b4-edited".to_string(),
+                    _ => format!("b{id}"),
+                };
+                (id, Some(body))
+            })
+            .collect::<Vec<_>>()
+    );
+    for (index, output) in outputs.iter().enumerate() {
+        assert!(
+            pending_addrs(&completed, output).await.is_empty(),
+            "{output}"
+        );
+        let expected: Vec<(i32, Option<String>)> = bodies
+            .iter()
+            .map(|(id, body)| {
+                let value = chain[..=index]
+                    .iter()
+                    .fold(body.clone(), |input, (column, _)| {
+                        Some(computed(column, input.as_deref()))
+                    });
+                (*id, value)
+            })
+            .collect();
+        assert_eq!(
+            column_values(&completed, output, None).await,
+            expected,
+            "{output}"
+        );
+    }
+}
+
 /// The publication keeps the version its values were computed at, so a
 /// write committed after it is checked against the staged rows.
 #[rstest]
@@ -7017,9 +7202,9 @@ async fn test_stager_preserves_read_version(
 
 /// With two-row copy windows and one-row batches, fragments are written one
 /// after another as the stream arrives: fragment 0's file is complete once
-/// the stream is asked for fragment 1's second row, and not before. Pulling
-/// per copy window within a fragment is pinned by
-/// `merged_windows_pull_computed_rows_lazily` in the staging module.
+/// the stream is asked for fragment 1's second row, and not before. Writing
+/// within a fragment as its rows stream is pinned by
+/// [`test_stager_writes_a_fragment_while_its_rows_stream`].
 #[tokio::test]
 async fn test_stager_streams_without_collecting() {
     let read = computed_outputs(4, &[("summary", "body")]).await;
@@ -7050,4 +7235,109 @@ async fn test_stager_streams_without_collecting() {
     let head = commit_staged(&read, staged, Reject).await.unwrap().dataset;
     assert_eq!(head.cell_flag_true_rows(summary).unwrap(), full(&[0, 1]));
     assert_visible_values_follow_inputs(&head, "summary").await;
+}
+
+/// Within one fragment, `stage` writes the rows it has before the stream
+/// yields the rest: the staged file has received bytes by the time the stream
+/// is asked for the fragment's last batch. The file writer caches 8 MiB per
+/// column before it encodes a page, so the fragment holds 12 MiB of digests,
+/// each small enough (32 KiB) to be stored uncompressed.
+#[tokio::test]
+async fn test_stager_writes_a_fragment_while_its_rows_stream() {
+    const ROWS: u32 = 384;
+    const BATCH_ROWS: u32 = 16;
+    const DIGEST_BYTES: usize = 32 * 1024;
+    let test_uri = TempStrDir::default();
+    let batch = RecordBatch::try_from_iter([
+        (
+            "body",
+            Arc::new(StringArray::from_iter_values(
+                (0..ROWS).map(|offset| format!("b{offset}")),
+            )) as ArrayRef,
+        ),
+        (
+            "digest",
+            Arc::new(BinaryArray::new_null(ROWS as usize)) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    let digest = dataset
+        .register_cell_flag(
+            "digest",
+            "ready",
+            CellFlagOptions::default()
+                .with_clear_on_write(["body"])
+                .with_mask_when_false(true),
+        )
+        .await
+        .unwrap()
+        .flag_id;
+    // The writer stages into a temporary file beside the data files.
+    let data_dir = std::path::Path::new(test_uri.as_str()).join("data");
+    let data_bytes = move || -> u64 {
+        std::fs::read_dir(&data_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum()
+    };
+    let baseline = data_bytes();
+    let digest_of = |offset: u32| vec![(offset % 251) as u8; DIGEST_BYTES];
+    let staged_at_pull = Arc::new(Mutex::new(Vec::new()));
+    let computed = stream::iter((0..ROWS).step_by(BATCH_ROWS as usize)).map({
+        let staged_at_pull = staged_at_pull.clone();
+        move |start| {
+            staged_at_pull.lock().unwrap().push(data_bytes() - baseline);
+            let offsets = start..start + BATCH_ROWS;
+            let addrs: Vec<u64> = offsets.clone().map(|offset| addr(0, offset)).collect();
+            let digests = BinaryArray::from_iter_values(offsets.map(digest_of));
+            Ok::<_, Error>(addressed(
+                &addrs,
+                vec![("digest", Arc::new(digests) as ArrayRef)],
+            ))
+        }
+    });
+
+    let staged = stager_of(&dataset, &["digest"])
+        .with_copy_batch_size(BATCH_ROWS)
+        .stage(computed)
+        .await
+        .unwrap()
+        .unwrap();
+    let staged_at_pull = staged_at_pull.lock().unwrap().clone();
+    assert_eq!(staged_at_pull.len(), (ROWS / BATCH_ROWS) as usize);
+    assert_eq!(staged_at_pull[0], 0);
+    assert!(
+        *staged_at_pull.last().unwrap() > 0,
+        "nothing was written before the last batch was pulled: {staged_at_pull:?}"
+    );
+
+    let head = commit_staged(&dataset, staged, Reject)
+        .await
+        .unwrap()
+        .dataset;
+    assert_eq!(head.cell_flag_true_rows(digest).unwrap(), full(&[0]));
+    let digests = head
+        .scan()
+        .project(&["digest"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let digests = digests["digest"].as_binary::<i32>();
+    assert_eq!(digests.len(), ROWS as usize);
+    for offset in 0..ROWS {
+        assert_eq!(
+            digests.value(offset as usize),
+            digest_of(offset).as_slice(),
+            "digest at offset {offset}"
+        );
+    }
 }
