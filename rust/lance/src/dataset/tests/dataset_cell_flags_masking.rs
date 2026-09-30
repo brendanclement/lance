@@ -1537,16 +1537,47 @@ fn id_embeddings(batch: &RecordBatch) -> Vec<(i32, Option<Vec<f32>>)> {
     pairs
 }
 
-async fn scan_id_embeddings(
-    dataset: &Dataset,
-    batch_size: Option<usize>,
-) -> Vec<(i32, Option<Vec<f32>>)> {
+/// The child values under the list slot of each of `ids` in `batch`, which a
+/// reader of the list's values, such as `lance.torch`, takes whatever the
+/// slot's validity.
+fn embedding_children(batch: &RecordBatch, ids: &[i32]) -> Vec<(i32, Vec<Option<f32>>)> {
+    let rows: HashMap<i32, usize> = batch["id"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .enumerate()
+        .map(|(row, id)| (*id, row))
+        .collect();
+    let embeddings = batch["embedding"].as_fixed_size_list();
+    ids.iter()
+        .map(|id| {
+            let children = embeddings.value(rows[id]);
+            (*id, children.as_primitive::<Float32Type>().iter().collect())
+        })
+        .collect()
+}
+
+/// What [`embedding_children`] shows for masked `ids`: no stored value.
+fn masked_children(ids: &[i32]) -> Vec<(i32, Vec<Option<f32>>)> {
+    ids.iter()
+        .map(|id| (*id, vec![None; DIM as usize]))
+        .collect()
+}
+
+async fn scan_embeddings(dataset: &Dataset, batch_size: Option<usize>) -> RecordBatch {
     let mut scan = dataset.scan();
     scan.project(&["id", "embedding"]).unwrap();
     if let Some(batch_size) = batch_size {
         scan.batch_size(batch_size);
     }
-    id_embeddings(&scan.try_into_batch().await.unwrap())
+    scan.try_into_batch().await.unwrap()
+}
+
+async fn scan_id_embeddings(
+    dataset: &Dataset,
+    batch_size: Option<usize>,
+) -> Vec<(i32, Option<Vec<f32>>)> {
+    id_embeddings(&scan_embeddings(dataset, batch_size).await)
 }
 
 /// What reads of [`masked_embeddings`] show for `ids`: only ids 0, 2 and 4
@@ -2010,11 +2041,20 @@ async fn test_masked_embeddings_on_scan_filter_and_take(
         .load()
         .await
         .unwrap();
+    // Stale e5 stays stored under id 5's masked slot, in the partly true
+    // fragment 1.
+    let masked = [5, 7, 8, 10, 11];
     for read in [&dataset, &reopened] {
         for batch_size in [None, Some(1), Some(3)] {
+            let batch = scan_embeddings(read, batch_size).await;
             assert_eq!(
-                scan_id_embeddings(read, batch_size).await,
+                id_embeddings(&batch),
                 visible_embeddings(&LIVE_IDS),
+                "batch size {batch_size:?}"
+            );
+            assert_eq!(
+                embedding_children(&batch, &masked),
+                masked_children(&masked),
                 "batch size {batch_size:?}"
             );
         }
@@ -2031,6 +2071,10 @@ async fn test_masked_embeddings_on_scan_filter_and_take(
         .await
         .unwrap();
     assert_eq!(id_embeddings(&taken), visible_embeddings(&[1, 4, 5, 8]));
+    assert_eq!(
+        embedding_children(&taken, &[5, 8]),
+        masked_children(&[5, 8])
+    );
     let mut scan = dataset.scan();
     scan.with_row_id().project(&["id"]).unwrap();
     let batch = scan.try_into_batch().await.unwrap();
@@ -2050,6 +2094,10 @@ async fn test_masked_embeddings_on_scan_filter_and_take(
     let requested: Vec<u64> = [5, 4, 8, 1].iter().map(|id| row_ids[id]).collect();
     let taken = dataset.take_rows(&requested, projection).await.unwrap();
     assert_eq!(id_embeddings(&taken), visible_embeddings(&[1, 4, 5, 8]));
+    assert_eq!(
+        embedding_children(&taken, &[5, 8]),
+        masked_children(&[5, 8])
+    );
 
     let mut scan = dataset.scan();
     scan.project(&["id", "embedding"])
@@ -2324,7 +2372,10 @@ async fn test_stale_embedding_publication_stays_masked_until_refreshed(
             )
         })
         .collect();
-    assert_eq!(scan_id_embeddings(&head, None).await, visible);
+    let batch = scan_embeddings(&head, None).await;
+    assert_eq!(id_embeddings(&batch), visible);
+    // Id 5 is masked in the partly true fragment 1, over stale e5 or e50.
+    assert_eq!(embedding_children(&batch, &[5]), masked_children(&[5]));
     let (nearest, nearest_to_e50) = if report.is_some() {
         (
             vec![

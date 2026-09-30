@@ -14,9 +14,11 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, BooleanArray, RecordBatch, new_null_array};
+use arrow_array::{Array, BooleanArray, RecordBatch, Scalar, new_null_array};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
+use arrow_schema::DataType;
 use arrow_select::nullif::nullif;
+use arrow_select::zip::zip;
 use futures::{FutureExt, StreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
@@ -200,7 +202,18 @@ impl CellFlagMasks {
                         if is_masked.count_set_bits() == 0 {
                             continue;
                         }
-                        nullif(columns[index].as_ref(), &BooleanArray::new(is_masked, None))?
+                        let is_masked = BooleanArray::new(is_masked, None);
+                        let column = &columns[index];
+                        if matches!(column.data_type(), DataType::FixedSizeList(..)) {
+                            // `nullif` would keep the stored vector under the
+                            // NULL slot, and vector readers such as
+                            // `lance.torch` read the child values as a dense
+                            // matrix without the list's validity.
+                            let null = Scalar::new(new_null_array(column.data_type(), 1));
+                            zip(&is_masked, &null, column)?
+                        } else {
+                            nullif(column.as_ref(), &is_masked)?
+                        }
                     }
                 }
             };
