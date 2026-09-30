@@ -26,7 +26,8 @@
 //! detection, so an incremental refresh keeps the rows an earlier one
 //! completed. A flag published together with a dependent flag upstream of it
 //! must, on the rows both assign, be computed from the upstream values the
-//! same transaction publishes. [`PublicationReport`] describes how concurrent
+//! same transaction publishes. [`PublicationStager`] stages such a publication
+//! from computed rows, and [`PublicationReport`] describes how concurrent
 //! transactions are checked. A flag without sources is *ordinary*: only explicit updates
 //! change it, and it cannot mask its field.
 //!
@@ -46,12 +47,8 @@
 //! # use arrow_array::RecordBatch;
 //! # use futures::stream;
 //! # use lance::{Dataset, Result};
-//! # use lance::dataset::cell_flag::{CellFlagOptions, DeferralReason};
-//! # use lance::dataset::transaction::{
-//! #     CellFlagChanges, CellFlagUpdate, Operation, TransactionBuilder,
-//! # };
+//! # use lance::dataset::cell_flag::{CellFlagOptions, PublicationStager};
 //! # use lance::dataset::{CommitBuilder, DependencyConflictPolicy, UpdateBuilder};
-//! # use lance_select::RowAddrTreeMap;
 //! # async fn example(mut dataset: Dataset, summaries: RecordBatch) -> Result<()> {
 //! // `summary` is computed from `title` and `body` and reads NULL until published.
 //! let ready = dataset
@@ -64,34 +61,25 @@
 //!     )
 //!     .await?;
 //!
-//! // A refresh reads a snapshot, computes one value per physical row of fragment 0
-//! // outside Lance, and stages them as a full-fragment file.
-//! let read = dataset.clone();
-//! let output = read.schema().project(&["summary"])?;
-//! let fragment = read.get_fragment(0).expect("fragment 0 exists");
-//! let group = fragment
-//!     .write_columns(stream::iter([Ok(summaries)]), &output)
-//!     .await?;
-//! let mut computed = RowAddrTreeMap::new();
-//! computed.insert_fragment(0);
-//! let publication = TransactionBuilder::new(
-//!     read.version().version,
-//!     Operation::DataReplacement { replacements: vec![group] },
-//! )
-//! .cell_flag_changes(CellFlagChanges {
-//!     updates: vec![CellFlagUpdate { flag_id: ready.flag_id, value: true, rows: computed }],
-//!     ..Default::default()
-//! })
-//! .build();
+//! // A refresh reads a snapshot and computes values outside Lance: `summaries`
+//! // holds `_rowaddr` and `summary` for some rows, in scan order. The stager
+//! // copies every other row from the snapshot into full-fragment files.
+//! let read = Arc::new(dataset.clone());
+//! let stager = PublicationStager::try_new(read.clone(), &["summary"])?;
+//! let Some(publication) = stager.stage(stream::iter([Ok(summaries)])).await? else {
+//!     return Ok(());
+//! };
 //!
-//! // Publish what is still valid and learn what to redo.
-//! let result = CommitBuilder::new(Arc::new(read))
+//! // Publish what is still valid, and plan the rows the report certifies or
+//! // defers, at the version it names; a moved row is pending at its new address.
+//! let result = CommitBuilder::new(read)
 //!     .with_dependency_conflict_policy(DependencyConflictPolicy::Skip)
 //!     .execute_with_report(publication)
 //!     .await?;
-//! let recompute = result.report.deferred_rows_of(ready.flag_id, DeferralReason::InputChanged);
-//! let reuse = result.report.reusable_rows(ready.flag_id);
-//! # let _ = (recompute, reuse);
+//! let published = result.report.published_rows(ready.flag_id);
+//! let follow_up = PublicationStager::try_new(Arc::new(result.dataset.clone()), &["summary"])?;
+//! let plan = follow_up.follow_up(&result.report).await?;
+//! # let _ = (published, plan);
 //!
 //! // An ordinary write to a source clears the flag in its own commit.
 //! UpdateBuilder::new(Arc::new(result.dataset))
@@ -118,12 +106,14 @@ use crate::dataset::write::CommitBuilder;
 use crate::{Dataset, Error, Result};
 
 mod publication;
+mod staging;
 
 pub use publication::{
     DeferralReason, DeferredGroup, DeferredRows, DependencyConflictPolicy, PublicationReport,
     PublicationResult,
 };
 pub(crate) use publication::{PublicationDeferrals, input_changed_rows, removed_fragments};
+pub use staging::{ComputedBatch, FollowUpPlan, FollowUpRows, PublicationStager};
 
 /// How a cell flag reacts to writes and reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

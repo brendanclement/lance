@@ -1988,6 +1988,39 @@ impl FileFragment {
         projection: &Schema,
         batch_size: u32,
     ) -> Result<ReadBatchFutStream> {
+        self.read_physical_rows(rows, projection, batch_size, false)
+            .await
+    }
+
+    /// [`Self::read_physical_slice`] with a `_rowaddr` column holding each
+    /// row's physical address, so a caller writing the rows back can check
+    /// that every batch lands at the offsets it came from. Blob projections
+    /// are refused: their descriptor rewrite drops the column.
+    pub(crate) async fn read_physical_slice_with_row_addr(
+        &self,
+        rows: Range<u64>,
+        projection: &Schema,
+        batch_size: u32,
+    ) -> Result<ReadBatchFutStream> {
+        if let Some(blob) = projection.fields_pre_order().find(|field| field.is_blob()) {
+            return Err(Error::not_supported(format!(
+                "physical slices of fragment {} cannot be read with row addresses because \
+                 '{}' is a blob field",
+                self.id(),
+                blob.name
+            )));
+        }
+        self.read_physical_rows(rows, projection, batch_size, true)
+            .await
+    }
+
+    async fn read_physical_rows(
+        &self,
+        rows: Range<u64>,
+        projection: &Schema,
+        batch_size: u32,
+        has_row_addr: bool,
+    ) -> Result<ReadBatchFutStream> {
         if batch_size == 0 {
             return Err(Error::invalid_input(
                 "read_physical_slice batch_size must be greater than zero",
@@ -2038,7 +2071,7 @@ impl FileFragment {
         scanner.limit(Some(limit), Some(offset))?;
 
         let has_blob_columns = projection.fields_pre_order().any(|field| field.is_blob());
-        if has_blob_columns {
+        if has_blob_columns || has_row_addr {
             scanner.with_row_address();
         }
         let stream = scanner.try_into_stream().await?;

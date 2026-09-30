@@ -19,7 +19,7 @@ use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema}
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::tempfile::TempStrDir;
-use lance_core::{Error, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
+use lance_core::{Error, ROW_ADDR, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_encoding::constants::PACKED_STRUCT_META_KEY;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use rstest::rstest;
@@ -1130,6 +1130,32 @@ async fn test_physical_slice_read_preserves_deleted_positions() {
         batch["id"].as_primitive::<Int32Type>().values(),
         &[1, 2, 3, 4]
     );
+    assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+
+    // The row-address variant labels every row, deleted ones included, with
+    // its physical address.
+    let batches = fragment
+        .read_physical_slice_with_row_addr(1..4, &schema, 2)
+        .await
+        .unwrap()
+        .buffered(1)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| batch["id"].as_primitive::<Int32Type>().values().to_vec())
+        .collect();
+    let addrs: Vec<u64> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch[ROW_ADDR]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!((ids, addrs), (vec![2, 3, 4], vec![1, 2, 3]));
 }
 
 async fn count_files(dataset: &Dataset) -> usize {
