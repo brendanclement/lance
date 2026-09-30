@@ -12,8 +12,8 @@
 | Worktree | `/Users/brendan/code/lance/.claude/worktrees/dependency-aware-cell-flags-43fc32` |
 | Branch | `brendan/dependency-aware-cell-flags` (not merged, no PR) |
 | Baseline | `e3671b2f5730eea927a088a42cbf30e273edc43c` (`origin/main` when the work started) |
-| Final implementation | `2fd300ac2885f07d1357a0a438ceb874d7d6a519`, the last commit that changes the prototype's code: both `FragmentReader` read funnels keep `main`'s `merge_overlays` call and apply masks afterwards through a plain function, so the read path of unmasked fields is structurally `main`'s. That removed a 3–4% slowdown of full-column reads on tables without flags in the benchmark profile. It is not a performance fix: in the shipping `release` profile the fix measures slower than the prototype, and neither build retires more instructions than `main` (see Benchmarks). Later commits change only `prototypes/`, drop a performance claim from `mask_cells`'s rustdoc, and add a benchmark (`rust/lance/benches/cell_flags_scan_counters.rs` and its `[[bench]]` entry). Before it, `93ada9bca33fd1b747826ec098c451fb1b531778`: `input_changed_rows` resolves a flag registered after the read version through the head's registry, and only a flag the head no longer knows falls back to the file's fields, so a late flag on an unrelated output no longer counts as an input change. Before `93ada9bca`, `8fa1eab0811087a8c2795ab2b10f85646139601f`: staleness checks count a concurrent publication of an upstream output as an input change of the flags computed from it, also where that publication republishes them and so records no clear (`input_changed_rows`), and a deferred group reports its rows deleted or moved since the read version as `RowVacated`. Before that, the last code commit was `25d3cf3e5d988271f05e50de1f47e9885f1b33ba` (a deferred publication file no longer certifies outputs computed from an upstream output staged in the same file, and reports them as `UpstreamNotPublished`), followed by rustdoc and tests in `rust/lance` (`9f0911398`) and `prototypes/`; before that, `26388225a273052b3a1ff0ec705c53da1b68c7cb`, and the commits between it and `25d3cf3e5` change only `prototypes/` (benchmark results, docs and benchmark tooling: `run_paired.sh` gained `ORDER` in `3e8c36ba0672102ad005c6de20858e9a82b32231` and the rustflags check in `f1fb31606`; `analyze.py` gained `--section`/`--title` and `bench/` the rerun scripts after that) and rustdoc in `rust/lance/src/dataset/cell_flag/publication.rs` (the `PublicationReport` conflict table in `4aaa8280c`, the `DependencyConflictPolicy::Reject` description in `4993d350b`) |
-| Benchmarked | Reads at `2fd300ac2`: `10m-reads-fix-*` (clean builds, flags in round 3 only) and the no-flag counters rotations in `bench/results/10m-noflag-investigation/`. Writes, publication and conflicts were not re-run at `2fd300ac2`, which changes only the read funnels. Full matrix at `21601f894` (`1m`; `10m` subset; `smoke-final`) and at `26388225a` (`1m-clean`, 1M, clean build). Reads at `26388225a` (`10m-reads-clean-*`, clean builds; `1m-reads-maskfix`, `10m-reads-maskfix`, `10m-reads-reversed`, which record `e48573011`, a results-only commit with the same code). The only code change from `21601f894` to `26388225a` is the mask builder (`fragment/cell_flag_mask.rs`). Not re-run at `25d3cf3e5`, `9f0911398` (rustdoc and tests only), `8fa1eab08` or `93ada9bca`: the code commits change only how the report classifies the staged rows of a deferred publication file (reusable, to recompute or vacated) when outputs are chained or a concurrent publication republishes an upstream output, `8fa1eab08` also rows deleted or moved while their group is deferred, and `93ada9bca` how a flag registered after the read version is resolved. No benchmark workload has any of these: none registers an output computed from another output or a flag while a publication is in flight, each publication stages one output, and the only workload that defers groups (`OutputOverride`) writes in place, deleting and moving no rows. The staleness check still scans each concurrent transaction's flag updates once per published flag, now with its replacement files |
+| Final implementation | `2883e66d66aabdd91b96b6073f47598d4671e9c5`, the last commit that changes the prototype's code: `PublicationStager` stages publications of dependent flag outputs from computed rows and plans report-driven follow-ups (see Publication staging), and `read_physical_slice` gains a crate-private variant that also returns row addresses. Later commits change only `prototypes/`. Before it, `2fd300ac2885f07d1357a0a438ceb874d7d6a519`: both `FragmentReader` read funnels keep `main`'s `merge_overlays` call and apply masks afterwards through a plain function, so the read path of unmasked fields is structurally `main`'s. It is not a proven performance fix (see Benchmarks); later commits dropped a performance claim from `mask_cells`'s rustdoc and added a portable counters benchmark (`rust/lance/benches/cell_flags_scan_counters.rs`). Before `2fd300ac2`, `93ada9bca33fd1b747826ec098c451fb1b531778`: `input_changed_rows` resolves a flag registered after the read version through the head's registry, and only a flag the head no longer knows falls back to the file's fields, so a late flag on an unrelated output no longer counts as an input change. Before `93ada9bca`, `8fa1eab0811087a8c2795ab2b10f85646139601f`: staleness checks count a concurrent publication of an upstream output as an input change of the flags computed from it, also where that publication republishes them and so records no clear (`input_changed_rows`), and a deferred group reports its rows deleted or moved since the read version as `RowVacated`. Before that, the last code commit was `25d3cf3e5d988271f05e50de1f47e9885f1b33ba` (a deferred publication file no longer certifies outputs computed from an upstream output staged in the same file, and reports them as `UpstreamNotPublished`), followed by rustdoc and tests in `rust/lance` (`9f0911398`) and `prototypes/`; before that, `26388225a273052b3a1ff0ec705c53da1b68c7cb`, and the commits between it and `25d3cf3e5` change only `prototypes/` (benchmark results, docs and benchmark tooling: `run_paired.sh` gained `ORDER` in `3e8c36ba0672102ad005c6de20858e9a82b32231` and the rustflags check in `f1fb31606`; `analyze.py` gained `--section`/`--title` and `bench/` the rerun scripts after that) and rustdoc in `rust/lance/src/dataset/cell_flag/publication.rs` (the `PublicationReport` conflict table in `4aaa8280c`, the `DependencyConflictPolicy::Reject` description in `4993d350b`) |
+| Benchmarked | Not re-run at `2883e66d6`: it adds a staging API, and the only benchmarked-code change is the shared body of `read_physical_slice`, which no benchmark workload calls. Reads at `2fd300ac2`: `10m-reads-fix-*` (clean builds, flags in round 3 only) and the no-flag counters rotations in `bench/results/10m-noflag-investigation/`. Writes, publication and conflicts were not re-run at `2fd300ac2`, which changes only the read funnels. Full matrix at `21601f894` (`1m`; `10m` subset; `smoke-final`) and at `26388225a` (`1m-clean`, 1M, clean build). Reads at `26388225a` (`10m-reads-clean-*`, clean builds; `1m-reads-maskfix`, `10m-reads-maskfix`, `10m-reads-reversed`, which record `e48573011`, a results-only commit with the same code). The only code change from `21601f894` to `26388225a` is the mask builder (`fragment/cell_flag_mask.rs`). Not re-run at `25d3cf3e5`, `9f0911398` (rustdoc and tests only), `8fa1eab08` or `93ada9bca`: the code commits change only how the report classifies the staged rows of a deferred publication file (reusable, to recompute or vacated) when outputs are chained or a concurrent publication republishes an upstream output, `8fa1eab08` also rows deleted or moved while their group is deferred, and `93ada9bca` how a flag registered after the read version is resolved. No benchmark workload has any of these: none registers an output computed from another output or a flag while a publication is in flight, each publication stages one output, and the only workload that defers groups (`OutputOverride`) writes in place, deleting and moving no rows. The staleness check still scans each concurrent transaction's flag updates once per published flag, now with its replacement files |
 
 Checks on the benchmarked code `26388225a` (run at `f1fb31606`, whose Rust, proto, Python and Java
 sources equal it): `cargo fmt --all -- --check`; `cargo clippy --all --tests --benches -- -D
@@ -26,7 +26,24 @@ source changed, only the Rust binding's struct literal. Java and Python tests we
 `4aaa8280c` (same code as `26388225a`): `cargo test -p lance --doc -- cell_flag
 with_dependency_conflict_policy execute_with_report` (10 passed).
 
-Checks on the final code, at `2fd300ac2` (which changes only `rust/lance/src/dataset/fragment.rs`),
+Checks on the final code, at `2883e66d6` (which changes only `rust/lance`):
+- `cargo fmt --all -- --check`
+- `cargo clippy --all --tests --benches -- -D warnings`
+- `cargo test -p lance --lib`: 4516 passed, 3 ignored.
+- `cargo test -p lance --doc -- cell_flag staging PublicationStager ComputedBatch FollowUpPlan`: 15
+  passed.
+- `cargo doc -p lance --no-deps` with broken and private intra-doc links denied.
+
+Every stager test case takes under 0.2 s. Each check the stager adds was also mutation-tested (see
+the Tests table). Not run: `python/`, `java/lance-jni/` and the lance-table tests, since nothing
+outside `rust/lance` changed; the MSRV (1.91) build, since only 1.97 is installed here; and a Linux
+build of the stager.
+
+The counters bench (`3f3f07c83`) was checked on macOS with `cargo clippy -p lance --bench
+cell_flags_scan_counters -- -D warnings`. On Linux, in a local aarch64 container, it passed
+`cargo check` and ran to completion.
+
+Checks on the code at `2fd300ac2` (which changes only `rust/lance/src/dataset/fragment.rs`),
 run with the counters bench and its `[[bench]]` entry added:
 - `cargo fmt --all -- --check`
 - `cargo clippy --all --tests --benches -- -D warnings`
@@ -109,6 +126,8 @@ Rust only (`lance` and `lance-table`).
 | `CommitBuilder::with_dependency_conflict_policy(DependencyConflictPolicy::{Reject, Skip})` | default `Reject` |
 | `CommitBuilder::execute_with_report(Transaction) -> Result<PublicationResult>` | `PublicationResult { dataset, report }` |
 | `PublicationReport { read_version, checked_version, committed_version, published, deferred_rows, deferred_groups }`, `published_rows`, `reusable_rows`, `deferred_rows_of` | `DeferredRows`, `DeferredGroup`, `DeferralReason::{InputChanged, RowVacated, UpstreamNotPublished, NewerResult, OutputWritten, FragmentRemoved, FragmentRewritten}` in `lance::dataset::cell_flag` |
+| `PublicationStager::try_new(snapshot, outputs)`, `flag_id(output)`, `stage(computed) -> Result<Option<Transaction>>`, `follow_up(&report) -> Result<FollowUpPlan>` | `lance::dataset::cell_flag`; stages a publication from computed rows, which the caller commits with `CommitBuilder` (see Publication staging) |
+| `ComputedBatch::new(batch)`, `with_assigned(output, mask)`; `FollowUpPlan::rows(output)`, `is_empty()`; `FollowUpRows { reuse, recompute }` | `lance::dataset::cell_flag` |
 | `CellFlagDefinition`, `CellFlagRegistry` (`Manifest::cell_flags`) | `lance_table::format` |
 
 Callers never supply `derived_invalidations`: the commit recomputes them against the head on every
@@ -127,33 +146,24 @@ let ready = dataset
     )
     .await?;
 
-// A refresh reads a snapshot, computes one value per physical row of fragment 0
-// outside Lance, and stages them as a full-fragment file.
-let read = dataset.clone();
-let output = read.schema().project(&["summary"])?;
-let fragment = read.get_fragment(0).expect("fragment 0 exists");
-let group = fragment
-    .write_columns(stream::iter([Ok(summaries)]), &output)
-    .await?;
-let mut computed = RowAddrTreeMap::new();
-computed.insert_fragment(0);
-let publication = TransactionBuilder::new(
-    read.version().version,
-    Operation::DataReplacement { replacements: vec![group] },
-)
-.cell_flag_changes(CellFlagChanges {
-    updates: vec![CellFlagUpdate { flag_id: ready.flag_id, value: true, rows: computed }],
-    ..Default::default()
-})
-.build();
+// A refresh reads a snapshot and computes values outside Lance: `summaries`
+// holds `_rowaddr` and `summary` for some rows, in scan order. The stager
+// copies every other row from the snapshot into full-fragment files.
+let read = Arc::new(dataset.clone());
+let stager = PublicationStager::try_new(read.clone(), &["summary"])?;
+let Some(publication) = stager.stage(stream::iter([Ok(summaries)])).await? else {
+    return Ok(());
+};
 
-// Publish what is still valid and learn what to redo.
-let result = CommitBuilder::new(Arc::new(read))
+// Publish what is still valid, and plan the rows the report certifies or
+// defers, at the version it names; a moved row is pending at its new address.
+let result = CommitBuilder::new(read)
     .with_dependency_conflict_policy(DependencyConflictPolicy::Skip)
     .execute_with_report(publication)
     .await?;
-let recompute = result.report.deferred_rows_of(ready.flag_id, DeferralReason::InputChanged);
-let reuse = result.report.reusable_rows(ready.flag_id);
+let published = result.report.published_rows(ready.flag_id);
+let follow_up = PublicationStager::try_new(Arc::new(result.dataset.clone()), &["summary"])?;
+let plan = follow_up.follow_up(&result.report).await?;
 
 // An ordinary write to a source clears the flag in its own commit.
 UpdateBuilder::new(Arc::new(result.dataset))
@@ -163,6 +173,10 @@ UpdateBuilder::new(Arc::new(result.dataset))
     .execute()
     .await?;
 ```
+
+A caller can still build a publication by hand (`FileFragment::write_columns` plus a
+`TransactionBuilder` with `CellFlagChanges`), as the tests of deliberately broken files do; it
+then owns the copy-through contract below.
 
 ## Publication contract
 
@@ -200,6 +214,67 @@ Every true assignment is validated against the read version before the rebase: e
 be a physical row of its fragment, and each assigned fragment needs a group whose file writes the
 flag's output. An invalid publication fails with `InvalidInput` even when a concurrent commit
 would have deferred the offending group.
+
+## Publication staging
+
+`PublicationStager` (`rust/lance/src/dataset/cell_flag/staging.rs`) builds a publication from
+computed rows against one snapshot, so a caller supplies only what it computed.
+
+**Inputs.**
+- `ComputedBatch`es hold a `_rowaddr` column (physical addresses at the snapshot) and the output
+  columns they assign. A column's presence, narrowed by an optional per-output mask, marks the
+  rows it assigns. Values never do, so a computed NULL is published and sets the flag true, while
+  an unassigned cell is copied.
+- Each fragment's rows arrive together, with strictly ascending offsets. An ordered scan of the
+  snapshot with row addresses satisfies this.
+
+**Output.** `stage` returns an ordinary `DataReplacement` transaction:
+- read at the snapshot's version;
+- one file per fragment with an assigned row, of exactly its physical rows, writing every declared
+  output in schema order;
+- one `CellFlagUpdate { value: true }` per output, with `Partial` rows. An output that assigns
+  nothing gets an empty update, so its copied cells clear neither its flag nor its downstream
+  flags.
+
+The caller commits it through `CommitBuilder` with either policy. The commit's checks and the
+report are unchanged.
+
+**Copy-through by construction.** Every unassigned cell is copied from the same snapshot through
+`read_physical_slice`: overlays merged, NULL where a masking flag is false, and deleted positions
+kept. Each copy window is checked against its own row addresses. A masked stale value is therefore
+written back as NULL, which is what readers see; dropping the flag later shows NULL, not the stale
+value.
+
+**Refused before anything is written or committed**, with `InvalidInput` unless noted:
+- *Rows:* addresses of other or revisited fragments, out of order, duplicated, past the physical
+  rows, or deleted at the snapshot.
+- *Columns:* undeclared columns, wrong types, and NULL for a non-nullable output.
+- *Outputs:* names that are not top-level fields or have no dependent flag; blob and JSON outputs
+  and V1 datasets (`NotSupported`).
+- *Layout:* outputs stored in a fragment's data files next to outputs that are only
+  metadata-declared there, which one replacement file cannot express.
+- *Chains:* outputs linked through a dependent output the stager does not declare, and a row that
+  assigns an output and one it depends on but not the declared output between them. The commit
+  would clear the one between and carry the clear on to the downstream output.
+
+**Memory.** `write_columns` pulls the merge window by window. The stager holds the caller batches
+overlapping one copy window, two copy windows and one staged batch. The copy scan's own decode
+and IO read-ahead, at the scanner defaults, is outside that bound.
+
+**Follow-up.** `follow_up(report)` runs at exactly `committed_version.unwrap_or(checked_version)`
+and returns, per output:
+- `reuse`: rows the report still certifies whose flag is false there;
+- `recompute`: rows deferred `InputChanged` or `UpstreamNotPublished`, plus every row on which the
+  plan assigns an upstream output.
+
+Both sets hold live rows only, and never rows already true, so a newer result is left to copy
+through. Rows vacated by a delete or a move, and removed or rewritten fragments, are not planned: a
+pending-row refresh picks up moved rows at their new addresses.
+
+**Not verified.** Lance does not check that values were computed from the declared inputs, nor
+that a downstream output assigned with its upstream was computed from that upstream value. Staged
+files of a transaction that is dropped, fails to commit or has groups deferred stay in the data
+directory until `cleanup_old_versions` removes them.
 
 ## Conflicts and the `Skip` policy
 
@@ -306,6 +381,9 @@ Supported:
   fragments.
 - Publication through `DataReplacement` on several fragments, incremental (copy-through), with
   sibling outputs in one file, under `Reject` or `Skip`, across commit retries.
+- Publication staging from computed rows (`PublicationStager`) and report-driven follow-ups
+  (`follow_up`), under either policy, on several fragments and outputs, with deletions, overlays and
+  stable row ids.
 - Registration drop and replace, which fence older publishers; registering or dropping a masking
   flag clears the flags watching its field. Restore keeps flag ids monotonic; shallow and deep
   clones keep the registry.
@@ -369,6 +447,7 @@ Requirements from the task, with the tests that cover them (files under
 | S | Staged writes: the clears they record, and retries over a dropped mask they read through | `cell_flags::test_partial_merge_insert_records_offsets_only_when_read`; `update::test_rewrite_retries_over_drop_of_the_mask_it_read_through` |
 | R | A deferred file's values computed from an upstream it also stages are reported for recomputation (`UpstreamNotPublished`), never as reusable; independent outputs stay reusable | `publication::test_deferred_group_recomputes_outputs_of_its_staged_upstream` (the review's case; a follow-up that follows the report: translating alone, after republishing summary, or with summary in one file), `test_deferred_group_defers_only_rows_its_upstream_assigns` (partially overlapping assignments), `test_deferred_group_defers_each_link_of_a_chain` (three outputs in one file; a follow-up restaging them in one file recomputes the reusable values whose input it republishes), `test_retry_keeps_chained_outputs_of_a_deferred_group_unreusable` (group deferred on the retry, or invalidated during it), `test_deferred_group_keeps_independent_outputs_reusable`. Each checks that every assigned row is reported once and that every reusable staged value is the function of its input at the head |
 | I | A concurrent input change the competitor recorded no clear for (it republished the downstream output with a new upstream value) defers the staged rows as `InputChanged`, never as reusable; rows moved or deleted while their group was deferred are `RowVacated` | `publication::test_deferred_group_defers_rows_whose_upstream_was_republished` (competitor committed before the check, during the retry, or after an earlier attempt deferred the group; partially overlapping rows: the row whose clear was recorded and the one whose clear was not are both deferred, with their sibling, the third stays reusable), `test_deferred_group_defers_rows_whose_published_upstream_was_recomputed` (an upstream already true at the read version, recomputed with a new value), `test_deferred_group_defers_each_link_a_competitor_republishes` (three-level chain; the competitor publishes summary and translation, translation and keywords, the whole chain, or keywords alone), `test_flag_registered_after_the_read_is_resolved` (the upstream's flag registered after the read, unmasked, dropped again or not; an unrelated late flag leaves the row reusable), `test_late_flag_on_an_unrelated_output_changes_no_input` (a late flag on an unrelated output, published by a file that also writes summary, changes no input of translation, under both policies, for an installed group and for one deferred by an earlier attempt: the head's registry resolves it, or, dropped again, it cannot be summary's flag, which the competitor also publishes on the same or the other fragment), `test_deferred_group_keeps_independent_outputs_reusable` (a competitor publishing one or both independent outputs), `test_deferred_group_reports_rows_moved_or_deleted_as_vacated` (update, delete, and a full-row upsert or delete during the retry). Each checks the full report, `reusable_rows`, that every assigned row is reported once, flag state and values, that the competitor's values and flags are unchanged and, for input changes, a follow-up that restages the deferred file from the report: it reuses exactly the reusable staged values, recomputes the deferred rows from the head, keeps the newer results and leaves every visible value the function of its inputs |
+| P | Publication staging from computed rows | `publication::test_stager_*`, 20 functions: incremental refresh across four batchings, computed NULL against unassigned, deleted rows (assigned at the snapshot, copied, deleted by a competitor under both policies), several fragments and outputs with masks, an output with an empty assignment (kept flags, proto round trip, fence), copy-through of overlays and masked stale values, a concurrent newer publication under both policies, three follow-ups combining the stager with the report (deferred work, a planned upstream, a recomputed upstream), read-version preservation, invalid outputs, chains through undeclared or skipped outputs, mixed layouts, invalid computed rows, nothing to publish, streaming. Unit tests in `cell_flag/staging.rs` (`merged_windows_pull_computed_rows_lazily`) and `cell_flag/staging/merge.rs` cover the per-window pull and merge. Disabling any refusal above, the empty update, the follow-up's version check, its subtraction of true and deleted rows or its upstream propagation, or the per-window pull in the merge makes at least one test fail. A buffering of a fragment's rows placed before the merge starts is not detected |
 
 `test_refresh_loop_never_shows_a_stale_output` runs the whole loop on three fragments with
 `summary <- title, body` and `translation <- body, language`, and checks every version by time
@@ -548,11 +627,15 @@ S3 was not measured.
 
 Correctness risks:
 
-- **Trusted publication contents.** Lance cannot verify the copy-through contract (unassigned rows
-  copied unchanged) or the chained-output contract. A buggy executor that writes placeholders for
-  copied rows publishes them under true flags.
+- **Trusted publication contents.** `PublicationStager` meets the copy-through contract by
+  construction. A publication built by hand still depends on the caller copying unassigned rows
+  unchanged, which Lance cannot verify. Lance verifies neither that values were computed from their
+  declared inputs nor the chained-output contract, so wrong computed values publish under true
+  flags.
 - **Staged work retention.** Deferred groups' staged files are unreferenced, so
-  `cleanup_old_versions` may delete them once they age out; there is no lease.
+  `cleanup_old_versions` may delete them once they age out; there is no lease. The files of a
+  staged transaction that is dropped or fails to commit also stay until cleanup, and a retry loop
+  under `Reject` accumulates them.
 - **Unclassified future operations.** State is keyed by physical row address. Every operation must
   either be handled or refused by the commit gate; a new `Operation` variant or row-moving writer
   that bypasses it would misplace or drop flag state.
