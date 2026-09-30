@@ -17,9 +17,13 @@
 //! - `allocated_bytes`: the sizes they requested, a `realloc` counting its new
 //!   size (allocation volume);
 //! - `peak_live_growth_bytes`: the most bytes live at once above those live
-//!   at the sample's start (peak memory, which volume does not bound).
+//!   at the region's start (peak memory, which volume does not bound). Both
+//!   count requested capacity, not resident memory.
 //!
 //! All count every thread of the process.
+
+// Each bench binary uses a different subset of these helpers.
+#![allow(dead_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -47,6 +51,12 @@ pub fn count_from_env() -> bool {
 
 pub fn is_counting() -> bool {
     COUNTING.load(Ordering::Relaxed)
+}
+
+/// Bytes live now, as counted; only differences between readings mean
+/// anything.
+pub fn live_bytes() -> i64 {
+    LIVE_BYTES.load(Ordering::Relaxed)
 }
 
 /// The system allocator, counting what passes through it while counting is on.
@@ -127,6 +137,11 @@ impl Allocations {
             bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
             live_bytes,
         }
+    }
+
+    /// Bytes live when the region started.
+    pub fn live_bytes(&self) -> i64 {
+        self.live_bytes
     }
 
     /// What was allocated since `self`, or `None` when counting is off.

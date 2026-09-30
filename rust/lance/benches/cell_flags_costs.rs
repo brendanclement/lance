@@ -25,13 +25,30 @@
 //! and `masked` (`one`) get an in-place `body` write on 1%, 50% or all rows,
 //! which clears their flag, and `null_1pct`, `null_50pct` and `null_all`
 //! (`plain`) store `summary` NULL there and get the same write, so each pair
-//! reads the same visible data. `pending_<topology>` and `plain_empty` never
-//! store their outputs. `<topology>_h16` and `_h64` take 16 or 64 row-moving
-//! `body` updates of 100 rows, and `<topology>_dense` one of every tenth row,
-//! left pending.
+//! reads the same visible data. `ready_moved` (`one`) and `plain_moved` get a
+//! row-moving `views` update of 1% of rows: every flag stays true, but on
+//! fragments that lost rows, so reads take the per-row mask path where
+//! `one`'s whole-fragment states skip it. `pending_<topology>` and
+//! `plain_empty` never store their outputs. `<topology>_h16` and `_h64` take
+//! 16 or 64 row-moving `body` updates of 100 rows, and `<topology>_dense` one
+//! of every tenth row, left pending; `one_h16r`, `one_h64r` and their `plain_`
+//! pairs refresh `summary` after every update instead.
 //!
-//! Measure mode runs the workloads `BENCH_WORKLOADS` names (`list` mode
-//! prints them all). Reads use the root tables. Every other sample works on a
+//! What the refresh workloads write depends on where the pending rows are. A
+//! row-moving write puts them in a new fragment, and the refresh stages that
+//! fragment only. An in-place write leaves them scattered over the table's
+//! fragments, and both the stager and a plain `merge_insert` in
+//! `RewriteColumns` mode rewrite the refreshed columns of every fragment
+//! touched (all ten, for 100 scattered rows); `_rewrite_rows` measures
+//! `merge_insert` rewriting whole rows instead. Pending rows are found the way
+//! the prototype documents, with a scan of live row addresses less each
+//! flag's true rows: caller-side code whose cost grows with the table's rows.
+//! A plain table's refresh finds the rows it wrote with a filter instead, so
+//! its `locate` phase is the flagged `find` and `read_inputs` together, and
+//! its `merge` phase is `merge_insert`'s write, join included.
+//!
+//! Measure mode runs the workloads `BENCH_WORKLOADS` names exactly (`list`
+//! mode prints them all). Reads use the root tables. Every other sample works on a
 //! copy of its table under `BENCH_SCRATCH_DIR` (default `<root>-scratch`),
 //! cloned with `cp -Rc` (APFS clonefile; `cp --reflink=auto` elsewhere) so
 //! every sample starts from the same bytes and history, then read once so
@@ -43,9 +60,18 @@
 //! cycles where available (`cell_flags_common/counters.rs`), the object
 //! store's bytes and requests (lance-io `test-util` counters), and with
 //! `BENCH_COUNT_ALLOCATIONS=1` allocation volume and peak live growth
-//! (`cell_flags_common/alloc.rs`); plus the manifest and transaction file
-//! sizes of the version it ends at. Output values are computed outside every
-//! phase, so no phase includes the function's own computation.
+//! (`cell_flags_common/alloc.rs`); plus the metadata sizes of the version it
+//! ends at (reads and reopens: the root table's). A phase's peak is above the
+//! bytes live at its start; a sample's is the most live during any of its
+//! phases above those live when it started. Both count requested capacity,
+//! such as the 5 MiB buffer every manifest write reserves, not resident
+//! memory. Lance inlines a transaction of up to 20 MiB into the manifest
+//! file, so `manifest_bytes` holds that copy too; `manifest_struct_bytes` is
+//! the manifest proper (fragments, schema, flag state) that every open reads
+//! and every commit rewrites. Output values are computed outside every phase,
+//! so no phase includes the function's own computation. Workloads run in a
+//! rotated order, reversed on every other pass, so each runs after both of
+//! its neighbours.
 //!
 //! ```bash
 //! BENCH_COUNTERS_MODE=create BENCH_COUNTERS_URI=/abs/root BENCH_SCALE_ROWS=1000000 <binary>
@@ -83,7 +109,9 @@ use arrow_array::types::{Int64Type, UInt64Type};
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, new_null_array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::{TryStreamExt, stream};
-use lance::dataset::cell_flag::{CellFlagOptions, PublicationReport, PublicationStager};
+use lance::dataset::cell_flag::{
+    CellFlagOptions, DeferralReason, PublicationReport, PublicationStager,
+};
 use lance::dataset::transaction::{
     CellFlagChanges, CellFlagUpdate, Operation, Transaction, TransactionBuilder,
 };
@@ -229,6 +257,15 @@ enum State {
     /// Published, then one row-moving `body` update of every tenth row, left
     /// pending.
     DenseHistory,
+    /// Published, then this many row-moving `body` updates of
+    /// [`HISTORY_ROWS`] scattered rows each, each followed by a refresh of
+    /// `summary`: a publication, or on a plain table a `merge_insert`.
+    RefreshedHistory(u64),
+    /// Published, then a row-moving `views` update of this many rows per
+    /// thousand, which clears no flag.
+    UnrelatedMoved {
+        per_mille: u64,
+    },
 }
 
 struct TableSpec {
@@ -245,7 +282,7 @@ const fn spec(name: &'static str, topology: Topology, state: State) -> TableSpec
     }
 }
 
-const TABLES: [TableSpec; 22] = [
+const TABLES: [TableSpec; 28] = [
     spec("plain", Topology::Plain, State::Published),
     spec("one", Topology::One, State::Published),
     spec("shared", Topology::Shared, State::Published),
@@ -288,17 +325,32 @@ const TABLES: [TableSpec; 22] = [
     spec("chain_h64", Topology::Chain, State::SparseHistory(64)),
     spec("plain_dense", Topology::Plain, State::DenseHistory),
     spec("one_dense", Topology::One, State::DenseHistory),
+    spec("plain_h16r", Topology::Plain, State::RefreshedHistory(16)),
+    spec("one_h16r", Topology::One, State::RefreshedHistory(16)),
+    spec("plain_h64r", Topology::Plain, State::RefreshedHistory(64)),
+    spec("one_h64r", Topology::One, State::RefreshedHistory(64)),
+    spec(
+        "ready_moved",
+        Topology::One,
+        State::UnrelatedMoved { per_mille: 10 },
+    ),
+    spec(
+        "plain_moved",
+        Topology::Plain,
+        State::UnrelatedMoved { per_mille: 10 },
+    ),
 ];
 
 /// Flagged tables and the plain tables that read the same visible data.
-const READ_PAIRS: [(&str, &str); 4] = [
+const READ_PAIRS: [(&str, &str); 5] = [
     ("one", "plain"),
+    ("ready_moved", "plain_moved"),
     ("partial_1pct", "null_1pct"),
     ("partial_50pct", "null_50pct"),
     ("masked", "null_all"),
 ];
 
-const HISTORY_TABLES: [&str; 12] = [
+const HISTORY_TABLES: [&str; 16] = [
     "plain",
     "one",
     "shared",
@@ -311,6 +363,10 @@ const HISTORY_TABLES: [&str; 12] = [
     "chain_h64",
     "plain_dense",
     "one_dense",
+    "plain_h16r",
+    "one_h16r",
+    "plain_h64r",
+    "one_h64r",
 ];
 
 fn table_spec(name: &str) -> &'static TableSpec {
@@ -322,14 +378,18 @@ fn table_spec(name: &str) -> &'static TableSpec {
 
 fn cleared_ids(state: State, rows: u64) -> RoaringTreemap {
     match state {
-        State::Cleared { per_mille: 10 } => scattered_ids(rows, rows / 100, SEED_ONE_PERCENT)
-            .into_iter()
-            .collect(),
+        State::Cleared { per_mille: 10 } | State::UnrelatedMoved { per_mille: 10 } => {
+            scattered_ids(rows, rows / 100, SEED_ONE_PERCENT)
+                .into_iter()
+                .collect()
+        }
         State::Cleared { per_mille: 500 } => scattered_ids(rows, rows / 2, SEED_HALF)
             .into_iter()
             .collect(),
         State::Cleared { per_mille: 1000 } => (0..rows).collect(),
-        State::Cleared { per_mille } => panic!("no cleared set of {per_mille} per mille"),
+        State::Cleared { per_mille } | State::UnrelatedMoved { per_mille } => {
+            panic!("no set of {per_mille} rows per mille")
+        }
         _ => RoaringTreemap::new(),
     }
 }
@@ -433,8 +493,9 @@ async fn create_table(root: &Path, spec: &TableSpec, config: &BenchConfig) -> Da
     }
 
     let cleared = cleared_ids(spec.state, total);
-    let stored_nulls =
-        (spec.topology == Topology::Plain && !cleared.is_empty()).then_some(&cleared);
+    let stored_nulls = (spec.topology == Topology::Plain
+        && matches!(spec.state, State::Cleared { .. }))
+    .then_some(&cleared);
     let mut dataset = populate(dataset, &flag_ids, stored_nulls).await;
     match spec.state {
         State::Cleared { .. } => {
@@ -449,6 +510,19 @@ async fn create_table(root: &Path, spec: &TableSpec, config: &BenchConfig) -> Da
             }
         }
         State::DenseHistory => dataset = update_body(dataset, "id % 10 = 3").await.0,
+        State::RefreshedHistory(updates) => {
+            for update in 0..updates {
+                let ids = scattered_ids(total, HISTORY_ROWS, SEED_HISTORY + update);
+                dataset = update_body(dataset, &id_in_predicate(&ids)).await.0;
+                dataset = Box::pin(refresh_summaries(dataset, spec.topology, &ids)).await;
+            }
+        }
+        State::UnrelatedMoved { .. } => {
+            let ids: Vec<u64> = cleared.iter().collect();
+            let predicate = id_in_predicate(&ids);
+            let (moved, _) = update_rows(Arc::new(dataset), &predicate, "views", "views + 1").await;
+            dataset = Arc::unwrap_or_clone(moved);
+        }
         State::Published | State::Pending => {}
     }
     dataset
@@ -520,6 +594,44 @@ async fn update_body(dataset: Dataset, predicate: &str) -> (Dataset, u64) {
     let (dataset, rows) =
         update_rows(Arc::new(dataset), predicate, "body", "concat(body, '!')").await;
     (Arc::unwrap_or_clone(dataset), rows)
+}
+
+/// Bring `summary` of the rows just written to `ids` up to date: publish it,
+/// or on a plain table rewrite it with `merge_insert`.
+async fn refresh_summaries(dataset: Dataset, topology: Topology, ids: &[u64]) -> Dataset {
+    let outputs = [Output::Summary];
+    if topology == Topology::Plain {
+        let inputs = filter_inputs(&dataset, &id_in_predicate(ids)).await;
+        let source = merge_source(
+            &dataset,
+            &inputs,
+            &outputs,
+            compute(&inputs, &outputs, None),
+        );
+        let dataset = Arc::new(dataset);
+        let uncommitted = merge_uncommitted(
+            dataset.clone(),
+            source,
+            MergeInsertWriteMode::RewriteColumns,
+        )
+        .await;
+        return commit_merge(dataset, uncommitted).await;
+    }
+    assert_eq!(
+        topology.flagged(),
+        outputs,
+        "histories refresh `one` tables"
+    );
+    let pending = pending_rows(&dataset, &outputs).await;
+    let inputs = read_inputs(&dataset, &pending).await;
+    let computed = computed_batch(&inputs, &outputs, compute(&inputs, &outputs, None));
+    let snapshot = Arc::new(dataset);
+    let publication = stage(&snapshot, &outputs, vec![computed]).await;
+    let result = publish(snapshot, publication, DependencyConflictPolicy::Reject)
+        .await
+        .expect("publish the history's refresh");
+    assert_published(&result.report, &result.dataset, &outputs, pending.len());
+    result.dataset
 }
 
 fn flag_id(dataset: &Dataset, output: Output) -> u32 {
@@ -769,6 +881,9 @@ enum Workload {
         shape: Shape,
         table: Topology,
         refresh: Topology,
+        /// On a plain table, `merge_insert` rewrites whole rows
+        /// (`RewriteRows`) instead of the refreshed columns.
+        rewrite_rows: bool,
     },
     /// Publish every row of never-stored outputs; on `plain_empty`, write
     /// them with one `DataReplacement`.
@@ -816,10 +931,17 @@ impl Workload {
                         shape,
                         table,
                         refresh,
+                        rewrite_rows: false,
                     });
                 }
             }
         }
+        all.push(Self::Cycle {
+            shape: Shape::InPlaceSparse,
+            table: Topology::Plain,
+            refresh: Topology::One,
+            rewrite_rows: true,
+        });
         for refresh in Topology::FLAGGED {
             for table in [refresh, Topology::Plain] {
                 all.push(Self::Backfill { table, refresh });
@@ -877,11 +999,13 @@ impl Workload {
                 shape,
                 table,
                 refresh,
+                rewrite_rows,
             } => format!(
-                "cycle_{}_{}{}",
+                "cycle_{}_{}{}{}",
                 shape.name(),
                 on_plain(table),
-                refresh.name()
+                refresh.name(),
+                if rewrite_rows { "_rewrite_rows" } else { "" }
             ),
             Self::Backfill { table, refresh } => {
                 format!("backfill_{}{}", on_plain(table), refresh.name())
@@ -945,6 +1069,8 @@ struct Phase {
     instructions: Option<u64>,
     cycles: Option<u64>,
     allocated: Option<AllocationDelta>,
+    /// Bytes live at the phase's start above those live at the sample's.
+    live_offset: i64,
     /// `None` where no object store is metered (a new `Session`'s open).
     io: Option<IoDelta>,
 }
@@ -954,6 +1080,8 @@ struct Recorder {
     hardware: bool,
     io: Option<IoMeter>,
     phases: Vec<Phase>,
+    /// Bytes live when the sample started.
+    live_bytes: i64,
 }
 
 impl Recorder {
@@ -962,6 +1090,7 @@ impl Recorder {
             hardware,
             io: None,
             phases: Vec::new(),
+            live_bytes: allocations::live_bytes(),
         }
     }
 
@@ -998,6 +1127,7 @@ impl Recorder {
                 instructions: delta(after.instructions, before.instructions),
                 cycles: delta(after.cycles, before.cycles),
                 allocated,
+                live_offset: allocations.live_bytes() - self.live_bytes,
                 io: self.io.as_ref().map(IoMeter::take),
             });
             output
@@ -1008,7 +1138,7 @@ impl Recorder {
         Sample {
             phases: self.phases,
             rows,
-            sizes: version_file_sizes(end).await,
+            sizes: Sizes::of(end).await,
             extra,
         }
     }
@@ -1017,17 +1147,68 @@ impl Recorder {
 struct Sample {
     phases: Vec<Phase>,
     rows: u64,
-    /// Manifest and transaction file bytes of the version the sample ends at.
-    sizes: (Option<u64>, Option<u64>),
+    sizes: Sizes,
     extra: Map<String, Value>,
+}
+
+/// Metadata file sizes of a version.
+#[derive(Debug, Clone, Copy)]
+struct Sizes {
+    /// The manifest file, including the inline transaction.
+    manifest_bytes: u64,
+    /// The manifest proper, and the file's footer.
+    manifest_struct_bytes: u64,
+    inline_transaction_bytes: Option<u64>,
+    /// The separate transaction file.
+    transaction_bytes: Option<u64>,
+}
+
+impl Sizes {
+    /// Reads the manifest's footer from the local file system.
+    async fn of(dataset: &Dataset) -> Self {
+        let location = dataset.manifest_location();
+        let path = Path::new("/").join(location.path.as_ref());
+        let bytes = std::fs::read(&path).expect("read the manifest file");
+        let len = bytes.len();
+        // A Lance footer: the manifest struct's position, the version, "LANC".
+        assert!(
+            len >= 16 && bytes.ends_with(b"LANC"),
+            "{} is not a manifest",
+            path.display()
+        );
+        let position = u64::from_le_bytes(bytes[len - 16..len - 8].try_into().expect("8 bytes"));
+        let manifest = dataset.manifest();
+        Self {
+            manifest_bytes: len as u64,
+            manifest_struct_bytes: len as u64 - position,
+            inline_transaction_bytes: manifest
+                .transaction_section
+                .map(|start| position - start as u64),
+            transaction_bytes: version_file_sizes(dataset).await.1,
+        }
+    }
+
+    fn insert_into(self, record: &mut Map<String, Value>) {
+        record.insert("manifest_bytes".into(), json!(self.manifest_bytes));
+        record.insert(
+            "manifest_struct_bytes".into(),
+            json!(self.manifest_struct_bytes),
+        );
+        record.insert(
+            "inline_transaction_bytes".into(),
+            json!(self.inline_transaction_bytes),
+        );
+        record.insert("transaction_bytes".into(), json!(self.transaction_bytes));
+    }
 }
 
 fn sum(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
     values.sum()
 }
 
-/// A phase's counters, or the sum of a sample's (the peak is the largest).
-fn counters_json(phases: &[&Phase]) -> Map<String, Value> {
+/// One phase's counters, or with `is_sample` the sum of a sample's, whose peak
+/// is the most bytes live during any phase above those live at its start.
+fn counters_json(phases: &[&Phase], is_sample: bool) -> Map<String, Value> {
     let allocated = |f: fn(&AllocationDelta) -> u64| -> Option<u64> {
         sum(phases.iter().map(|phase| phase.allocated.as_ref().map(f)))
     };
@@ -1043,7 +1224,12 @@ fn counters_json(phases: &[&Phase]) -> Map<String, Value> {
         "allocated_bytes": allocated(|delta| delta.allocated_bytes),
         "peak_live_growth_bytes": phases
             .iter()
-            .map(|phase| phase.allocated.map(|delta| delta.peak_live_growth_bytes))
+            .map(|phase| {
+                let offset = if is_sample { phase.live_offset } else { 0 };
+                phase
+                    .allocated
+                    .map(|delta| (offset + delta.peak_live_growth_bytes as i64).max(0) as u64)
+            })
             .collect::<Option<Vec<_>>>()
             .map(|peaks| peaks.into_iter().max().unwrap_or(0)),
         "read_iops": io(|delta| delta.read_iops),
@@ -1064,8 +1250,9 @@ struct Ctx {
     hardware: bool,
     /// Root tables the read workloads use, each opened once.
     tables: HashMap<&'static str, Dataset>,
-    /// Manifest and transaction file bytes of each root table.
-    sizes: HashMap<&'static str, (Option<u64>, Option<u64>)>,
+    sizes: HashMap<&'static str, Sizes>,
+    /// Rows `Read::Take` fetches.
+    take_indices: Vec<u64>,
 }
 
 /// A clone of a root table under the scratch directory, removed on drop.
@@ -1081,7 +1268,12 @@ impl WorkingCopy {
 
 impl Drop for WorkingCopy {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+        let removed = std::fs::remove_dir_all(&self.dir);
+        // A second panic while a failed sample unwinds would abort before its
+        // message prints.
+        if let Err(error) = removed
+            && !std::thread::panicking()
+        {
             panic!("remove {}: {error}", self.dir.display());
         }
     }
@@ -1128,6 +1320,19 @@ fn read_every_file(path: &Path) {
 // ---------------------------------------------------------------------------
 // Refresh steps
 // ---------------------------------------------------------------------------
+
+/// The addresses of `rows`, which name no whole fragment.
+fn addresses(rows: &RowAddrTreeMap) -> RoaringTreemap {
+    let mut out = RoaringTreemap::new();
+    for (fragment, selection) in rows.iter() {
+        let RowAddrSelection::Partial(offsets) = selection else {
+            panic!("fragment {fragment} is listed whole");
+        };
+        let base = u64::from(*fragment) << 32;
+        out.extend(offsets.iter().map(|offset| base | u64::from(offset)));
+    }
+    out
+}
 
 /// Live rows where the flag of any of `outputs` is false: an ordered scan of
 /// `_rowaddr` alone, without the flags' true rows.
@@ -1285,12 +1490,16 @@ fn assert_published(report: &PublicationReport, dataset: &Dataset, outputs: &[Ou
     }
 }
 
-async fn merge_uncommitted(dataset: Arc<Dataset>, source: RecordBatch) -> UncommittedMergeInsert {
+async fn merge_uncommitted(
+    dataset: Arc<Dataset>,
+    source: RecordBatch,
+    mode: MergeInsertWriteMode,
+) -> UncommittedMergeInsert {
     MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
         .expect("merge insert builder")
         .when_matched(WhenMatched::UpdateAll)
         .when_not_matched(WhenNotMatched::DoNothing)
-        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .write_mode(mode)
         .try_build()
         .expect("build merge insert")
         .execute_uncommitted_batches(vec![source])
@@ -1367,10 +1576,9 @@ async fn read_sample(ctx: &Ctx, read: Read, table: &'static str) -> Sample {
                     scanner.count_rows().await.expect("count")
                 }
                 Read::Take => {
-                    let indices = scattered_ids(ctx.rows, TAKE_ROWS.min(ctx.rows), SEED_TAKE);
                     let batch = dataset
                         .take(
-                            &indices,
+                            &ctx.take_indices,
                             ProjectionRequest::from_columns(["summary"], dataset.schema()),
                         )
                         .await
@@ -1449,7 +1657,13 @@ async fn source_write(dataset: Dataset, shape: Shape, ids: &[u64]) -> (Dataset, 
     }
 }
 
-async fn cycle_sample(ctx: &Ctx, shape: Shape, table: Topology, refresh: Topology) -> Sample {
+async fn cycle_sample(
+    ctx: &Ctx,
+    shape: Shape,
+    table: Topology,
+    refresh: Topology,
+    rewrite_rows: bool,
+) -> Sample {
     let copy = ctx.working_copy(table.name());
     let dataset = open_fresh_session(copy.uri()).await;
     let mut recorder = Recorder::new(ctx.hardware).meter(&dataset).await;
@@ -1497,16 +1711,18 @@ async fn cycle_sample(ctx: &Ctx, shape: Shape, table: Topology, refresh: Topolog
         result.dataset
     } else {
         let inputs = recorder
-            .phase(
-                "read_inputs",
-                filter_inputs(&dataset, &shape.predicate(&ids)),
-            )
+            .phase("locate", filter_inputs(&dataset, &shape.predicate(&ids)))
             .await;
         assert_eq!(inputs.num_rows() as u64, written, "rows the write changed");
         let source = merge_source(&dataset, &inputs, outputs, compute(&inputs, outputs, None));
+        let mode = if rewrite_rows {
+            MergeInsertWriteMode::RewriteRows
+        } else {
+            MergeInsertWriteMode::RewriteColumns
+        };
         let dataset = Arc::new(dataset);
         let uncommitted = recorder
-            .phase("stage", merge_uncommitted(dataset.clone(), source))
+            .phase("merge", merge_uncommitted(dataset.clone(), source, mode))
             .await;
         recorder
             .phase("commit", commit_merge(dataset, uncommitted))
@@ -1526,16 +1742,14 @@ async fn cycle_sample(ctx: &Ctx, shape: Shape, table: Topology, refresh: Topolog
 async fn backfill_sample(ctx: &Ctx, table: Topology, refresh: Topology) -> Sample {
     let copy = ctx.working_copy(Workload::Backfill { table, refresh }.table());
     let dataset = open_fresh_session(copy.uri()).await;
-    let mut recorder = Recorder::new(ctx.hardware).meter(&dataset).await;
     let outputs = refresh.flagged();
     let is_flagged = table != Topology::Plain;
-
+    // Every row is pending, so a backfill needs no scan to find them.
     if is_flagged {
-        let pending = recorder
-            .phase("find", pending_rows(&dataset, outputs))
-            .await;
-        assert_eq!(pending.len(), ctx.rows, "every row is pending");
+        assert_eq!(pending_rows(&dataset, outputs).await.len(), ctx.rows);
     }
+    let mut recorder = Recorder::new(ctx.hardware).meter(&dataset).await;
+
     let inputs = recorder.phase("read_inputs", scan_inputs(&dataset)).await;
     let dataset = if is_flagged {
         let computed = inputs
@@ -1642,10 +1856,10 @@ async fn conflict_sample(
 ) -> Sample {
     let copy = ctx.working_copy(refresh.name());
     let dataset = open_fresh_session(copy.uri()).await;
-    let mut recorder = Recorder::new(ctx.hardware).meter(&dataset).await;
     let outputs = refresh.flagged();
     let pending_ids = scattered_ids(ctx.rows, CONFLICT_PENDING_ROWS, SEED_CONFLICT);
     let snapshot = Arc::new(write_ids(dataset, in_place, &pending_ids, 1).await);
+    let mut recorder = Recorder::new(ctx.hardware).meter(&snapshot).await;
 
     let pending = recorder
         .phase("find", pending_rows(&snapshot, outputs))
@@ -1667,6 +1881,8 @@ async fn conflict_sample(
     for (commit, ids) in groups.iter().take(commits).enumerate() {
         head = write_ids(head, in_place, ids, 2 + commit as u64).await;
     }
+    let head_version = head.version().version;
+    drop(head);
     let written: Vec<u64> = groups.iter().take(commits).flatten().copied().collect();
 
     let published = recorder
@@ -1680,7 +1896,15 @@ async fn conflict_sample(
                 matches!(published, Err(lance::Error::RetryableCommitConflict { .. })),
                 "a raced publication under Reject fails as retryable: {published:?}"
             );
-            // A retry refreshes everything pending at the head.
+            // A retry refreshes everything pending at the head it loads.
+            let head = recorder
+                .phase("retry_checkout", async {
+                    let mut latest = (*snapshot).clone();
+                    latest.checkout_latest().await.expect("load the head");
+                    latest
+                })
+                .await;
+            assert_eq!(head.version().version, head_version);
             let head = Arc::new(head);
             let pending = recorder
                 .phase("retry_find", pending_rows(&head, outputs))
@@ -1701,24 +1925,21 @@ async fn conflict_sample(
                 .await
                 .expect("the retry publishes");
             assert_published(&result.report, &result.dataset, outputs, pending.len());
-            extra.insert("rows_reused".into(), json!(0));
             result.dataset
         }
         DependencyConflictPolicy::Skip => {
             let result = published.expect("Skip publishes the safe part");
             let report = &result.report;
-            let mut deferred: HashMap<String, u64> = HashMap::new();
+            let mut deferred: HashMap<String, RoaringTreemap> = HashMap::new();
             for rows in &report.deferred_rows {
-                *deferred.entry(format!("{:?}", rows.reason)).or_default() += rows
-                    .rows
-                    .iter()
-                    .map(|(_, selection)| match selection {
-                        RowAddrSelection::Partial(rows) => rows.len(),
-                        RowAddrSelection::Full => panic!("deferred rows are partial"),
-                    })
-                    .sum::<u64>();
+                *deferred.entry(format!("{:?}", rows.reason)).or_default() |= addresses(&rows.rows);
             }
-            extra.insert("rows_deferred".into(), json!(deferred));
+            let is_vacated = deferred.contains_key(&format!("{:?}", DeferralReason::RowVacated));
+            let deferred: Map<String, Value> = deferred
+                .into_iter()
+                .map(|(reason, rows)| (reason, json!(rows.len())))
+                .collect();
+            extra.insert("rows_deferred".into(), Value::Object(deferred));
             extra.insert(
                 "groups_deferred".into(),
                 json!(report.deferred_groups.len()),
@@ -1737,15 +1958,25 @@ async fn conflict_sample(
                         .expect("plan the follow-up")
                 })
                 .await;
-            let pending = recorder
-                .phase("follow_up_find", pending_rows(&follow, outputs))
-                .await;
             // These races defer rows, never whole groups, and the published
             // rows are true, so nothing staged is left to reuse.
+            let mut planned = RoaringTreemap::new();
             for output in outputs {
                 let rows = plan.rows(output.name()).expect("a staged output");
                 assert!(rows.reuse.is_empty(), "{} reuses rows", output.name());
+                planned |= addresses(&rows.recompute);
             }
+            // The plan lists what to recompute in place; rows a race moved
+            // are pending at new addresses, which only a scan finds.
+            let pending = if is_vacated {
+                recorder
+                    .phase("follow_up_find", pending_rows(&follow, outputs))
+                    .await
+            } else {
+                planned.clone()
+            };
+            assert_eq!(pending, pending_rows(&follow, outputs).await);
+            assert!(planned.is_subset(&pending));
             extra.insert("rows_reused".into(), json!(0));
             recomputed += pending.len();
             let inputs = recorder
@@ -1810,10 +2041,10 @@ async fn append(dataset: Dataset, start: u64) -> Dataset {
 async fn after_appends_sample(ctx: &Ctx, commits: usize, table: Topology) -> Sample {
     let copy = ctx.working_copy(table.name());
     let dataset = open_fresh_session(copy.uri()).await;
-    let mut recorder = Recorder::new(ctx.hardware).meter(&dataset).await;
     let outputs = Topology::One.flagged();
     let ids = scattered_ids(ctx.rows, SPARSE_ROWS, SEED_SPARSE);
     let snapshot = Arc::new(write_ids(dataset, true, &ids, 1).await);
+    let mut recorder = Recorder::new(ctx.hardware).meter(&snapshot).await;
 
     enum Staged {
         Publication(Transaction),
@@ -1821,15 +2052,19 @@ async fn after_appends_sample(ctx: &Ctx, commits: usize, table: Topology) -> Sam
     }
     let staged = if table == Topology::Plain {
         let inputs = recorder
-            .phase(
-                "read_inputs",
-                filter_inputs(&snapshot, &id_in_predicate(&ids)),
-            )
+            .phase("locate", filter_inputs(&snapshot, &id_in_predicate(&ids)))
             .await;
         let source = merge_source(&snapshot, &inputs, outputs, compute(&inputs, outputs, None));
         Staged::Merge(
             recorder
-                .phase("stage", merge_uncommitted(snapshot.clone(), source))
+                .phase(
+                    "merge",
+                    merge_uncommitted(
+                        snapshot.clone(),
+                        source,
+                        MergeInsertWriteMode::RewriteColumns,
+                    ),
+                )
                 .await,
         )
     } else {
@@ -1944,7 +2179,8 @@ async fn run_workload(ctx: &Ctx, workload: Workload) -> Sample {
             shape,
             table,
             refresh,
-        } => Box::pin(cycle_sample(ctx, shape, table, refresh)).await,
+            rewrite_rows,
+        } => Box::pin(cycle_sample(ctx, shape, table, refresh, rewrite_rows)).await,
         Workload::Backfill { table, refresh } => {
             Box::pin(backfill_sample(ctx, table, refresh)).await
         }
@@ -2006,15 +2242,36 @@ async fn run() {
     }
 }
 
+/// The workloads `BENCH_WORKLOADS` names exactly, in `Workload::all` order.
+fn selected_workloads(config: &BenchConfig) -> Vec<(String, Workload)> {
+    let all: Vec<(String, Workload)> = Workload::all()
+        .into_iter()
+        .map(|workload| (workload.name(), workload))
+        .collect();
+    for token in &config.workloads {
+        assert!(
+            token == "all" || all.iter().any(|(name, _)| name == token),
+            "BENCH_WORKLOADS names {token}, which is no workload; list mode prints them"
+        );
+    }
+    let selected: Vec<(String, Workload)> = all
+        .into_iter()
+        .filter(|(name, _)| {
+            config.workloads.is_empty()
+                || config
+                    .workloads
+                    .iter()
+                    .any(|token| token == "all" || token == name)
+        })
+        .collect();
+    assert!(!selected.is_empty(), "BENCH_WORKLOADS selects no workload");
+    selected
+}
+
 async fn measure(config: &BenchConfig, root: &Path) {
     let build = required_env("BENCH_BUILD");
     let out_path = required_env("BENCH_OUT");
-    let workloads: Vec<(String, Workload)> = Workload::all()
-        .into_iter()
-        .map(|workload| (workload.name(), workload))
-        .filter(|(name, _)| config.selects(name))
-        .collect();
-    assert!(!workloads.is_empty(), "BENCH_WORKLOADS selects no workload");
+    let workloads = selected_workloads(config);
 
     let identity = tables_identity(root).await;
     if let Ok(expected) = std::env::var("BENCH_COUNTERS_EXPECT_MANIFEST_BLAKE3") {
@@ -2037,21 +2294,26 @@ async fn measure(config: &BenchConfig, root: &Path) {
             .unwrap_or_else(|| panic!("{} has no table {table}", root.display()));
         assert_eq!(
             dataset.count_rows(None).await.expect("count rows") as u64,
-            match table_spec(table).state {
-                State::Pending | State::Published | State::Cleared { .. } => config.scale_rows,
-                State::SparseHistory(_) | State::DenseHistory => config.scale_rows,
-            },
+            config.scale_rows,
             "{table} holds BENCH_SCALE_ROWS rows"
         );
-        sizes.insert(table, version_file_sizes(&dataset).await);
+        sizes.insert(table, Sizes::of(&dataset).await);
         if matches!(workload, Workload::Read { .. }) {
             tables.insert(table, dataset);
         }
     }
-    let scratch = std::env::var("BENCH_SCRATCH_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(format!("{}-scratch", root.display())))
-        .join(std::process::id().to_string());
+    let base = match std::env::var("BENCH_SCRATCH_DIR") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => {
+            let name = root.file_name().expect("the root has a name");
+            root.with_file_name(format!("{}-scratch", name.to_string_lossy()))
+        }
+    };
+    let scratch = base.join(std::process::id().to_string());
+    // Only a killed process that had this pid can have left it.
+    if scratch.exists() {
+        std::fs::remove_dir_all(&scratch).expect("remove a stale scratch directory");
+    }
     std::fs::create_dir_all(&scratch).expect("create the scratch directory");
     let hardware = hardware_counters_advance();
     let ctx = Ctx {
@@ -2061,6 +2323,11 @@ async fn measure(config: &BenchConfig, root: &Path) {
         hardware,
         tables,
         sizes,
+        take_indices: scattered_ids(
+            config.scale_rows,
+            TAKE_ROWS.min(config.scale_rows),
+            SEED_TAKE,
+        ),
     };
 
     if let Some(parent) = Path::new(&out_path).parent() {
@@ -2088,6 +2355,7 @@ async fn measure(config: &BenchConfig, root: &Path) {
         "warmup": config.warmup,
         "samples": config.read_samples,
         "workloads": workloads.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        "order": "rotated by one position per pass, reversed on odd passes",
         "working_copies": {
             "scratch": scratch,
             "method": if cfg!(target_os = "macos") { "cp -Rc" } else { "cp -R --reflink=auto" },
@@ -2113,28 +2381,36 @@ async fn measure(config: &BenchConfig, root: &Path) {
             "read_bytes": io_source,
             "write_iops": io_source,
             "written_bytes": io_source,
-            "manifest_bytes": "size of the version's manifest file",
-            "transaction_bytes": "size of the version's transaction file",
+            "manifest_bytes": "the manifest file",
+            "manifest_struct_bytes": "the manifest file from the footer's struct position",
+            "inline_transaction_bytes": "the manifest file's transaction section",
+            "transaction_bytes": "the separate transaction file",
         },
     });
     writeln!(out, "{run}").expect("write run record");
 
-    for cycle in 0..config.warmup + config.read_samples {
-        for position in 0..workloads.len() {
-            let (name, workload) = &workloads[(cycle + position) % workloads.len()];
+    let count = workloads.len();
+    for pass in 0..config.warmup + config.read_samples {
+        for position in 0..count {
+            let index = if pass % 2 == 0 {
+                (pass + position) % count
+            } else {
+                (pass + count - 1 - position) % count
+            };
+            let (name, workload) = &workloads[index];
             let sample = run_workload(&ctx, *workload).await;
-            if cycle < config.warmup {
+            if pass < config.warmup {
                 continue;
             }
             let phases: Vec<&Phase> = sample.phases.iter().collect();
-            let mut record = counters_json(&phases);
+            let mut record = counters_json(&phases, true);
             let by_phase: Map<String, Value> = sample
                 .phases
                 .iter()
                 .map(|phase| {
                     (
                         phase.name.to_string(),
-                        Value::Object(counters_json(&[phase])),
+                        Value::Object(counters_json(&[phase], false)),
                     )
                 })
                 .collect();
@@ -2143,10 +2419,10 @@ async fn measure(config: &BenchConfig, root: &Path) {
             record.insert("build".into(), json!(build));
             record.insert("workload".into(), json!(name));
             record.insert("table".into(), json!(workload.table()));
-            record.insert("sample".into(), json!(cycle - config.warmup));
+            record.insert("sample".into(), json!(pass - config.warmup));
+            record.insert("position".into(), json!(position));
             record.insert("rows".into(), json!(sample.rows));
-            record.insert("manifest_bytes".into(), json!(sample.sizes.0));
-            record.insert("transaction_bytes".into(), json!(sample.sizes.1));
+            sample.sizes.insert_into(&mut record);
             record.insert(
                 "phase_order".into(),
                 json!(

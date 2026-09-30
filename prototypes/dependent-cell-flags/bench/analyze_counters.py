@@ -54,8 +54,10 @@ IO_METRICS = (
     ("written_bytes", "written MiB", 1 << 20, 2),
     ("read_iops", "read requests", 1, 0),
     ("write_iops", "write requests", 1, 0),
-    ("manifest_bytes", "manifest KiB", 1 << 10, 1),
-    ("transaction_bytes", "transaction KiB", 1 << 10, 1),
+    ("manifest_bytes", "manifest file KiB", 1 << 10, 1),
+    ("manifest_struct_bytes", "manifest proper KiB", 1 << 10, 1),
+    ("inline_transaction_bytes", "inline transaction KiB", 1 << 10, 1),
+    ("transaction_bytes", "transaction file KiB", 1 << 10, 1),
 )
 
 
