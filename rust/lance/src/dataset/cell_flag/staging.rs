@@ -506,8 +506,11 @@ impl PublicationStager {
     /// [`Dataset::cell_flag_true_rows`], picks it up.
     ///
     /// Fails with `InvalidInput` when this stager reads another version, or
-    /// when the report leaves rows to reuse or recompute for a flag whose
-    /// output it does not stage.
+    /// when the report certifies rows to reuse for a flag whose output it
+    /// does not stage. The rows it only defers for such a flag are left to a
+    /// refresh of that output's pending rows. So where the outputs cannot
+    /// stage together, as on a fragment that stores only some of them, a
+    /// stager of the stored ones can plan the report.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -866,6 +869,10 @@ impl PublicationStager {
         Ok(values.project_by_schema(&output.relaxed)?.column(0).clone())
     }
 
+    /// Refuse a report that certifies rows of a flag this stager does not
+    /// stage, whose values its plan would lose. A deferred row of such a flag
+    /// needs no plan: it is false at the snapshot, where a refresh of pending
+    /// rows finds it, or true with a valid value.
     fn check_report_flags(&self, report: &PublicationReport) -> Result<()> {
         let mut flags = BTreeSet::new();
         for update in report
@@ -875,14 +882,6 @@ impl PublicationStager {
             .filter(|update| !update.rows.is_empty())
         {
             flags.insert(update.flag_id);
-        }
-        for deferred in report.deferred_rows.iter().filter(|deferred| {
-            matches!(
-                deferred.reason,
-                DeferralReason::InputChanged | DeferralReason::UpstreamNotPublished
-            ) && !deferred.rows.is_empty()
-        }) {
-            flags.insert(deferred.flag_id);
         }
         let Some(flag_id) = flags
             .into_iter()
@@ -899,16 +898,16 @@ impl PublicationStager {
             .and_then(|registry| registry.definition(flag_id));
         Err(match definition {
             Some(definition) => Error::invalid_input(format!(
-                "the report leaves rows of {} to reuse or recompute, but this stager does not \
-                 stage its output '{}'; declare it, or plan its follow-up with a stager that does",
+                "the report certifies rows of {} to reuse, but this stager does not stage its \
+                 output '{}'; declare it, or plan its follow-up with a stager that does",
                 definition.label(schema),
                 schema
                     .field_path(definition.field_id)
                     .unwrap_or_else(|_| definition.field_id.to_string())
             )),
             None => Error::invalid_input(format!(
-                "the report leaves rows of cell flag {flag_id} to reuse or recompute, but it is \
-                 not registered at version {}",
+                "the report certifies rows of cell flag {flag_id} to reuse, but it is not \
+                 registered at version {}",
                 self.snapshot.manifest.version
             )),
         })

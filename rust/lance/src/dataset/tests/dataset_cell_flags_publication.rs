@@ -6732,21 +6732,14 @@ async fn test_stager_follow_up_restages_deferred_work() {
     );
     assert!(!plan.is_empty());
 
-    // A stager without translation cannot plan it.
-    let error = stager_of(&head, &["summary"])
+    // The report only defers translation's rows, so a stager without it plans
+    // summary alone.
+    let summary_plan = stager_of(&head, &["summary"])
         .follow_up(report)
         .await
-        .unwrap_err();
-    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-    assert!(
-        error.to_string().contains(&format!(
-            "the report leaves rows of cell flag 'ready' (flag id {translation}) on \
-             'translation'"
-        )) && error
-            .to_string()
-            .contains("but this stager does not stage its output 'translation'"),
-        "{error}"
-    );
+        .unwrap();
+    assert_eq!(summary_plan.rows("summary"), plan.rows("summary"));
+    assert_eq!(summary_plan.rows("translation"), None);
 
     // Stage the plan: id 1's summary is the reused value and its translation
     // follows it; id 2's translation follows the newer summary it copies.
@@ -6877,7 +6870,7 @@ async fn test_stager_follow_up_recomputes_downstream_of_a_planned_upstream() {
     assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
     assert!(
         error.to_string().contains(&format!(
-            "the report leaves rows of cell flag 'ready' (flag id {summary}) on 'summary'"
+            "the report certifies rows of cell flag 'ready' (flag id {summary}) on 'summary'"
         )) && error
             .to_string()
             .contains("but this stager does not stage its output 'summary'"),
@@ -7002,6 +6995,97 @@ async fn test_stager_follow_up_recomputes_downstream_of_a_recomputed_upstream() 
         completed.cell_flag_true_rows(translation).unwrap(),
         full(&[0, 1])
     );
+    for column in outputs {
+        assert_visible_values_follow_inputs(&completed, column).await;
+    }
+}
+
+/// Summary and translation are added as all-NULL, metadata-only columns. A
+/// refresh stages both on fragment 0 while a newer summary-only result of
+/// id 2 stores summary alone there, which defers the refresh whole. No one
+/// file can now replace both outputs on fragment 0, so the plan of both
+/// cannot stage. A stager of summary alone plans its reusable row, since the
+/// report only defers translation's rows, and a refresh of pending
+/// translations completes the fragment.
+#[tokio::test]
+async fn test_stager_follow_up_plans_stored_outputs_over_a_mixed_layout() {
+    let mut read = computed_outputs(2, &[]).await;
+    let columns = ArrowSchema::new(vec![
+        ArrowField::new("summary", DataType::Utf8, true),
+        ArrowField::new("translation", DataType::Utf8, true),
+    ]);
+    read.add_columns(NewColumnTransform::AllNulls(Arc::new(columns)), None, None)
+        .await
+        .unwrap();
+    for (output, input) in CHAIN {
+        read.register_cell_flag(
+            output,
+            "ready",
+            CellFlagOptions::default()
+                .with_clear_on_write([input])
+                .with_mask_when_false(true),
+        )
+        .await
+        .unwrap();
+    }
+    let (summary, translation) = (flag_of(&read, "summary"), flag_of(&read, "translation"));
+    let outputs = ["summary", "translation"];
+    let fragment_0 = [addr(0, 0), addr(0, 1)];
+    let older = stage_batches(
+        &stager_of(&read, &outputs),
+        vec![
+            computed_batch(
+                &read,
+                &fragment_0,
+                &[("summary", &fragment_0), ("translation", &fragment_0)],
+            )
+            .await,
+        ],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let newer = publish_computed(&read, &["summary"], &[addr(0, 1)]).await;
+    let result = commit_staged(&read, older, Skip).await.unwrap();
+    let report = &result.report;
+    assert_eq!(report.committed_version, None);
+    assert_eq!(report.checked_version, newer.version().version);
+    assert_eq!(report.reusable_rows(summary), rows(&[(0, &[0])]));
+    assert!(report.reusable_rows(translation).is_empty());
+
+    let error = stage_batches(
+        &stager_of(&newer, &outputs),
+        vec![computed_batch(&newer, &[addr(0, 0)], &[("summary", &[addr(0, 0)])]).await],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("outputs [summary, translation] cannot be replaced together on fragment 0"),
+        "{error}"
+    );
+    let plan = stager_of(&newer, &["summary"])
+        .follow_up(report)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.rows("summary"),
+        Some(&FollowUpRows {
+            reuse: rows(&[(0, &[0])]),
+            recompute: RowAddrTreeMap::new(),
+        })
+    );
+    assert_eq!(plan.rows("translation"), None);
+
+    let reused = publish_computed(&newer, &["summary"], &[addr(0, 0)]).await;
+    let mut pending = pending_addrs(&reused, "translation").await;
+    pending.retain(|addr| RowAddress::from(*addr).fragment_id() == 0);
+    assert_eq!(pending, fragment_0);
+    let completed = publish_computed(&reused, &["translation"], &pending).await;
+    for flag_id in [summary, translation] {
+        assert_eq!(completed.cell_flag_true_rows(flag_id).unwrap(), full(&[0]));
+    }
     for column in outputs {
         assert_visible_values_follow_inputs(&completed, column).await;
     }
