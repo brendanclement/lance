@@ -1693,6 +1693,9 @@ enum Knn {
     /// Only the fragment of this id, which needs a prefilter.
     Fragment(usize),
     FastSearch,
+    /// A plain search over a scan whose batches are rechunked to at most this
+    /// many bytes, which slices them.
+    BatchBytes(u64),
 }
 
 /// The `(id, distance)` hits of each of `queries`, in result order, of a
@@ -1721,6 +1724,9 @@ async fn nearest_hits(
             let fragment = dataset.get_fragment(fragment_id).unwrap();
             scan.prefilter(true)
                 .with_fragments(vec![fragment.metadata().clone()]);
+        }
+        Knn::BatchBytes(bytes) => {
+            scan.batch_size_bytes(bytes);
         }
         _ => {}
     }
@@ -2151,6 +2157,105 @@ async fn test_unindexed_nearest_skips_masked_embeddings(
             nearest_hits(&dataset, queries, k, knn, batch_size).await,
             expected,
             "batch size {batch_size:?}"
+        );
+    }
+}
+
+/// A byte budget slices the scan's batches, so the search gets slices of a
+/// partly masked fragment whose validity starts mid-buffer, and without a
+/// deletion no row-id nulls are merged into a fresh buffer. Every row of the
+/// one fragment is published and then id 5's body is rewritten, leaving e5,
+/// the nearest to [`QUERY`], stale under a false flag. The search must skip
+/// only e5.
+#[rstest]
+#[tokio::test]
+async fn test_nearest_over_sliced_batches_skips_masked_embeddings(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let batch = RecordBatch::try_from_iter_with_nullable([
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..8)) as ArrayRef,
+            false,
+        ),
+        (
+            "body",
+            Arc::new(StringArray::from_iter_values(
+                (0..8).map(|id| format!("b{id}")),
+            )) as ArrayRef,
+            false,
+        ),
+        (
+            "embedding",
+            embeddings(&vec![Some(QUERY.to_vec()); 8]),
+            true,
+        ),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .register_cell_flag(
+            "embedding",
+            "ready",
+            CellFlagOptions::default()
+                .with_clear_on_write(["body"])
+                .with_mask_when_false(true),
+        )
+        .await
+        .unwrap();
+    let addrs: Vec<u64> = (0..8).map(|row| addr(0, row)).collect();
+    let computed = computed_embeddings(&dataset, &addrs, &[]).await;
+    let published = publish_embeddings(&dataset, computed, DependencyConflictPolicy::Reject)
+        .await
+        .unwrap()
+        .dataset;
+    let dataset = merge_insert_body(&published, 5, "b50").await;
+    assert!(
+        dataset.get_fragments()[0]
+            .metadata()
+            .deletion_file
+            .is_none()
+    );
+
+    let nearest = vec![
+        (6, 0.5625),
+        (4, 1.5625),
+        (7, 3.0625),
+        (3, 5.0625),
+        (2, 10.5625),
+        (1, 18.0625),
+        (0, 27.5625),
+    ];
+    let nearest_to_origin = vec![
+        (0, 1.0),
+        (1, 2.0),
+        (2, 5.0),
+        (3, 10.0),
+        (4, 17.0),
+        (6, 37.0),
+        (7, 50.0),
+    ];
+    for bytes in (128..=640).step_by(64) {
+        let knn = Knn::BatchBytes(bytes);
+        assert_eq!(
+            nearest_hits(&dataset, &[QUERY], 8, knn, None).await,
+            [nearest.clone()],
+            "{bytes} bytes"
+        );
+        assert_eq!(
+            nearest_hits(&dataset, &[QUERY, [0.0; 4]], 8, knn, None).await,
+            [nearest.clone(), nearest_to_origin.clone()],
+            "{bytes} bytes"
         );
     }
 }

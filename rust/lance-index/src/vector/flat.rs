@@ -113,7 +113,7 @@ pub async fn compute_distance(
         let vectors = vectors
             .into_data()
             .into_builder()
-            .null_bit_buffer(validity_buffer.map(|b| b.buffer().clone()))
+            .nulls(validity_buffer)
             .build()
             .map(make_array)?;
         let distances = match vectors.data_type() {
@@ -136,4 +136,54 @@ pub async fn compute_distance(
             .map_err(|e| Error::execution(format!("Failed to adding distance column: {}", e)))
     })
     .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::types::Float32Type;
+    use arrow_array::{FixedSizeListArray, UInt64Array};
+    use rstest::rstest;
+
+    use super::*;
+
+    /// A slice's null buffer starts at the slice's offset into its parent's,
+    /// as in the batches of a scan rechunked by bytes. Vectors 1 and 6 are
+    /// NULL, so reading the slice's validity from the parent's first bit
+    /// would score vector 6 and drop vector 5. Row id 7 is NULL, for a
+    /// deleted row.
+    #[rstest]
+    #[case::without_row_ids(None, [Some(16.0), Some(25.0), None, Some(49.0)])]
+    #[case::row_ids_without_nulls(
+        Some(UInt64Array::from_iter_values(0..8)),
+        [Some(16.0), Some(25.0), None, Some(49.0)]
+    )]
+    #[case::row_ids_with_nulls(
+        Some(UInt64Array::from_iter((0..8).map(|row| (row != 7).then_some(row)))),
+        [Some(16.0), Some(25.0), None, None]
+    )]
+    #[tokio::test]
+    async fn test_distances_of_a_sliced_batch_keep_its_nulls(
+        #[case] row_ids: Option<UInt64Array>,
+        #[case] expected: [Option<f32>; 4],
+    ) {
+        let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            (0..8).map(|row| (row % 5 != 1).then(|| [Some(row as f32), Some(0.0)])),
+            2,
+        );
+        let mut columns = vec![("vector", Arc::new(vectors) as ArrayRef)];
+        if let Some(row_ids) = row_ids {
+            columns.push((ROW_ID, Arc::new(row_ids) as ArrayRef));
+        }
+        let batch = RecordBatch::try_from_iter(columns).unwrap().slice(4, 4);
+        let key = Arc::new(Float32Array::from(vec![0.0, 0.0]));
+
+        let batch = compute_distance(key, DistanceType::L2, "vector", batch)
+            .await
+            .unwrap();
+        let distances: Vec<_> = batch[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .iter()
+            .collect();
+        assert_eq!(distances, expected);
+    }
 }
