@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
-"""Rotate builds of the cell_flags_scan_counters bench over one shared table.
+"""Rotate builds of a counters bench over one shared table directory.
 
 Builds each checkout, takes the single bench executable cargo reports for it,
 copies that executable read-only into the results directory, and runs the
-copies in a 4x4 Latin-square order, so every build runs in every position
-equally often. run.json records what identifies each build and the table:
+copies in a balanced order, so every build runs in every position equally
+often: a 4x4 Latin square for four labels, cyclic rotations for two or three.
+run.json records what identifies each build and the table:
 - the executable's sha256;
 - the source revision, the working-tree state and a patch of local changes;
 - rustc and cargo versions, the profile, rustflags, features and the cargo
@@ -17,8 +18,12 @@ equally often. run.json records what identifies each build and the table:
         --build main=/abs/lance-main --build prototype=/abs/lance-proto \\
         --build fix=/abs/lance-fix --control main
 
-There are exactly four labels: four builds, or three builds and --control,
-which runs one build's executable a second time under the label <build>-copy.
+--bench names the bench target (default cell_flags_scan_counters); it must
+follow that bench's environment and record contract, and --dataset is its
+BENCH_COUNTERS_URI (cell_flags_vector_masking takes a root of several tables).
+There are two to four labels: builds, plus optionally --control, which runs
+one build's executable a second time under the label <build>-copy. --rounds
+must be a multiple of the label count.
 Checkouts must not be nested under another checkout, whose cargo
 configuration cargo would merge into the build. Builds must have the same
 rustc, profile, rustflags and features unless --allow-build-differences is
@@ -45,10 +50,27 @@ import sys
 import tempfile
 from pathlib import Path
 
-BENCH = "cell_flags_scan_counters"
 PACKAGE = "lance"
 SCHEMA = 2
 LATIN_SQUARE = [[0, 1, 2, 3], [1, 3, 0, 2], [2, 0, 3, 1], [3, 2, 1, 0]]
+VECTOR_TABLES = (
+    "plain",
+    "ready",
+    "partial_1pct",
+    "partial_50pct",
+    "masked",
+    "null_1pct",
+    "null_50pct",
+    "null_all",
+)
+DEFAULT_WORKLOADS = {
+    "cell_flags_scan_counters": "scan_summary_full,filter_summary_is_null_count,count_summary_aggregate",
+    "cell_flags_vector_masking": ",".join(
+        f"{read}_{table}"
+        for table in VECTOR_TABLES
+        for read in ("scan", "nearest", "take")
+    ),
+}
 LABEL = re.compile(r"^[A-Za-z0-9._-]+$")
 # Cargo writes both `release` and `bench` into target/release, and `dev` and
 # `test` into target/debug.
@@ -167,7 +189,7 @@ def source_identity(checkout, patch_path):
     }
 
 
-def build(name, checkout, profile, out):
+def build(name, checkout, profile, out, bench):
     checkout = checkout.resolve()
     toplevel = run(["git", "rev-parse", "--show-toplevel"], cwd=checkout).strip()
     if Path(toplevel).resolve() != checkout:
@@ -190,7 +212,7 @@ def build(name, checkout, profile, out):
         "-p",
         PACKAGE,
         "--bench",
-        BENCH,
+        bench,
         "--profile",
         profile,
         "--locked",
@@ -215,7 +237,7 @@ def build(name, checkout, profile, out):
         target = message.get("target") or {}
         if (
             message.get("reason") == "compiler-artifact"
-            and target.get("name") == BENCH
+            and target.get("name") == bench
             and "bench" in target.get("kind", [])
             and message.get("executable")
         ):
@@ -223,7 +245,7 @@ def build(name, checkout, profile, out):
     if len(artifacts) != 1:
         found = ", ".join(artifact["executable"] for artifact in artifacts) or "none"
         fail(
-            f"build {name}: expected exactly one {BENCH} executable, cargo reported {found}"
+            f"build {name}: expected exactly one {bench} executable, cargo reported {found}"
         )
     artifact = artifacts[0]
     executable = Path(artifact["executable"]).resolve()
@@ -240,7 +262,7 @@ def build(name, checkout, profile, out):
         profile_dir
         / ".fingerprint"
         / f"{PACKAGE}-{unit_hash}"
-        / f"test-bench-{BENCH}.json"
+        / f"test-bench-{bench}.json"
     )
     if not fingerprint_path.is_file():
         fail(
@@ -375,6 +397,10 @@ def check_run_file(path, label, binary, digest, samples, workloads, manifests):
         fail(
             f"{path}: the run record names binary {header.get('binary_path')}, expected {binary}"
         )
+    if sorted(header.get("workloads") or []) != sorted(workloads):
+        fail(
+            f"{path}: the run record lists workloads {header.get('workloads')}, expected {workloads}"
+        )
     manifest = header["dataset"]["manifest_blake3"]
     manifests.setdefault(manifest, []).append(str(path))
     if len(manifests) != 1:
@@ -386,6 +412,7 @@ def check_run_file(path, label, binary, digest, samples, workloads, manifests):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--bench", default="cell_flags_scan_counters")
     parser.add_argument("--dataset", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--build", action="append", default=[], metavar="NAME=CHECKOUT")
@@ -397,16 +424,11 @@ def main():
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument(
-        "--workloads",
-        default="scan_summary_full,filter_summary_is_null_count,count_summary_aggregate",
+        "--workloads", help="exact workload names; defaults to the bench's usual set"
     )
     parser.add_argument("--allow-build-differences", action="store_true")
     args = parser.parse_args()
 
-    if args.rounds <= 0 or args.rounds % 4:
-        fail(
-            f"--rounds must be a positive multiple of 4 to keep the Latin square balanced, got {args.rounds}"
-        )
     if args.samples <= 0 or args.warmup < 0:
         fail("--samples must be positive and --warmup non-negative")
     dataset = args.dataset.resolve()
@@ -428,15 +450,24 @@ def main():
     labels = names + ([f"{args.control}-copy"] if args.control else [])
     if args.control and args.control not in names:
         fail(f"--control {args.control} is not a --build name")
-    if len(set(labels)) != len(labels) or len(labels) != 4:
-        fail(f"need exactly four distinct labels, got {labels}")
-    workloads = args.workloads.split(",")
+    if len(set(labels)) != len(labels) or not 2 <= len(labels) <= 4:
+        fail(f"need two to four distinct labels, got {labels}")
+    if args.rounds <= 0 or args.rounds % len(labels):
+        fail(
+            f"--rounds must be a positive multiple of the {len(labels)} labels to keep the "
+            f"rotation balanced, got {args.rounds}"
+        )
+    workloads_arg = args.workloads or DEFAULT_WORKLOADS.get(args.bench)
+    if not workloads_arg:
+        fail(f"--bench {args.bench} has no default workloads; pass --workloads")
+    workloads = workloads_arg.split(",")
     for directory in ("bins", "logs", "source", "warmup"):
         (out / directory).mkdir(parents=True, exist_ok=True)
 
     record = {
         "started": now(),
         "config": {
+            "bench": args.bench,
             "profile": args.profile,
             "rounds": args.rounds,
             "samples": args.samples,
@@ -448,7 +479,10 @@ def main():
         "host": host_identity(),
         "dataset_before": dataset_identity(dataset),
     }
-    builds = [build(name, checkout, args.profile, out) for name, checkout in requested]
+    builds = [
+        build(name, checkout, args.profile, out, args.bench)
+        for name, checkout in requested
+    ]
     check_build_settings(builds, args.allow_build_differences)
     by_label = {entry["name"]: entry for entry in builds}
     if args.control:
@@ -457,10 +491,17 @@ def main():
     record["labels"] = {label: by_label[label]["name"] for label in labels}
     (out / "run.json").write_text(json.dumps(record, indent=2) + "\n")
 
+    if len(labels) == 4:
+        rotations = LATIN_SQUARE
+    else:
+        rotations = [
+            [(first + position) % len(labels) for position in range(len(labels))]
+            for first in range(len(labels))
+        ]
     order = [
         (round_number, labels[index])
         for round_number in range(1, args.rounds + 1)
-        for index in LATIN_SQUARE[(round_number - 1) % 4]
+        for index in rotations[(round_number - 1) % len(labels)]
     ]
     with open(out / "order.tsv", "w") as order_file:
         order_file.write("round\tlabel\tbinary\n")

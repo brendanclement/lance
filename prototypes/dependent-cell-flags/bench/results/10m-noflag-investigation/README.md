@@ -257,6 +257,7 @@ Reproduce the recorded runs 01–09 as follows:
 
 The baseline checkout needs these files copied from this branch, plus their `[[bench]]` entries:
 - `rust/lance/benches/cell_flags_common/mod.rs`
+- `rust/lance/benches/cell_flags_common/counters.rs` (since the vector masking bench shares it)
 - `cell_flags_regression.rs` (the counters bench includes the common module)
 - `cell_flags_scan_counters.rs`
 

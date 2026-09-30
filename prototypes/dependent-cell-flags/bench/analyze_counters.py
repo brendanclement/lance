@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
-"""Compare builds measured by the cell_flags_scan_counters bench.
+"""Compare builds measured by a counters bench.
 
 Reads ``round<r>-<build>.jsonl`` files from one directory. For each workload it
 prints, per build, the geometric mean over rounds of the per-round ratio to the
 reference build (medians within a round), for wall time, retired instructions
 and cycles, with a bootstrap 95% interval and how many rounds were above 1. It
-also prints the median number of busy cores (CPU time / wall time).
+also prints the median number of busy cores (CPU time / wall time). Where the
+samples carry allocation counters (cell_flags_vector_masking), their ratios and
+medians are printed too.
 
     python3 analyze_counters.py <dir> --reference baseline --builds prototype,fix
+
+``--pair A:B`` (repeatable) also compares two workloads within each build: the
+geometric mean over rounds of median(A) / median(B), as for builds.
 
 A metric the bench recorded as null (unavailable on that platform or machine)
 is reported as unavailable, never as a ratio. Records written before the bench
@@ -36,6 +41,7 @@ from pathlib import Path
 ROUND_FILE = re.compile(r"round(\d+)-(.+)\.jsonl$")
 SCHEMA = 2
 METRICS = ("wall_ns", "instructions", "cycles")
+ALLOCATION_METRICS = ("allocations", "allocated_bytes", "peak_live_growth_bytes")
 
 
 def fail(message):
@@ -93,6 +99,51 @@ def bootstrap(values, draws=5000, seed=1):
     return means[int(0.025 * draws)], means[int(0.975 * draws)]
 
 
+def metrics_of(records):
+    """The metrics to report: the counters, and the allocation counters
+    where the records carry them."""
+    records = list(records)
+    return METRICS + tuple(
+        metric
+        for metric in ALLOCATION_METRICS
+        if any(metric in record for record in records)
+    )
+
+
+def ratio_rows(label, metrics, numerators, denominators, rounds, describe):
+    """Table rows of the per-round ratios of median numerator to median
+    denominator. Returns the rounds that lack either side."""
+    paired = [rnd for rnd in rounds if numerators.get(rnd) and denominators.get(rnd)]
+    for metric in metrics:
+        if any(
+            record.get(metric) is None
+            for rnd in paired
+            for side in (numerators, denominators)
+            for record in side[rnd]
+        ):
+            print(f"| {label} | {metric} | unavailable | — | — |")
+            continue
+        ratios = []
+        for rnd in paired:
+            ours = statistics.median(r[metric] for r in numerators[rnd])
+            ref = statistics.median(r[metric] for r in denominators[rnd])
+            if ours <= 0 or ref <= 0:
+                fail(
+                    f"{describe} round {rnd}: median {metric} is {ours} over {ref}; "
+                    "a ratio needs positive values"
+                )
+            ratios.append(ours / ref)
+        if not ratios:
+            continue
+        low, high = bootstrap(ratios)
+        above = sum(ratio > 1 for ratio in ratios)
+        print(
+            f"| {label} | {metric} | {geomean(ratios):.3f} | "
+            f"[{low:.3f}, {high:.3f}] | {above}/{len(ratios)} |"
+        )
+    return [rnd for rnd in rounds if rnd not in paired]
+
+
 def check_consistency(samples, runs):
     rows = collections.defaultdict(set)
     for record in samples:
@@ -121,6 +172,13 @@ def main():
         type=fractions.Fraction,
         help="nanoseconds per Mach tick for records without a schema, e.g. 125/3",
     )
+    parser.add_argument(
+        "--pair",
+        action="append",
+        default=[],
+        metavar="A:B",
+        help="also compare workload A to workload B within each build",
+    )
     args = parser.parse_args()
 
     samples, runs = load(args.directory)
@@ -137,56 +195,40 @@ def main():
         fail(
             f"no records for {', '.join(unknown)}; recorded builds are {', '.join(sorted(known))}"
         )
+    pairs = []
+    for pair in args.pair:
+        numerator, separator, denominator = pair.partition(":")
+        missing = [w for w in (numerator, denominator) if w not in workloads]
+        if not separator or missing:
+            fail(
+                f"--pair takes A:B of recorded workloads, got {pair!r}; "
+                f"recorded workloads are {', '.join(workloads)}"
+            )
+        pairs.append((numerator, denominator))
     timebase = (
         None if args.legacy_mach_timebase is None else float(args.legacy_mach_timebase)
     )
 
+    def by_round(workload, build):
+        return {rnd: groups.get((workload, build, rnd)) for rnd in rounds}
+
     for workload in workloads:
+        metrics = metrics_of(r for r in samples if r["workload"] == workload)
         print(f"## {workload}")
         print("| build | metric | ratio to reference | 95% interval | rounds > 1 |")
         print("|---|---|---|---|---|")
         dropped = {}
         for build in builds:
-            paired = [
-                rnd
-                for rnd in rounds
-                if groups.get((workload, build, rnd))
-                and groups.get((workload, args.reference, rnd))
-            ]
-            missing = [rnd for rnd in rounds if rnd not in paired]
+            missing = ratio_rows(
+                build,
+                metrics,
+                by_round(workload, build),
+                by_round(workload, args.reference),
+                rounds,
+                f"{workload} {build} / {args.reference}",
+            )
             if missing:
                 dropped[build] = missing
-            for metric in METRICS:
-                if any(
-                    record[metric] is None
-                    for rnd in paired
-                    for key in (build, args.reference)
-                    for record in groups[(workload, key, rnd)]
-                ):
-                    print(f"| {build} | {metric} | unavailable | — | — |")
-                    continue
-                ratios = []
-                for rnd in paired:
-                    ours = statistics.median(
-                        r[metric] for r in groups[(workload, build, rnd)]
-                    )
-                    ref = statistics.median(
-                        r[metric] for r in groups[(workload, args.reference, rnd)]
-                    )
-                    if ours <= 0 or ref <= 0:
-                        fail(
-                            f"{workload} round {rnd}: median {metric} of {build} is {ours}, "
-                            f"of {args.reference} {ref}; a ratio needs positive values"
-                        )
-                    ratios.append(ours / ref)
-                if not ratios:
-                    continue
-                low, high = bootstrap(ratios)
-                above = sum(ratio > 1 for ratio in ratios)
-                print(
-                    f"| {build} | {metric} | {geomean(ratios):.3f} | "
-                    f"[{low:.3f}, {high:.3f}] | {above}/{len(ratios)} |"
-                )
         for build, missing in dropped.items():
             print(
                 f"\n{build}: rounds {', '.join(map(str, missing))} lack {build} or "
@@ -211,6 +253,58 @@ def main():
             else:
                 busy = f"{statistics.median(c / r['wall_ns'] for c, r in zip(cpu, records)):.2f}"
             print(f"| {build} | {statistics.median(walls):.2f} | {p10} | {busy} |")
+        print()
+        if metrics[len(METRICS) :]:
+            print(
+                "| build | median allocations | median allocated MiB | "
+                "median peak live growth MiB |"
+            )
+            print("|---|---|---|---|")
+            for build in [args.reference] + builds:
+                records = [
+                    r for rnd in rounds for r in groups.get((workload, build, rnd), [])
+                ]
+                if not records:
+                    continue
+                cells = []
+                for metric, scale, digits in (
+                    ("allocations", 1, 0),
+                    ("allocated_bytes", 1 << 20, 1),
+                    ("peak_live_growth_bytes", 1 << 20, 1),
+                ):
+                    values = [r.get(metric) for r in records]
+                    cells.append(
+                        "unavailable"
+                        if any(value is None for value in values)
+                        else f"{statistics.median(values) / scale:.{digits}f}"
+                    )
+                print(f"| {build} | {' | '.join(cells)} |")
+            print()
+
+    for numerator, denominator in pairs:
+        metrics = metrics_of(
+            r for r in samples if r["workload"] in (numerator, denominator)
+        )
+        print(f"## {numerator} / {denominator}")
+        print("| build | metric | ratio | 95% interval | rounds > 1 |")
+        print("|---|---|---|---|---|")
+        dropped = {}
+        for build in [args.reference] + builds:
+            missing = ratio_rows(
+                build,
+                metrics,
+                by_round(numerator, build),
+                by_round(denominator, build),
+                rounds,
+                f"{build} {numerator} / {denominator}",
+            )
+            if missing:
+                dropped[build] = missing
+        for build, missing in dropped.items():
+            print(
+                f"\n{build}: rounds {', '.join(map(str, missing))} lack "
+                f"{numerator} or {denominator} and are left out."
+            )
         print()
 
 

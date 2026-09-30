@@ -344,5 +344,9 @@ harness = false
 name = "cell_flags_scan_counters"
 harness = false
 
+[[bench]]
+name = "cell_flags_vector_masking"
+harness = false
+
 [lints]
 workspace = true
