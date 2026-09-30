@@ -12,8 +12,8 @@
 | Worktree | `/Users/brendan/code/lance/.claude/worktrees/dependency-aware-cell-flags-43fc32` |
 | Branch | `brendan/dependency-aware-cell-flags` (not merged, no PR) |
 | Baseline | `e3671b2f5730eea927a088a42cbf30e273edc43c` (`origin/main` when the work started) |
-| Final implementation | `2883e66d66aabdd91b96b6073f47598d4671e9c5`, the last commit that changes the prototype's code: `PublicationStager` stages publications of dependent flag outputs from computed rows and plans report-driven follow-ups (see Publication staging), and `read_physical_slice` gains a crate-private variant that also returns row addresses. Later commits change only `prototypes/`. Before it, `2fd300ac2885f07d1357a0a438ceb874d7d6a519`: both `FragmentReader` read funnels keep `main`'s `merge_overlays` call and apply masks afterwards through a plain function, so the read path of unmasked fields is structurally `main`'s. It is not a proven performance fix (see Benchmarks); later commits dropped a performance claim from `mask_cells`'s rustdoc and added a portable counters benchmark (`rust/lance/benches/cell_flags_scan_counters.rs`). Before `2fd300ac2`, `93ada9bca33fd1b747826ec098c451fb1b531778`: `input_changed_rows` resolves a flag registered after the read version through the head's registry, and only a flag the head no longer knows falls back to the file's fields, so a late flag on an unrelated output no longer counts as an input change. Before `93ada9bca`, `8fa1eab0811087a8c2795ab2b10f85646139601f`: staleness checks count a concurrent publication of an upstream output as an input change of the flags computed from it, also where that publication republishes them and so records no clear (`input_changed_rows`), and a deferred group reports its rows deleted or moved since the read version as `RowVacated`. Before that, the last code commit was `25d3cf3e5d988271f05e50de1f47e9885f1b33ba` (a deferred publication file no longer certifies outputs computed from an upstream output staged in the same file, and reports them as `UpstreamNotPublished`), followed by rustdoc and tests in `rust/lance` (`9f0911398`) and `prototypes/`; before that, `26388225a273052b3a1ff0ec705c53da1b68c7cb`, and the commits between it and `25d3cf3e5` change only `prototypes/` (benchmark results, docs and benchmark tooling: `run_paired.sh` gained `ORDER` in `3e8c36ba0672102ad005c6de20858e9a82b32231` and the rustflags check in `f1fb31606`; `analyze.py` gained `--section`/`--title` and `bench/` the rerun scripts after that) and rustdoc in `rust/lance/src/dataset/cell_flag/publication.rs` (the `PublicationReport` conflict table in `4aaa8280c`, the `DependencyConflictPolicy::Reject` description in `4993d350b`) |
-| Benchmarked | Not re-run at `2883e66d6`: it adds a staging API, and the only benchmarked-code change is the shared body of `read_physical_slice`, which no benchmark workload calls. Reads at `2fd300ac2`: `10m-reads-fix-*` (clean builds, flags in round 3 only) and the no-flag counters rotations in `bench/results/10m-noflag-investigation/`. Writes, publication and conflicts were not re-run at `2fd300ac2`, which changes only the read funnels. Full matrix at `21601f894` (`1m`; `10m` subset; `smoke-final`) and at `26388225a` (`1m-clean`, 1M, clean build). Reads at `26388225a` (`10m-reads-clean-*`, clean builds; `1m-reads-maskfix`, `10m-reads-maskfix`, `10m-reads-reversed`, which record `e48573011`, a results-only commit with the same code). The only code change from `21601f894` to `26388225a` is the mask builder (`fragment/cell_flag_mask.rs`). Not re-run at `25d3cf3e5`, `9f0911398` (rustdoc and tests only), `8fa1eab08` or `93ada9bca`: the code commits change only how the report classifies the staged rows of a deferred publication file (reusable, to recompute or vacated) when outputs are chained or a concurrent publication republishes an upstream output, `8fa1eab08` also rows deleted or moved while their group is deferred, and `93ada9bca` how a flag registered after the read version is resolved. No benchmark workload has any of these: none registers an output computed from another output or a flag while a publication is in flight, each publication stages one output, and the only workload that defers groups (`OutputOverride`) writes in place, deleting and moving no rows. The staleness check still scans each concurrent transaction's flag updates once per published flag, now with its replacement files |
+| Final implementation | `792c462d91a7e87ba4866c91fdb9888944ca0a4a`, the last commit that changes the prototype's code (tests of vector masking). The commits before it, newest first: `4f191f852`: masked vector slots carry NULL child values.; `58c874a67`: flat search keeps a sliced batch's null offset (`lance-index`).; `cf8903bac`: unindexed fixed-size-list vector outputs can be masked (see Vector outputs).; `c860edb20`, `4333d632a`: follow-up plans with a subset of outputs, and quiet discards.; `2883e66d6`: `PublicationStager` stages publications of dependent flag outputs from computed rows and plans report-driven follow-ups (see Publication staging), and `read_physical_slice` gains a crate-private variant that also returns row addresses.. Later commits change only `prototypes/`. Before the stager, `2fd300ac2885f07d1357a0a438ceb874d7d6a519` made both `FragmentReader` read funnels keep `main`'s `merge_overlays` call and apply masks afterwards through a plain function, so the read path of unmasked fields is structurally `main`'s. That is a maintainability choice, not a proven speed-up (see Benchmarks). Later commits dropped a performance claim from `mask_cells`'s rustdoc and added a portable counters benchmark (`rust/lance/benches/cell_flags_scan_counters.rs`). Before `2fd300ac2`, `93ada9bca33fd1b747826ec098c451fb1b531778`: `input_changed_rows` resolves a flag registered after the read version through the head's registry, and only a flag the head no longer knows falls back to the file's fields, so a late flag on an unrelated output no longer counts as an input change. Before `93ada9bca`, `8fa1eab0811087a8c2795ab2b10f85646139601f`: staleness checks count a concurrent publication of an upstream output as an input change of the flags computed from it, also where that publication republishes them and so records no clear (`input_changed_rows`), and a deferred group reports its rows deleted or moved since the read version as `RowVacated`. Before that, the last code commit was `25d3cf3e5d988271f05e50de1f47e9885f1b33ba` (a deferred publication file no longer certifies outputs computed from an upstream output staged in the same file, and reports them as `UpstreamNotPublished`), followed by rustdoc and tests in `rust/lance` (`9f0911398`) and `prototypes/`; before that, `26388225a273052b3a1ff0ec705c53da1b68c7cb`, and the commits between it and `25d3cf3e5` change only `prototypes/` (benchmark results, docs and benchmark tooling: `run_paired.sh` gained `ORDER` in `3e8c36ba0672102ad005c6de20858e9a82b32231` and the rustflags check in `f1fb31606`; `analyze.py` gained `--section`/`--title` and `bench/` the rerun scripts after that) and rustdoc in `rust/lance/src/dataset/cell_flag/publication.rs` (the `PublicationReport` conflict table in `4aaa8280c`, the `DependencyConflictPolicy::Reject` description in `4993d350b`) |
+| Benchmarked | Not re-run at `2883e66d6` or later. The stager adds a staging API, and its only change to benchmarked code is the shared body of `read_physical_slice`, which no benchmark workload calls. The vector commits change masking only for fixed-size-list columns and flat search's null handling, and no benchmark workload reads a vector column. Performance acceptance stays open (see Benchmarks). Reads at `2fd300ac2`: `10m-reads-fix-*` (clean builds, flags in round 3 only) and the no-flag counters rotations in `bench/results/10m-noflag-investigation/`. Writes, publication and conflicts were not re-run at `2fd300ac2`, which changes only the read funnels. Full matrix at `21601f894` (`1m`; `10m` subset; `smoke-final`) and at `26388225a` (`1m-clean`, 1M, clean build). Reads at `26388225a` (`10m-reads-clean-*`, clean builds; `1m-reads-maskfix`, `10m-reads-maskfix`, `10m-reads-reversed`, which record `e48573011`, a results-only commit with the same code). The only code change from `21601f894` to `26388225a` is the mask builder (`fragment/cell_flag_mask.rs`). Not re-run at `25d3cf3e5`, `9f0911398` (rustdoc and tests only), `8fa1eab08` or `93ada9bca`: the code commits change only how the report classifies the staged rows of a deferred publication file (reusable, to recompute or vacated) when outputs are chained or a concurrent publication republishes an upstream output, `8fa1eab08` also rows deleted or moved while their group is deferred, and `93ada9bca` how a flag registered after the read version is resolved. No benchmark workload has any of these: none registers an output computed from another output or a flag while a publication is in flight, each publication stages one output, and the only workload that defers groups (`OutputOverride`) writes in place, deleting and moving no rows. The staleness check still scans each concurrent transaction's flag updates once per published flag, now with its replacement files |
 
 Checks on the benchmarked code `26388225a` (run at `f1fb31606`, whose Rust, proto, Python and Java
 sources equal it): `cargo fmt --all -- --check`; `cargo clippy --all --tests --benches -- -D
@@ -26,7 +26,31 @@ source changed, only the Rust binding's struct literal. Java and Python tests we
 `4aaa8280c` (same code as `26388225a`): `cargo test -p lance --doc -- cell_flag
 with_dependency_conflict_policy execute_with_report` (10 passed).
 
-Checks on the final code, at `2883e66d6` (which changes only `rust/lance`):
+Checks on the final code, at `792c462d9`, on macOS:
+- `cargo fmt --all -- --check`
+- `cargo clippy --all --tests --benches -- -D warnings`
+- `cargo test -p lance --lib`: 4581 passed, 3 ignored.
+- `cargo test -p lance-table cell_flag`: 112 passed.
+- `cargo test -p lance-index --lib vector::flat`: 30 passed.
+- `cargo test -p lance --doc -- cell_flag staging PublicationStager ComputedBatch FollowUpPlan`: 15
+  passed.
+
+On Linux (a local Docker container, aarch64, Rust 1.97):
+- `cargo test -p lance --lib -- cell_flag fragment_write_columns`: 458 passed.
+- lance-table `cell_flag`: 112 passed.
+- lance-index `vector::flat`: 30 passed.
+- The doctests: 15 passed.
+- The counters bench compiles.
+
+MSRV: CI's msrv command, `cargo check --profile ci --workspace --tests --benches` with every
+workspace feature except `protoc`, passes under Rust 1.91.0 in the same container.
+
+Two caveats:
+- One intermediate commit, `58c874a67`, fails clippy on its own. The lint fixes for its tests
+  landed in `792c462d9`.
+- `python/`, `java/lance-jni/`, and Linux x86_64 were not built.
+
+Checks on the code at `2883e66d6` (which changes only `rust/lance`):
 - `cargo fmt --all -- --check`
 - `cargo clippy --all --tests --benches -- -D warnings`
 - `cargo test -p lance --lib`: 4516 passed, 3 ignored.
@@ -287,6 +311,54 @@ that a downstream output assigned with its upstream was computed from that upstr
 files of a transaction that is dropped, fails to commit or has groups deferred stay in the data
 directory until `cleanup_old_versions` removes them.
 
+## Vector outputs
+
+A dependent masking flag can hide an unindexed embedding: a top-level, nullable
+`FixedSizeList<Float16 | Float32 | Float64, N>` computed from other fields. The only change needed
+is the registration type gate. Masking, copy-through and the stager handle the type as they are,
+and the flat nearest-neighbor search already skips NULL vectors.
+
+```rust
+dataset.register_cell_flag("embedding", "ready",
+    CellFlagOptions::default().with_clear_on_write(["body"]).with_mask_when_false(true)).await?;
+let snapshot = Arc::new(dataset.clone());
+let stager = PublicationStager::try_new(snapshot.clone(), &["embedding"])?;
+let mut scan = snapshot.scan();
+scan.project(&["body"])?.with_row_address();
+// `embed` returns `_rowaddr` and `embedding` (a FixedSizeListArray) per batch.
+let computed = scan.try_into_stream().await?.map(|batch| batch.and_then(|b| embed(&b)));
+if let Some(publication) = stager.stage(computed).await? {
+    CommitBuilder::new(snapshot)
+        .with_dependency_conflict_policy(DependencyConflictPolicy::Skip)
+        .execute_with_report(publication)
+        .await?;
+}
+// Flat search: rows whose embedding is masked (pending) or computed NULL are never returned.
+let mut scan = dataset.scan();
+scan.nearest("embedding", &query, 10)?.project(&["id"])?;
+```
+
+**Behavior.**
+- *Input writes.* A write to an input masks the embedding in its own version. A stale publication
+  never makes an old embedding visible: under `Reject` it fails, and under `Skip` the changed row
+  is deferred `InputChanged` and a moved row `RowVacated`. A refresh through the stager
+  (`follow_up`, then a pending-row scan) restores the rows with their new values.
+- *Reads.* A masked embedding reads NULL in scans, `IS NULL` / `IS NOT NULL` filters, `count_rows`,
+  SQL, `take`, `take_rows` and late materialization.
+- *Search.* Unindexed nearest-neighbor search is a flat search that returns only visible
+  embeddings, with fewer than k rows when fewer are visible. That holds with prefilters and
+  postfilters, `distance_range`, batch queries and restricted fragments. `fast_search` returns
+  nothing, as it does for any unindexed column.
+- *Stored values.* The child values under a masked slot read as NULL too. Readers that take a
+  fixed-size list's values as a dense matrix without its validity, such as `lance.torch`,
+  therefore never see a stored vector.
+- *Indexes.* Every vector index is refused on a masked embedding: at build (IVF_FLAT, IVF_HNSW_SQ,
+  prebuilt segments) and at commit. Masking an indexed embedding is refused too.
+
+**Found and fixed along the way:** the flat search's `compute_distance` (`lance-index`) dropped
+the bit offset of a sliced batch's null buffer. A scan with a byte budget could then score a NULL
+vector from the values under its slot, and return a masked, stale embedding as the top hit.
+
 ## Conflicts and the `Skip` policy
 
 A publication is checked against every transaction committed in `(read_version, head]`, across
@@ -403,6 +475,9 @@ Supported:
   `take_rows`, late materialization, flat full-text search, update/delete predicates, SQL through
   `Dataset::sql` and the Lance table provider; multi-fragment with deletions, with and without
   stable row ids.
+- Masking of unindexed vector outputs: a nullable fixed-size list of Float16, Float32 or Float64
+  (see Vector outputs), in scans, filters, takes and flat nearest-neighbor search, on V2.0, V2.1
+  and V2.2 storage.
 
 Unsupported, each failing with an explicit error (test in `dataset_cell_flags.rs` unless named):
 
@@ -418,8 +493,8 @@ Unsupported, each failing with an explicit error (test in `dataset_cell_flags.rs
 | Making a masked output non-nullable | `NotSupported` | `…::non_nullable_masked_output` |
 | Setting a dependent flag true outside a `DataReplacement` that writes its output | `NotSupported` / `InvalidInput` | `…::dependent_flag_set_outside_publication`; `lance-table` `change_gate`, `publication_validation_errors` |
 | Masking with an ordinary flag (no `clear_on_write`) | `NotSupported` | `…::masking_ordinary_flag`; `lance-table` `registration_validation_errors::ordinary_mask` |
-| Masking a non-nullable, nested, list, struct, blob or legacy (v1) field | `InvalidInput` / `NotSupported` | `lance-table` `registration_validation_errors`, `masking_registration_rejects_indexed_output_mem_wal_and_legacy_storage` |
-| Any index on a masked output; masking an indexed field | `NotSupported` | `dataset_cell_flags_masking`: `test_indexing_a_masked_field_fails_before_building`, `test_masking_an_indexed_field_is_refused` |
+| Masking a non-nullable, nested, list, struct, blob or legacy (v1) field, or a vector of anything but Float16/32/64 (integer, bfloat16, struct items, nested lists, multivectors) | `InvalidInput` / `NotSupported` | `lance-table` `registration_validation_errors` (incl. `multivector_mask`), `only_float_vector_lists_are_maskable`, `masking_registration_rejects_indexed_output_mem_wal_and_legacy_storage` |
+| Any index on a masked output, scalar, full-text or vector; masking an indexed field | `NotSupported` | `dataset_cell_flags_masking`: `test_indexing_a_masked_field_fails_before_building` (incl. IVF_FLAT and IVF_HNSW_SQ), `test_committing_a_vector_index_built_before_masking_is_refused`, `test_masking_an_indexed_field_is_refused` (BTree, IVF_FLAT) |
 | Row-moving writes without flag state (`merge_insert` `RewriteRows`, raw staged `Update`) on a fragment where an ordinary flag is true | `NotSupported` (retryable when staged before the flag's registration) | `dataset_cell_flags_update`: `test_stateless_row_move_is_refused_where_an_ordinary_flag_is_true`, `test_row_move_retries_over_flag_registered_after_its_read` |
 | Detached commits; batch commits or dataset creation carrying flag changes | `NotSupported` | `test_detached_and_batch_commits_are_refused`, `test_creating_a_dataset_with_cell_flag_changes_is_refused` |
 | Initializing MemWAL or opening a MemWAL writer where a flag masks a field; registering a masking flag where MemWAL is initialized (checked at commit, so also when staged before the other) | `NotSupported` | `dataset_cell_flags_masking::test_mem_wal_and_masking_are_exclusive`; `lance-table` `operation_gate::mem_wal_on_masked`, `masking_registration_rejects_indexed_output_mem_wal_and_legacy_storage` |
@@ -459,6 +534,7 @@ Requirements from the task, with the tests that cover them (files under
 | R | A deferred file's values computed from an upstream it also stages are reported for recomputation (`UpstreamNotPublished`), never as reusable; independent outputs stay reusable | `publication::test_deferred_group_recomputes_outputs_of_its_staged_upstream` (the review's case; a follow-up that follows the report: translating alone, after republishing summary, or with summary in one file), `test_deferred_group_defers_only_rows_its_upstream_assigns` (partially overlapping assignments), `test_deferred_group_defers_each_link_of_a_chain` (three outputs in one file; a follow-up restaging them in one file recomputes the reusable values whose input it republishes), `test_retry_keeps_chained_outputs_of_a_deferred_group_unreusable` (group deferred on the retry, or invalidated during it), `test_deferred_group_keeps_independent_outputs_reusable`. Each checks that every assigned row is reported once and that every reusable staged value is the function of its input at the head |
 | I | A concurrent input change the competitor recorded no clear for (it republished the downstream output with a new upstream value) defers the staged rows as `InputChanged`, never as reusable; rows moved or deleted while their group was deferred are `RowVacated` | `publication::test_deferred_group_defers_rows_whose_upstream_was_republished` (competitor committed before the check, during the retry, or after an earlier attempt deferred the group; partially overlapping rows: the row whose clear was recorded and the one whose clear was not are both deferred, with their sibling, the third stays reusable), `test_deferred_group_defers_rows_whose_published_upstream_was_recomputed` (an upstream already true at the read version, recomputed with a new value), `test_deferred_group_defers_each_link_a_competitor_republishes` (three-level chain; the competitor publishes summary and translation, translation and keywords, the whole chain, or keywords alone), `test_flag_registered_after_the_read_is_resolved` (the upstream's flag registered after the read, unmasked, dropped again or not; an unrelated late flag leaves the row reusable), `test_late_flag_on_an_unrelated_output_changes_no_input` (a late flag on an unrelated output, published by a file that also writes summary, changes no input of translation, under both policies, for an installed group and for one deferred by an earlier attempt: the head's registry resolves it, or, dropped again, it cannot be summary's flag, which the competitor also publishes on the same or the other fragment), `test_deferred_group_keeps_independent_outputs_reusable` (a competitor publishing one or both independent outputs), `test_deferred_group_reports_rows_moved_or_deleted_as_vacated` (update, delete, and a full-row upsert or delete during the retry). Each checks the full report, `reusable_rows`, that every assigned row is reported once, flag state and values, that the competitor's values and flags are unchanged and, for input changes, a follow-up that restages the deferred file from the report: it reuses exactly the reusable staged values, recomputes the deferred rows from the head, keeps the newer results and leaves every visible value the function of its inputs |
 | P | Publication staging from computed rows | `publication::test_stager_*`, 25 functions, covering: incremental refresh across four batchings; a fragment written while its rows stream through `stage()` (12 MiB past the writer's page cache); computed NULL against unassigned; deleted rows (assigned at the snapshot, copied, deleted by a competitor under both policies); several fragments and outputs with masks; an output with an empty assignment (kept flags, proto round trip, fence); copy-through of overlays and masked stale values; a concurrent newer publication under both policies; follow-ups combining the stager with the report (deferred work, planned and recomputed upstreams, an upstream that stays true, several deferred groups, a stager of the stored outputs over a mixed layout); rows moved during publication, found by a pending-row scan; read-version preservation; invalid outputs; chains through undeclared or skipped outputs; a new output beside a stored one (refused, then the workaround); invalid computed rows; nothing to publish. Unit tests in `cell_flag/staging.rs` and `cell_flag/staging/merge.rs` cover the per-window pull and the copy-window alignment checks. Disabling any refusal above, the empty update, the follow-up's version check, its subtraction of true and deleted rows or its upstream propagation, the per-window pull, or pulling while the fragment is written, makes at least one test fail |
+| V | Unindexed vector masking | `masking::test_embedding_publication_through_the_stager`, `test_vectors_of_every_float_width_mask` (Float16/32/64 × V2.0/V2.1/V2.2), `test_input_write_masks_an_embedding_in_its_own_version` (in place and row-moving), `test_masked_embeddings_on_scan_filter_and_take`, `test_unindexed_nearest_skips_masked_embeddings` (exact ids and distances: mixed assigned, pending and computed-NULL rows, k past the visible rows, indexed and unindexed prefilter, postfilter, `distance_range`, batch queries, restricted fragments, `fast_search`, cold reopen, at three batch sizes), `test_nearest_over_sliced_batches_skips_masked_embeddings` (byte budgets), `test_stale_embedding_publication_stays_masked_until_refreshed` (both policies), index refusals as in the table above; `lance-table` `masking_registration_accepts_a_float_vector`, `only_float_vector_lists_are_maskable`; `lance-index` `vector::flat::test_distances_of_a_sliced_batch_keep_its_nulls` |
 
 `test_refresh_loop_never_shows_a_stale_output` runs the whole loop on three fragments with
 `summary <- title, body` and `translation <- body, language`, and checks every version by time
@@ -676,6 +752,9 @@ Performance bottlenecks:
   a dense update leaves a hole pattern no run compression helps; keeping dependent-flag bits on
   deleted rows (they are unreadable) would keep those fragments `Full`. Its moved-rows payload
   (`RoaringTreemap` of source addresses) adds 170 KB to the transaction at 100k moved rows.
+- **Vector outputs are flat-search only.** Without vector-index maintenance there is no ANN over a
+  masked embedding: every search reads and scores the whole column. Partly masked vector batches
+  are also copied to null their child values.
 - **Masked scans over partial state** still cost 1.5–1.8× after the run-based mask
   (`1m-reads-maskfix`; 1.68–1.80× at 10M in `10m-reads-clean-*`); the remainder is per-read offset
   materialization. A cached per-fragment validity buffer or masking in the decoder would remove
