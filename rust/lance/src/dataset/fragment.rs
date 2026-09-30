@@ -904,6 +904,8 @@ fn duplicate_nested_path(data_type: &DataType, path: &str) -> Option<String> {
 
 /// Remove a staged file that will not be committed. Best effort: it is
 /// unreachable either way, and must not mask the error that caused it.
+/// What is already missing counts as removed: a file without blobs has no
+/// sidecars, and a local writer dropped mid-write never creates its file.
 pub(crate) async fn discard_staged_file(dataset: &Dataset, path: &Path) {
     // Blob v2 spills sidecars into data/<file-stem>/ beside the file, and
     // those are the large ones; leaving them is what makes a routine
@@ -913,10 +915,13 @@ pub(crate) async fn discard_staged_file(dataset: &Dataset, path: &Path) {
         .and_then(|name| name.strip_suffix(".lance"))
         .map(|stem| dataset.data_dir().join(stem))
         && let Err(delete_error) = dataset.object_store.remove_dir_all(stem.clone()).await
+        && !matches!(delete_error, Error::NotFound { .. })
     {
         log::warn!("failed to delete staged blob sidecars '{stem}': {delete_error}");
     }
-    if let Err(delete_error) = dataset.object_store.delete(path).await {
+    if let Err(delete_error) = dataset.object_store.delete(path).await
+        && !matches!(delete_error, Error::NotFound { .. })
+    {
         log::warn!("failed to delete staged column file '{path}': {delete_error}");
     }
 }
