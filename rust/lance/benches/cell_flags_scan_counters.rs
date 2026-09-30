@@ -21,12 +21,18 @@
 //! value the platform or machine cannot provide is written as null, never as
 //! zero.
 //!
+//! With `BENCH_COUNT_ALLOCATIONS=1`, samples also carry what
+//! `cell_flags_common/alloc.rs`'s counting allocator saw; otherwise those
+//! fields are null.
+//!
 //! Each measure run writes one `run` record (binary, dataset identity, counter
 //! sources) before its `sample` records. Uses only APIs that exist on `main`,
 //! so the same file builds against the baseline and the prototype.
 
 #![allow(clippy::print_stdout)]
 
+#[path = "cell_flags_common/alloc.rs"]
+mod allocations;
 #[path = "cell_flags_common/mod.rs"]
 mod common;
 #[path = "cell_flags_common/counters.rs"]
@@ -47,6 +53,7 @@ use lance::dataset::{Dataset, ProjectionRequest};
 use lance::session::Session;
 use serde_json::json;
 
+use allocations::Allocations;
 use common::{
     BenchConfig, OutputColumn, SimulatedUdf, commit, create_articles_dataset, scattered_ids,
     stage_refresh,
@@ -68,6 +75,7 @@ const WORKLOADS: [&str; 5] = [
 ];
 
 fn main() {
+    allocations::count_from_env();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -125,6 +133,7 @@ async fn measure(config: &BenchConfig, uri: &str) {
     }
     let rows = dataset.count_rows(None).await.expect("count rows") as u64;
     let hardware = hardware_counters_advance();
+    let allocation_source = allocations::is_counting().then_some(allocations::SOURCE);
 
     if let Some(parent) = Path::new(&out_path).parent() {
         std::fs::create_dir_all(parent).expect("create the BENCH_OUT directory");
@@ -154,6 +163,9 @@ async fn measure(config: &BenchConfig, uri: &str) {
             "cpu_ns": CPU_NS_SOURCE,
             "instructions": if hardware { HARDWARE_SOURCE } else { None },
             "cycles": if hardware { HARDWARE_SOURCE } else { None },
+            "allocations": allocation_source,
+            "allocated_bytes": allocation_source,
+            "peak_live_growth_bytes": allocation_source,
         },
     });
     writeln!(out, "{run}").expect("write run record");
@@ -164,9 +176,11 @@ async fn measure(config: &BenchConfig, uri: &str) {
         }
         for sample in 0..config.warmup + config.read_samples {
             let before = Counters::read(hardware);
+            let allocations = Allocations::start();
             let start = Instant::now();
             let observed = read(&dataset, workload, rows).await;
             let wall_ns = start.elapsed().as_nanos() as u64;
+            let allocated = allocations.since();
             let after = Counters::read(hardware);
             if sample < config.warmup {
                 continue;
@@ -181,6 +195,9 @@ async fn measure(config: &BenchConfig, uri: &str) {
                 "cpu_ns": delta(after.cpu_ns, before.cpu_ns),
                 "instructions": delta(after.instructions, before.instructions),
                 "cycles": delta(after.cycles, before.cycles),
+                "allocations": allocated.map(|delta| delta.allocations),
+                "allocated_bytes": allocated.map(|delta| delta.allocated_bytes),
+                "peak_live_growth_bytes": allocated.map(|delta| delta.peak_live_growth_bytes),
                 "rows": observed,
             });
             writeln!(out, "{record}").expect("write sample");

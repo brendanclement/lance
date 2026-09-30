@@ -16,6 +16,13 @@ medians are printed too.
 ``--pair A:B`` (repeatable) also compares two workloads within each build: the
 geometric mean over rounds of median(A) / median(B), as for builds.
 
+Samples with phases (cell_flags_costs) also count as one workload per phase,
+named ``<workload>.<phase>``, with the sample's rows. Where samples carry
+object-store IO or file sizes, their medians are printed too. ``--only REGEX``
+limits the per-workload tables to matching workloads; pairs are printed
+whatever it selects. ``--spread`` adds each build's range of per-round median
+wall times, the run-to-run variation.
+
 A metric the bench recorded as null (unavailable on that platform or machine)
 is reported as unavailable, never as a ratio. Records written before the bench
 recorded CPU time in nanoseconds (no ``schema`` field) store it in Mach ticks;
@@ -42,6 +49,14 @@ ROUND_FILE = re.compile(r"round(\d+)-(.+)\.jsonl$")
 SCHEMA = 2
 METRICS = ("wall_ns", "instructions", "cycles")
 ALLOCATION_METRICS = ("allocations", "allocated_bytes", "peak_live_growth_bytes")
+IO_METRICS = (
+    ("read_bytes", "read MiB", 1 << 20, 2),
+    ("written_bytes", "written MiB", 1 << 20, 2),
+    ("read_iops", "read requests", 1, 0),
+    ("write_iops", "write requests", 1, 0),
+    ("manifest_bytes", "manifest KiB", 1 << 10, 1),
+    ("transaction_bytes", "transaction KiB", 1 << 10, 1),
+)
 
 
 def fail(message):
@@ -77,6 +92,19 @@ def load(directory):
                 fail(f"{path}: unknown record kind {kind!r}")
             record["round"] = int(match.group(1))
             samples.append(record)
+            for phase in record.get("phase_order") or []:
+                samples.append(
+                    dict(
+                        record["phases"][phase],
+                        record=kind,
+                        schema=record["schema"],
+                        build=record["build"],
+                        workload=f"{record['workload']}.{phase}",
+                        sample=record["sample"],
+                        rows=record["rows"],
+                        round=record["round"],
+                    )
+                )
     return samples, runs
 
 
@@ -128,11 +156,12 @@ def ratio_rows(label, metrics, numerators, denominators, rounds, describe):
             ours = statistics.median(r[metric] for r in numerators[rnd])
             ref = statistics.median(r[metric] for r in denominators[rnd])
             if ours <= 0 or ref <= 0:
-                fail(
-                    f"{describe} round {rnd}: median {metric} is {ours} over {ref}; "
-                    "a ratio needs positive values"
-                )
+                ratios = None
+                break
             ratios.append(ours / ref)
+        if ratios is None:
+            print(f"| {label} | {metric} | a median is zero | — | — |")
+            continue
         if not ratios:
             continue
         low, high = bootstrap(ratios)
@@ -171,6 +200,15 @@ def main():
         "--legacy-mach-timebase",
         type=fractions.Fraction,
         help="nanoseconds per Mach tick for records without a schema, e.g. 125/3",
+    )
+    parser.add_argument(
+        "--only",
+        help="print per-workload tables only for workloads matching this regex",
+    )
+    parser.add_argument(
+        "--spread",
+        action="store_true",
+        help="also print the range of per-round median wall times",
     )
     parser.add_argument(
         "--pair",
@@ -213,6 +251,8 @@ def main():
         return {rnd: groups.get((workload, build, rnd)) for rnd in rounds}
 
     for workload in workloads:
+        if args.only and not re.search(args.only, workload):
+            continue
         metrics = metrics_of(r for r in samples if r["workload"] == workload)
         print(f"## {workload}")
         print("| build | metric | ratio to reference | 95% interval | rounds > 1 |")
@@ -235,8 +275,14 @@ def main():
                 f"{args.reference} and are left out."
             )
         print()
-        print("| build | median wall ms | p10 wall ms | busy cores |")
-        print("|---|---|---|---|")
+        if args.spread:
+            print(
+                "| build | median wall ms | p10 wall ms | round medians ms | busy cores |"
+            )
+            print("|---|---|---|---|---|")
+        else:
+            print("| build | median wall ms | p10 wall ms | busy cores |")
+            print("|---|---|---|---|")
         for build in [args.reference] + builds:
             records = [
                 r for rnd in rounds for r in groups.get((workload, build, rnd), [])
@@ -247,12 +293,24 @@ def main():
             p10 = (
                 f"{statistics.quantiles(walls, n=10)[0]:.2f}" if len(walls) > 1 else "—"
             )
+            round_medians = [
+                statistics.median(r["wall_ns"] / 1e6 for r in group)
+                for rnd in rounds
+                if (group := groups.get((workload, build, rnd)))
+            ]
+            spread = (
+                f" {min(round_medians):.2f}–{max(round_medians):.2f} |"
+                if args.spread
+                else ""
+            )
             cpu = [cpu_ns(r, timebase) for r in records]
             if any(value is None for value in cpu):
                 busy = "unavailable"
             else:
                 busy = f"{statistics.median(c / r['wall_ns'] for c, r in zip(cpu, records)):.2f}"
-            print(f"| {build} | {statistics.median(walls):.2f} | {p10} | {busy} |")
+            print(
+                f"| {build} | {statistics.median(walls):.2f} | {p10} |{spread} {busy} |"
+            )
         print()
         if metrics[len(METRICS) :]:
             print(
@@ -272,6 +330,32 @@ def main():
                     ("allocated_bytes", 1 << 20, 1),
                     ("peak_live_growth_bytes", 1 << 20, 1),
                 ):
+                    values = [r.get(metric) for r in records]
+                    cells.append(
+                        "unavailable"
+                        if any(value is None for value in values)
+                        else f"{statistics.median(values) / scale:.{digits}f}"
+                    )
+                print(f"| {build} | {' | '.join(cells)} |")
+            print()
+        io_metrics = [
+            entry
+            for entry in IO_METRICS
+            if any(entry[0] in r for r in samples if r["workload"] == workload)
+        ]
+        if io_metrics:
+            print(
+                f"| build | {' | '.join(f'median {entry[1]}' for entry in io_metrics)} |"
+            )
+            print(f"|---|{'---|' * len(io_metrics)}")
+            for build in [args.reference] + builds:
+                records = [
+                    r for rnd in rounds for r in groups.get((workload, build, rnd), [])
+                ]
+                if not records:
+                    continue
+                cells = []
+                for metric, _, scale, digits in io_metrics:
                     values = [r.get(metric) for r in records]
                     cells.append(
                         "unavailable"

@@ -37,11 +37,8 @@
 //! `prototypes/dependent-cell-flags/bench/run_counters_rotation.py --bench
 //! cell_flags_vector_masking` drives it. The run record's dataset identity
 //! lists every table and hashes their manifests into one `manifest_blake3`.
-//! Samples also carry what a counting global allocator saw: `allocations`
-//! (calls to `alloc`, `alloc_zeroed` and `realloc`), `allocated_bytes` (the
-//! sizes they requested, a `realloc` counting its new size) and
-//! `peak_live_growth_bytes` (the most live bytes above those live at the
-//! sample's start). They count every thread of the process.
+//! Samples also carry what `cell_flags_common/alloc.rs`'s counting allocator
+//! saw, with `BENCH_COUNT_ALLOCATIONS=1`, and null otherwise.
 //!
 //! Uses the prototype's cell flag API, so it does not build on `main`. Sets
 //! `LANCE_ENABLE_UNSTABLE_CELL_FLAGS=1` itself, since release builds refuse
@@ -49,16 +46,16 @@
 
 #![allow(clippy::print_stdout)]
 
+#[path = "cell_flags_common/alloc.rs"]
+mod allocations;
 #[path = "cell_flags_common/mod.rs"]
 mod common;
 #[path = "cell_flags_common/counters.rs"]
 mod counters;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use arrow_array::cast::AsArray;
@@ -83,6 +80,7 @@ use lance_table::feature_flags::ENABLE_UNSTABLE_CELL_FLAGS_ENV;
 use roaring::RoaringTreemap;
 use serde_json::{Map, Value, json};
 
+use allocations::Allocations;
 use common::{BenchConfig, dir_bytes, merge_in_place, scattered_ids, splitmix64};
 use counters::{
     CPU_NS_SOURCE, Counters, HARDWARE_SOURCE, dataset_identity, delta, hardware_counters_advance,
@@ -184,94 +182,6 @@ impl Read {
 }
 
 // ---------------------------------------------------------------------------
-// Allocation counting
-// ---------------------------------------------------------------------------
-
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// The system allocator, counting what passes through it.
-struct CountingAllocator;
-
-impl CountingAllocator {
-    fn allocated(size: usize) {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        ALLOCATED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
-        let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
-        PEAK_LIVE_BYTES.fetch_max(live, Ordering::Relaxed);
-    }
-}
-
-// SAFETY: every method forwards its arguments unchanged to `System` and
-// returns its result; the counters only record sizes.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
-        if !ptr.is_null() {
-            Self::allocated(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc_zeroed(layout);
-        if !ptr.is_null() {
-            Self::allocated(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let moved = System.realloc(ptr, layout, new_size);
-        if !moved.is_null() {
-            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-            Self::allocated(new_size);
-        }
-        moved
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-#[derive(Clone, Copy)]
-struct Allocations {
-    count: u64,
-    bytes: u64,
-    live_bytes: usize,
-}
-
-impl Allocations {
-    /// Start a sample: the peak restarts from the bytes live now.
-    fn start() -> Self {
-        let live_bytes = LIVE_BYTES.load(Ordering::Relaxed);
-        PEAK_LIVE_BYTES.store(live_bytes, Ordering::Relaxed);
-        Self {
-            count: ALLOCATIONS.load(Ordering::Relaxed),
-            bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
-            live_bytes,
-        }
-    }
-
-    /// `(allocations, allocated_bytes, peak_live_growth_bytes)` since `self`.
-    fn since(self) -> (u64, u64, u64) {
-        let peak = PEAK_LIVE_BYTES.load(Ordering::Relaxed);
-        (
-            ALLOCATIONS.load(Ordering::Relaxed) - self.count,
-            ALLOCATED_BYTES.load(Ordering::Relaxed) - self.bytes,
-            peak.saturating_sub(self.live_bytes) as u64,
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Data
 // ---------------------------------------------------------------------------
 
@@ -368,6 +278,7 @@ fn cleared_rows(cleared: Cleared, rows: u64) -> RoaringTreemap {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    allocations::count_from_env();
     if std::env::var_os(ENABLE_UNSTABLE_CELL_FLAGS_ENV).is_none() {
         // SAFETY: no other thread exists yet; the runtime starts below.
         unsafe { std::env::set_var(ENABLE_UNSTABLE_CELL_FLAGS_ENV, "1") };
@@ -721,6 +632,7 @@ async fn measure(config: &BenchConfig, root: &Path) {
     }
     assert!(!workloads.is_empty(), "BENCH_WORKLOADS selects no workload");
     let hardware = hardware_counters_advance();
+    let allocation_source = allocations::is_counting().then_some(allocations::SOURCE);
 
     if let Some(parent) = Path::new(&out_path).parent() {
         std::fs::create_dir_all(parent).expect("create the BENCH_OUT directory");
@@ -751,9 +663,9 @@ async fn measure(config: &BenchConfig, root: &Path) {
             "cpu_ns": CPU_NS_SOURCE,
             "instructions": if hardware { HARDWARE_SOURCE } else { None },
             "cycles": if hardware { HARDWARE_SOURCE } else { None },
-            "allocations": "counting #[global_allocator] over std::alloc::System",
-            "allocated_bytes": "counting #[global_allocator] over std::alloc::System",
-            "peak_live_growth_bytes": "counting #[global_allocator] over std::alloc::System",
+            "allocations": allocation_source,
+            "allocated_bytes": allocation_source,
+            "peak_live_growth_bytes": allocation_source,
         },
     });
     writeln!(out, "{run}").expect("write run record");
@@ -766,7 +678,7 @@ async fn measure(config: &BenchConfig, root: &Path) {
             let start = Instant::now();
             let observed = read_once(&tables[*index], *read, &query, take).await;
             let wall_ns = start.elapsed().as_nanos() as u64;
-            let (allocation_count, allocated_bytes, peak_live_growth_bytes) = allocations.since();
+            let allocated = allocations.since();
             let after = Counters::read(hardware);
             if cycle < config.warmup {
                 continue;
@@ -783,9 +695,9 @@ async fn measure(config: &BenchConfig, root: &Path) {
                 "cpu_ns": delta(after.cpu_ns, before.cpu_ns),
                 "instructions": delta(after.instructions, before.instructions),
                 "cycles": delta(after.cycles, before.cycles),
-                "allocations": allocation_count,
-                "allocated_bytes": allocated_bytes,
-                "peak_live_growth_bytes": peak_live_growth_bytes,
+                "allocations": allocated.map(|delta| delta.allocations),
+                "allocated_bytes": allocated.map(|delta| delta.allocated_bytes),
+                "peak_live_growth_bytes": allocated.map(|delta| delta.peak_live_growth_bytes),
                 "rows": observed,
             });
             writeln!(out, "{record}").expect("write sample");
