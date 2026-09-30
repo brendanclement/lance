@@ -1,0 +1,207 @@
+From 8d09fb6236b27a4be9acf41cc086fb9844815396 Mon Sep 17 00:00:00 2001
+From: Brendan Clement <brendan.clement@lancedb.com>
+Date: Wed, 30 Sep 2026 09:29:33 -0500
+Subject: [PATCH] fix: keep a sliced batch's null offset when flat search
+ scores vectors
+
+compute_distance pushed the merged row-id and vector validity onto the
+vectors with null_bit_buffer(b.buffer()), which drops the NullBuffer's bit
+offset: the rebuilt array has offset 0, so a sliced batch read its validity
+from the parent's first bit. A scan with batch_size_bytes rechunks batches
+into zero-copy slices, and when no row-id nulls are merged in (a fragment
+without deletions) the vector's own offset NullBuffer was used as is. Flat
+search then scored a NULL vector from the values stored under its slot,
+returned it, and dropped a valid vector whose bit it misread.
+
+Pass the NullBuffer itself with nulls(), which keeps its offset. A unit
+test scores a sliced batch with and without row-id nulls, and a scanner
+test runs single-query and batch flat KNN over a two-fragment dataset with
+NULL vectors under byte budgets on V2_0, V2_1 and V2_2 storage.
+---
+ rust/lance-index/src/vector/flat.rs |  52 +++++++++++++-
+ rust/lance/src/dataset/scanner.rs   | 102 ++++++++++++++++++++++++++++
+ 2 files changed, 153 insertions(+), 1 deletion(-)
+
+diff --git a/rust/lance-index/src/vector/flat.rs b/rust/lance-index/src/vector/flat.rs
+index 4a9d12fab..9d4811f67 100644
+--- a/rust/lance-index/src/vector/flat.rs
++++ b/rust/lance-index/src/vector/flat.rs
+@@ -113,7 +113,7 @@ pub async fn compute_distance(
+         let vectors = vectors
+             .into_data()
+             .into_builder()
+-            .null_bit_buffer(validity_buffer.map(|b| b.buffer().clone()))
++            .nulls(validity_buffer)
+             .build()
+             .map(make_array)?;
+         let distances = match vectors.data_type() {
+@@ -137,3 +137,53 @@ pub async fn compute_distance(
+     })
+     .await?
+ }
++
++#[cfg(test)]
++mod tests {
++    use arrow_array::types::Float32Type;
++    use arrow_array::{FixedSizeListArray, UInt64Array};
++    use rstest::rstest;
++
++    use super::*;
++
++    /// A slice's null buffer starts at the slice's offset into its parent's,
++    /// as in the batches of a scan rechunked by bytes. Vectors 1 and 6 are
++    /// NULL, so reading the slice's validity from the parent's first bit
++    /// would score vector 6 and drop vector 5. Row id 7 is NULL, for a
++    /// deleted row.
++    #[rstest]
++    #[case::without_row_ids(None, [Some(16.0), Some(25.0), None, Some(49.0)])]
++    #[case::row_ids_without_nulls(
++        Some(UInt64Array::from_iter_values(0..8)),
++        [Some(16.0), Some(25.0), None, Some(49.0)]
++    )]
++    #[case::row_ids_with_nulls(
++        Some(UInt64Array::from_iter((0..8).map(|row| (row != 7).then_some(row)))),
++        [Some(16.0), Some(25.0), None, None]
++    )]
++    #[tokio::test]
++    async fn test_distances_of_a_sliced_batch_keep_its_nulls(
++        #[case] row_ids: Option<UInt64Array>,
++        #[case] expected: [Option<f32>; 4],
++    ) {
++        let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
++            (0..8).map(|row| (row % 5 != 1).then_some([Some(row as f32), Some(0.0)])),
++            2,
++        );
++        let mut columns = vec![("vector", Arc::new(vectors) as ArrayRef)];
++        if let Some(row_ids) = row_ids {
++            columns.push((ROW_ID, Arc::new(row_ids) as ArrayRef));
++        }
++        let batch = RecordBatch::try_from_iter(columns).unwrap().slice(4, 4);
++        let key = Arc::new(Float32Array::from(vec![0.0, 0.0]));
++
++        let batch = compute_distance(key, DistanceType::L2, "vector", batch)
++            .await
++            .unwrap();
++        let distances: Vec<_> = batch[DIST_COL]
++            .as_primitive::<Float32Type>()
++            .iter()
++            .collect();
++        assert_eq!(distances, expected);
++    }
++}
+diff --git a/rust/lance/src/dataset/scanner.rs b/rust/lance/src/dataset/scanner.rs
+index 3994c66f3..414c91e59 100644
+--- a/rust/lance/src/dataset/scanner.rs
++++ b/rust/lance/src/dataset/scanner.rs
+@@ -12429,6 +12429,108 @@ mod test {
+         );
+     }
+ 
++    /// A byte budget rechunks the scan's batches into zero-copy slices, so the
++    /// vector validity a search sees starts mid-buffer, and without a deletion
++    /// no row-id nulls are merged into a fresh buffer. Each NULL vector holds
++    /// the first query, so scoring one from a misread validity bit returns it
++    /// and drops a valid vector.
++    #[rstest]
++    #[tokio::test]
++    async fn test_flat_knn_over_sliced_batches_skips_null_vectors(
++        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
++        data_storage_version: LanceFileVersion,
++    ) {
++        let is_null = |id: u32| id % 5 == 1;
++        let values = Float32Array::from_iter_values((0..16).flat_map(|id| {
++            if is_null(id) {
++                [-1.0, 0.0]
++            } else {
++                [id as f32, 0.0]
++            }
++        }));
++        let vectors = FixedSizeListArray::try_new(
++            Arc::new(ArrowField::new("item", DataType::Float32, true)),
++            2,
++            Arc::new(values),
++            Some((0..16).map(|id| !is_null(id)).collect()),
++        )
++        .unwrap();
++        let batch = RecordBatch::try_from_iter([
++            (
++                "id",
++                Arc::new(UInt32Array::from_iter_values(0..16)) as ArrayRef,
++            ),
++            ("vec", Arc::new(vectors) as ArrayRef),
++        ])
++        .unwrap();
++        let schema = batch.schema();
++        let dataset = Dataset::write(
++            RecordBatchIterator::new([Ok(batch)], schema),
++            "memory://",
++            Some(WriteParams {
++                max_rows_per_file: 8,
++                data_storage_version: Some(data_storage_version),
++                ..Default::default()
++            }),
++        )
++        .await
++        .unwrap();
++        assert_eq!(dataset.get_fragments().len(), 2);
++
++        let hits = |batch: RecordBatch| -> Vec<(u32, f32)> {
++            let ids = batch["id"].as_primitive::<UInt32Type>().values().to_vec();
++            let distances = batch[DIST_COL].as_primitive::<Float32Type>();
++            ids.into_iter().zip(distances.values().to_vec()).collect()
++        };
++        // Every valid vector, nearest first, for a query of `[x, 0]`.
++        let nearest = |x: f32| -> Vec<(u32, f32)> {
++            let mut hits = (0..16)
++                .filter(|id| !is_null(*id))
++                .map(|id| (id, (id as f32 - x).powi(2)))
++                .collect::<Vec<_>>();
++            hits.sort_by(|left, right| left.1.total_cmp(&right.1));
++            hits
++        };
++        let queries = FixedSizeListArray::try_new_from_values(
++            Float32Array::from(vec![-1.0, 0.0, 16.0, 0.0]),
++            2,
++        )
++        .unwrap();
++        for bytes in (64..=512).step_by(64) {
++            let mut scan = dataset.scan();
++            scan.nearest("vec", &queries.value(0), 16)
++                .unwrap()
++                .project(&["id"])
++                .unwrap()
++                .batch_size_bytes(bytes);
++            let batch = scan.try_into_batch().await.unwrap();
++            assert_eq!(hits(batch), nearest(-1.0), "{bytes} bytes");
++
++            let mut scan = dataset.scan();
++            scan.nearest("vec", &queries, 16)
++                .unwrap()
++                .project(&["id"])
++                .unwrap()
++                .batch_size_bytes(bytes);
++            let batch = scan.try_into_batch().await.unwrap();
++            let first_query_rows = batch[QUERY_INDEX_COL]
++                .as_primitive::<Int32Type>()
++                .values()
++                .iter()
++                .filter(|query_index| **query_index == 0)
++                .count();
++            let rest = batch.num_rows() - first_query_rows;
++            assert_eq!(
++                [
++                    hits(batch.slice(0, first_query_rows)),
++                    hits(batch.slice(first_query_rows, rest))
++                ],
++                [nearest(-1.0), nearest(16.0)],
++                "{bytes} bytes"
++            );
++        }
++    }
++
+     #[rstest]
+     #[tokio::test]
+     async fn test_refine_factor(
+-- 
+2.50.1 (Apple Git-155)
+
