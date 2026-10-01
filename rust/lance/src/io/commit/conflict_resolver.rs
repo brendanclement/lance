@@ -6749,6 +6749,7 @@ mod tests {
                     new_frags: fragments.iter().map(FragDigest::from).collect(),
                 }],
                 RoaringBitmap::from_iter([dest_id as u32]),
+                dataset.manifest.version,
             )
             .await
             .unwrap();

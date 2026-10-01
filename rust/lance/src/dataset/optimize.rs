@@ -2401,10 +2401,11 @@ pub struct RewriteResult {
     pub row_addrs: Option<Vec<u8>>,
 }
 
+/// Returns the version the reservation committed at; `dataset` is not moved to it.
 async fn reserve_fragment_ids(
     dataset: &Dataset,
     fragments: impl ExactSizeIterator<Item = &mut Fragment>,
-) -> Result<()> {
+) -> Result<u64> {
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::ReserveFragments {
@@ -2434,7 +2435,7 @@ async fn reserve_fragment_ids(
         fragment.id = new_id as u64;
     }
 
-    Ok(())
+    Ok(manifest.version)
 }
 
 /// Rewrite the files in a single task.
@@ -3231,15 +3232,20 @@ pub async fn commit_compaction(
         .collect();
 
     // Single reserve_fragment_ids for all address-style tasks
+    let mut reserved_version = None;
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
             .filter(|t| t.row_addrs.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
-        if let Err(e) = reserve_fragment_ids(dataset, frags.into_iter()).await {
-            cleanup_compaction_files_after_reservation_failure(dataset, &all_new_fragments).await;
-            return Err(e);
+        match reserve_fragment_ids(dataset, frags.into_iter()).await {
+            Ok(version) => reserved_version = Some(version),
+            Err(e) => {
+                cleanup_compaction_files_after_reservation_failure(dataset, &all_new_fragments)
+                    .await;
+                return Err(e);
+            }
         }
     }
 
@@ -3469,7 +3475,7 @@ pub async fn commit_compaction(
     // transitions riding the in-memory rewrite intent that
     // `build_frag_reuse_rewrite_entry` assembles onto the entry at every
     // commit attempt -- is decided HERE, at commit time, from the freshest
-    // state this handle has (the id reservations above advanced it), not
+    // state this handle has (the id reservations above do not advance it), not
     // from a sample taken when the compaction started: another writer may
     // have tagged the table in between. The record's BASE, however, is the
     // snapshot at `tasks_read_version`: the commit path works out what the
@@ -3560,7 +3566,18 @@ pub async fn commit_compaction(
                     .await?,
             )
         } else {
-            Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
+            // The rewrite publishes right after the reservation unless another commit
+            // lands in between, in which case `finish_rewrite` restamps it.
+            let dataset_version = reserved_version.unwrap_or(dataset.manifest.version);
+            Some(
+                build_new_frag_reuse_index(
+                    dataset,
+                    frag_reuse_groups,
+                    new_fragment_bitmap,
+                    dataset_version,
+                )
+                .await?,
+            )
         }
     } else {
         if options.defer_index_remap {
@@ -7516,6 +7533,201 @@ mod tests {
             _ => 0,
         };
         assert_eq!(dataset.count_rows(None).await.unwrap(), rows + appended);
+    }
+
+    /// Reuse versions over fragments the dataset never had, to size a stored history
+    /// without compacting that much data.
+    fn padding_reuse_versions(count: u64) -> Vec<lance_index::frag_reuse::FragReuseVersion> {
+        use lance_index::frag_reuse::{FragDigest, FragReuseVersion};
+        let digest = |id: u64| FragDigest {
+            id,
+            physical_rows: 4,
+            num_deleted_rows: 0,
+        };
+        (0..count)
+            .map(|i| {
+                let old_id = 1_000 + i;
+                let mut changed_row_addrs = Vec::new();
+                RoaringTreemap::from_iter((old_id << 32)..(old_id << 32) + 4)
+                    .serialize_into(&mut changed_row_addrs)
+                    .unwrap();
+                FragReuseVersion {
+                    dataset_version: 1,
+                    groups: vec![FragReuseGroup {
+                        changed_row_addrs,
+                        old_frags: vec![digest(old_id)],
+                        new_frags: vec![digest(100_000 + i)],
+                    }],
+                }
+            })
+            .collect()
+    }
+
+    async fn commit_padding_reuse_history(dataset: &mut Dataset, count: usize) -> IndexMetadata {
+        use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+        let details = lance_index::frag_reuse::FragReuseIndexDetails {
+            versions: padding_reuse_versions(count as u64),
+        };
+        let new_fragments = (0..count as u32).map(|i| 100_000 + i).collect();
+        let entry = build_frag_reuse_index_metadata(dataset, None, details, new_fragments)
+            .await
+            .unwrap();
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![entry.clone()],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        entry
+    }
+
+    /// The most padding versions whose details still fit inline.
+    fn inline_padding_capacity() -> usize {
+        use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+        use prost::Message;
+        let versions = padding_reuse_versions(5_000);
+        let fits = |count: usize| {
+            InlineContent::from(&lance_index::frag_reuse::FragReuseIndexDetails {
+                versions: versions[..count].to_vec(),
+            })
+            .encoded_len()
+                <= 204_800
+        };
+        let (mut low, mut high) = (0, versions.len());
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if fits(mid) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        assert!(low < versions.len());
+        low
+    }
+
+    fn stores_reuse_details_externally(entry: &IndexMetadata) -> bool {
+        let proto = entry
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<lance_table::format::pb::FragmentReuseIndexDetails>()
+            .unwrap();
+        matches!(
+            proto.content,
+            Some(lance_table::format::pb::fragment_reuse_index_details::Content::External(_))
+        )
+    }
+
+    /// The index directories holding a reuse details file.
+    fn reuse_details_dirs(uri: &str) -> HashSet<String> {
+        std::fs::read_dir(format!("{uri}/_indices"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|dir| {
+                dir.join(lance_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME)
+                    .exists()
+            })
+            .map(|dir| dir.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn reuse_details_requests(
+        stats: &lance_io::utils::tracking_store::IoStats,
+        method: &str,
+    ) -> usize {
+        stats
+            .requests
+            .iter()
+            .filter(|request| {
+                request.method.starts_with(method)
+                    && request
+                        .path
+                        .as_ref()
+                        .ends_with(lance_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME)
+            })
+            .count()
+    }
+
+    /// An uncontended commit publishes right after its reservation, so its reuse
+    /// details are written once and no provisional copy is left behind.
+    #[rstest]
+    #[case::over_an_external_history(true)]
+    #[case::crossing_into_external_storage(false)]
+    #[tokio::test]
+    async fn test_deferred_compaction_writes_reuse_details_once(#[case] external_before: bool) {
+        let dir = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(100),
+                Some(WriteParams {
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        create_scalar_index(&mut dataset, "i", false).await;
+        // Scattered deletions make the compaction's own version larger than a padding one.
+        dataset.delete("i % 3 = 1").await.unwrap();
+        let capacity = inline_padding_capacity();
+        let history = commit_padding_reuse_history(
+            &mut dataset,
+            if external_before {
+                capacity + 1
+            } else {
+                capacity
+            },
+        )
+        .await;
+        assert_eq!(stores_reuse_details_externally(&history), external_before);
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 200,
+            defer_index_remap: true,
+            excluded_fragment_ids: fragments_except(&dataset, &[0, 1]),
+            ..Default::default()
+        };
+        let result = plan_one_task(&dataset, &options).await;
+        let dirs_before = reuse_details_dirs(dir.as_str());
+        dataset.object_store.io_stats_incremental();
+        commit_one(&mut dataset, result, &options).await.unwrap();
+        let stats = dataset.object_store.io_stats_incremental();
+
+        assert_eq!(reuse_details_requests(&stats, "put"), 1);
+        let entry = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stores_reuse_details_externally(&entry));
+        let written: Vec<_> = reuse_details_dirs(dir.as_str())
+            .difference(&dirs_before)
+            .cloned()
+            .collect();
+        assert_eq!(written, vec![entry.uuid.to_string()]);
+        let details = load_frag_reuse_index_details(&dataset, &entry)
+            .await
+            .unwrap();
+        assert_eq!(entry.fragment_bitmap, Some(details.new_frag_bitmap()));
+        let watermark = dataset.manifest.version - 1;
+        assert_eq!(entry.dataset_version, watermark);
+        assert_eq!(
+            frag_reuse_watermarks(&dataset).await.last(),
+            Some(&watermark)
+        );
     }
 
     /// The deletions sit at non-zero offsets, so a mistranslated address loses rows.

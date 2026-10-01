@@ -456,14 +456,16 @@ pub(crate) async fn open_frag_reuse_index(
     CompactFragReuseIndex::try_new(uuid, details.clone())
 }
 
+/// `dataset_version` stamps both the new reuse version and the entry, which must agree.
 pub(crate) async fn build_new_frag_reuse_index(
     dataset: &mut Dataset,
     frag_reuse_groups: Vec<FragReuseGroup>,
     new_fragment_bitmap: RoaringBitmap,
+    dataset_version: u64,
 ) -> lance_core::Result<IndexMetadata> {
     let new_version = FragReuseVersion {
-        // Provisional: `finish_rewrite` restamps it at commit.
-        dataset_version: dataset.manifest.version,
+        // `finish_rewrite` restamps it if the rewrite publishes on a later version.
+        dataset_version,
         groups: frag_reuse_groups,
     };
 
@@ -474,25 +476,33 @@ pub(crate) async fn build_new_frag_reuse_index(
             .cloned()
     })?;
 
-    let new_index_details = match &index_meta {
-        None => FragReuseIndexDetails {
-            versions: Vec::from([new_version]),
-        },
+    let (new_index_details, fragment_bitmap) = match &index_meta {
+        None => (
+            FragReuseIndexDetails {
+                versions: Vec::from([new_version]),
+            },
+            new_fragment_bitmap,
+        ),
         Some(index_meta) => {
             let current_details = load_frag_reuse_index_details(dataset, index_meta).await?;
+            // Every version's new fragments, as a rebuild in `finish_rewrite` or a cleanup
+            // publishes, so the entry is the same whether or not its commit is restamped.
+            let fragment_bitmap = current_details.new_frag_bitmap() | new_fragment_bitmap;
             let mut versions = current_details.versions.clone();
             versions.push(new_version);
-            FragReuseIndexDetails { versions }
+            (FragReuseIndexDetails { versions }, fragment_bitmap)
         }
     };
 
-    build_frag_reuse_index_metadata(
+    let mut entry = build_frag_reuse_index_metadata(
         dataset,
         index_meta.as_ref(),
         new_index_details,
-        new_fragment_bitmap,
+        fragment_bitmap,
     )
-    .await
+    .await?;
+    entry.dataset_version = dataset_version;
+    Ok(entry)
 }
 
 pub(crate) async fn build_frag_reuse_index_metadata(
