@@ -6768,11 +6768,73 @@ mod tests {
             )
         }
 
-        #[tokio::test]
-        async fn v0_compaction_built_from_an_older_snapshot_is_refused() {
-            let dir = TempStrDir::default();
-            let mut dataset = disk_fixture(dir.as_str(), 2, 4).await;
+        /// With `external`, a history whose details live in their own file, so a
+        /// session that did not build an entry has to read it from storage.
+        async fn reuse_fixture(uri: &str, external: bool) -> (Dataset, usize) {
+            use crate::utils::test::{commit_padding_reuse_history, inline_padding_capacity};
+            let mut dataset = disk_fixture(uri, 2, 4).await;
+            let padding = if external {
+                inline_padding_capacity() + 1
+            } else {
+                0
+            };
+            if external {
+                commit_padding_reuse_history(&mut dataset, padding).await;
+            }
             reserve(&mut dataset, 5).await;
+            (dataset, padding)
+        }
+
+        fn take_reuse_details_reads(dataset: &Dataset) -> usize {
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .filter(|request| {
+                    request.method.starts_with("get")
+                        && request
+                            .path
+                            .as_ref()
+                            .ends_with(lance_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME)
+                })
+                .count()
+        }
+
+        #[rstest::rstest]
+        #[tokio::test]
+        async fn v0_compaction_built_in_another_session_commits(
+            #[values(false, true)] external: bool,
+        ) {
+            let dir = TempStrDir::default();
+            let (dataset, padding) = reuse_fixture(dir.as_str(), external).await;
+            let dest_id = dataset.manifest.max_fragment_id.unwrap() as u64;
+            let compaction = v0_compaction(&dataset, &[0], dest_id).await;
+
+            let mut committer = fresh_session(dir.as_str()).await;
+            take_reuse_details_reads(&committer);
+            committer
+                .apply_commit(compaction, &Default::default(), &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(take_reuse_details_reads(&committer) > 0, external);
+            let history = fresh_session(dir.as_str())
+                .await
+                .frag_reuse_index()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(history.details.versions.len(), padding + 1);
+            assert_eq!(history.details.versions[padding].old_frag_ids(), vec![0]);
+        }
+
+        #[rstest::rstest]
+        #[tokio::test]
+        async fn v0_compaction_built_from_an_older_snapshot_is_refused(
+            #[values(false, true)] external: bool,
+        ) {
+            let dir = TempStrDir::default();
+            let (dataset, padding) = reuse_fixture(dir.as_str(), external).await;
             let dest_id = dataset.manifest.max_fragment_id.unwrap() as u64;
             let stale = v0_compaction(&dataset, &[0], dest_id - 1).await;
             let mut other = fresh_session(dir.as_str()).await;
@@ -6794,8 +6856,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(history.details.versions.len(), 1);
-            assert_eq!(history.details.versions[0].old_frag_ids(), vec![1]);
+            assert_eq!(history.details.versions.len(), padding + 1);
+            assert_eq!(history.details.versions[padding].old_frag_ids(), vec![1]);
         }
 
         /// Matrix row 1: append, an unrelated delete and a fragment

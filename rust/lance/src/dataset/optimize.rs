@@ -5983,6 +5983,59 @@ mod tests {
             .unwrap()
             .expect("the clone must open the fragment reuse index");
         assert_eq!(index.details.versions, source_details.versions);
+
+        // Cached by the source's file: one read, then none, unless the cache is off.
+        let dir_name = |dir: &str| {
+            std::path::Path::new(dir)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let (source_name, clone_name) =
+            (dir_name(source_dir.as_str()), dir_name(clone_dir.as_str()));
+        for cached in [true, false] {
+            let session = if cached {
+                crate::session::Session::default()
+            } else {
+                crate::session::Session::with_index_cache_backend(
+                    Arc::new(lance_core::cache::MokaCacheBackend::no_cache()),
+                    128 * 1024 * 1024,
+                    Default::default(),
+                )
+            };
+            let fresh = crate::dataset::builder::DatasetBuilder::from_uri(clone_uri.as_str())
+                .with_session(Arc::new(session))
+                .load()
+                .await
+                .unwrap();
+            let store = fresh.object_store(clone_meta.base_id).await.unwrap();
+            store.io_stats_incremental();
+            for load in 0..2 {
+                let details = load_frag_reuse_index_details(&fresh, &clone_meta)
+                    .await
+                    .unwrap();
+                assert_eq!(details, source_details);
+                let reads: Vec<String> = store
+                    .io_stats_incremental()
+                    .requests
+                    .iter()
+                    .map(|request| request.path.to_string())
+                    .filter(|path| {
+                        path.ends_with(lance_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME)
+                    })
+                    .collect();
+                if cached && load > 0 {
+                    assert!(reads.is_empty(), "{reads:?}");
+                } else {
+                    assert_eq!(reads.len(), 1, "{reads:?}");
+                    assert!(
+                        reads[0].contains(&source_name) && !reads[0].contains(&clone_name),
+                        "{reads:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -7535,86 +7588,6 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), rows + appended);
     }
 
-    /// Reuse versions over fragments the dataset never had, to size a stored history
-    /// without compacting that much data.
-    fn padding_reuse_versions(count: u64) -> Vec<lance_index::frag_reuse::FragReuseVersion> {
-        use lance_index::frag_reuse::{FragDigest, FragReuseVersion};
-        let digest = |id: u64| FragDigest {
-            id,
-            physical_rows: 4,
-            num_deleted_rows: 0,
-        };
-        (0..count)
-            .map(|i| {
-                let old_id = 1_000 + i;
-                let mut changed_row_addrs = Vec::new();
-                RoaringTreemap::from_iter((old_id << 32)..(old_id << 32) + 4)
-                    .serialize_into(&mut changed_row_addrs)
-                    .unwrap();
-                FragReuseVersion {
-                    dataset_version: 1,
-                    groups: vec![FragReuseGroup {
-                        changed_row_addrs,
-                        old_frags: vec![digest(old_id)],
-                        new_frags: vec![digest(100_000 + i)],
-                    }],
-                }
-            })
-            .collect()
-    }
-
-    async fn commit_padding_reuse_history(dataset: &mut Dataset, count: usize) -> IndexMetadata {
-        use crate::index::frag_reuse::build_frag_reuse_index_metadata;
-        let details = lance_index::frag_reuse::FragReuseIndexDetails {
-            versions: padding_reuse_versions(count as u64),
-        };
-        let new_fragments = (0..count as u32).map(|i| 100_000 + i).collect();
-        let entry = build_frag_reuse_index_metadata(dataset, None, details, new_fragments)
-            .await
-            .unwrap();
-        dataset
-            .apply_commit(
-                Transaction::new(
-                    dataset.manifest.version,
-                    Operation::CreateIndex {
-                        new_indices: vec![entry.clone()],
-                        removed_indices: vec![],
-                    },
-                    None,
-                ),
-                &Default::default(),
-                &Default::default(),
-            )
-            .await
-            .unwrap();
-        entry
-    }
-
-    /// The most padding versions whose details still fit inline.
-    fn inline_padding_capacity() -> usize {
-        use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
-        use prost::Message;
-        let versions = padding_reuse_versions(5_000);
-        let fits = |count: usize| {
-            InlineContent::from(&lance_index::frag_reuse::FragReuseIndexDetails {
-                versions: versions[..count].to_vec(),
-            })
-            .encoded_len()
-                <= 204_800
-        };
-        let (mut low, mut high) = (0, versions.len());
-        while low < high {
-            let mid = (low + high).div_ceil(2);
-            if fits(mid) {
-                low = mid;
-            } else {
-                high = mid - 1;
-            }
-        }
-        assert!(low < versions.len());
-        low
-    }
-
     fn stores_reuse_details_externally(entry: &IndexMetadata) -> bool {
         let proto = entry
             .index_details
@@ -7658,13 +7631,131 @@ mod tests {
             .count()
     }
 
-    /// An uncontended commit publishes right after its reservation, so its reuse
-    /// details are written once and no provisional copy is left behind.
-    #[rstest]
-    #[case::over_an_external_history(true)]
-    #[case::crossing_into_external_storage(false)]
+    /// Two external entries of the same size each load their own details from one session.
     #[tokio::test]
-    async fn test_deferred_compaction_writes_reuse_details_once(#[case] external_before: bool) {
+    async fn test_reuse_details_cache_keeps_entries_of_one_size_apart() {
+        use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+        use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
+        let dir = TempStrDir::default();
+        let dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(
+                dir.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+        let count = inline_padding_capacity() as u64 + 1;
+        let mut entries = Vec::new();
+        for stamp in [1, 2] {
+            let mut versions = padding_reuse_versions(count);
+            for version in &mut versions {
+                version.dataset_version = stamp;
+            }
+            let details = lance_index::frag_reuse::FragReuseIndexDetails { versions };
+            let entry = build_frag_reuse_index_metadata(
+                &dataset,
+                None,
+                details.clone(),
+                RoaringBitmap::new(),
+            )
+            .await
+            .unwrap();
+            entries.push((entry, details));
+        }
+        let sizes: Vec<_> =
+            entries
+                .iter()
+                .map(|(entry, _)| {
+                    match entry
+                    .index_details
+                    .as_ref()
+                    .unwrap()
+                    .to_msg::<lance_table::format::pb::FragmentReuseIndexDetails>()
+                    .unwrap()
+                    .content
+                {
+                    Some(lance_table::format::pb::fragment_reuse_index_details::Content::External(
+                        file,
+                    )) => file.size,
+                    other => panic!("expected external details, got {other:?}"),
+                }
+                })
+                .collect();
+        assert_eq!(sizes[0], sizes[1]);
+        for (entry, details) in &entries {
+            let loaded = load_frag_reuse_index_details(&dataset, entry)
+                .await
+                .unwrap();
+            assert_eq!(loaded.as_ref(), details);
+        }
+    }
+
+    /// Versions written out of stamp order load from memory as a read of the file decodes them.
+    #[tokio::test]
+    async fn test_reuse_details_cache_holds_what_a_read_decodes() {
+        use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+        use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
+        let dir = TempStrDir::default();
+        let dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(
+                dir.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+        let mut versions = padding_reuse_versions(inline_padding_capacity() as u64 + 1);
+        let count = versions.len() as u64;
+        for (i, version) in versions.iter_mut().enumerate() {
+            version.dataset_version = count - i as u64;
+        }
+        let entry = build_frag_reuse_index_metadata(
+            &dataset,
+            None,
+            lance_index::frag_reuse::FragReuseIndexDetails { versions },
+            RoaringBitmap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(stores_reuse_details_externally(&entry));
+
+        let cached = load_frag_reuse_index_details(&dataset, &entry)
+            .await
+            .unwrap();
+        let uncached = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
+            .with_session(Arc::new(crate::session::Session::with_index_cache_backend(
+                Arc::new(lance_core::cache::MokaCacheBackend::no_cache()),
+                128 * 1024 * 1024,
+                Default::default(),
+            )))
+            .load()
+            .await
+            .unwrap();
+        let read = load_frag_reuse_index_details(&uncached, &entry)
+            .await
+            .unwrap();
+        assert_eq!(cached, read);
+        assert!(
+            cached
+                .versions
+                .is_sorted_by_key(|version| version.dataset_version)
+        );
+    }
+
+    /// An uncontended commit publishes right after its reservation, so its reuse
+    /// details are written once and no provisional copy is left behind. With a
+    /// cache, the history check reads nothing back; without one it reads the files
+    /// and reaches the same outcome.
+    #[rstest]
+    #[tokio::test]
+    async fn test_deferred_compaction_writes_reuse_details_once(
+        #[values(true, false)] external_before: bool,
+        #[values(true, false)] cached: bool,
+    ) {
+        use crate::utils::test::{commit_padding_reuse_history, inline_padding_capacity};
         let dir = TempStrDir::default();
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
@@ -7694,6 +7785,15 @@ mod tests {
         .await;
         assert_eq!(stores_reuse_details_externally(&history), external_before);
 
+        let session = if cached {
+            crate::session::Session::default()
+        } else {
+            crate::session::Session::with_index_cache_backend(
+                Arc::new(lance_core::cache::MokaCacheBackend::no_cache()),
+                128 * 1024 * 1024,
+                Default::default(),
+            )
+        };
         let options = CompactionOptions {
             target_rows_per_fragment: 200,
             defer_index_remap: true,
@@ -7701,12 +7801,25 @@ mod tests {
             ..Default::default()
         };
         let result = plan_one_task(&dataset, &options).await;
+        // Committed through a session that has read nothing yet.
+        let mut dataset = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
+            .with_session(Arc::new(session))
+            .load()
+            .await
+            .unwrap();
         let dirs_before = reuse_details_dirs(dir.as_str());
         dataset.object_store.io_stats_incremental();
         commit_one(&mut dataset, result, &options).await.unwrap();
         let stats = dataset.object_store.io_stats_incremental();
 
         assert_eq!(reuse_details_requests(&stats, "put"), 1);
+        // With a cache, only the stored history is read, once.
+        let reads = reuse_details_requests(&stats, "get");
+        if cached {
+            assert_eq!(reads, usize::from(external_before));
+        } else {
+            assert!(reads > usize::from(external_before));
+        }
         let entry = dataset
             .load_index_by_name(FRAG_REUSE_INDEX_NAME)
             .await
