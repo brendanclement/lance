@@ -19,6 +19,7 @@ use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_select::nullif::nullif;
 use futures::{FutureExt, StreamExt};
 use lance_core::datatypes::Schema;
+use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
@@ -40,6 +41,9 @@ enum ColumnMask {
 struct MaskedColumn {
     name: String,
     mask: ColumnMask,
+    /// Only deleted physical slots are false. Readers retaining deleted
+    /// slots must still apply this mask.
+    is_live_valid: bool,
 }
 
 /// The projected fields of one fragment that a masking cell flag hides on at
@@ -57,7 +61,7 @@ impl CellFlagMasks {
         dataset: &Dataset,
         fragment_id: u64,
         projection: &Schema,
-    ) -> Result<Option<Arc<Self>>> {
+    ) -> Result<Option<Self>> {
         let Some(registry) = dataset.manifest.cell_flags.as_deref() else {
             return Ok(None);
         };
@@ -81,21 +85,48 @@ impl CellFlagMasks {
             columns.push(MaskedColumn {
                 name: field.name.clone(),
                 mask,
+                is_live_valid: false,
             });
         }
-        Ok((!columns.is_empty()).then(|| {
-            Arc::new(Self {
-                fragment_id,
-                columns,
-            })
+        Ok((!columns.is_empty()).then_some(Self {
+            fragment_id,
+            columns,
         }))
     }
 
-    /// Only a partially masked field needs each row's physical offset.
-    pub(super) fn needs_offsets(&self) -> bool {
+    pub(super) fn with_live_rows(
+        mut self,
+        physical_rows: usize,
+        deleted: Option<&DeletionVector>,
+    ) -> Result<Arc<Self>> {
+        let physical_rows = u32::try_from(physical_rows).map_err(|_| {
+            Error::internal(format!(
+                "fragment {} has {physical_rows} physical rows, outside cell flag offset bounds",
+                self.fragment_id
+            ))
+        })?;
+        for column in &mut self.columns {
+            if let ColumnMask::Partial(state) = &column.mask
+                && let Some(RowAddrSelection::Partial(rows)) = state.get(&self.fragment_id)
+            {
+                column.is_live_valid = covers_live_rows(rows, physical_rows, deleted);
+            }
+        }
+        Ok(Arc::new(self))
+    }
+
+    pub(super) fn is_needed(&self, include_deleted: bool) -> bool {
         self.columns
             .iter()
-            .any(|column| matches!(column.mask, ColumnMask::Partial(_)))
+            .any(|column| include_deleted || !column.is_live_valid)
+    }
+
+    /// Only a partially masked field needs each row's physical offset.
+    pub(super) fn needs_offsets(&self, include_deleted: bool) -> bool {
+        self.columns.iter().any(|column| {
+            (include_deleted || !column.is_live_valid)
+                && matches!(column.mask, ColumnMask::Partial(_))
+        })
     }
 
     /// Null the masked cells of every batch of `stream`, which yields physical
@@ -105,6 +136,7 @@ impl CellFlagMasks {
         self: Arc<Self>,
         stream: ReadBatchTaskStream,
         offsets_in_frag: Option<Arc<Vec<u32>>>,
+        include_deleted: bool,
     ) -> ReadBatchTaskStream {
         let mut rows_seen = 0usize;
         stream
@@ -133,7 +165,7 @@ impl CellFlagMasks {
                                 })
                             })
                             .transpose()?;
-                        masks.mask_batch(batch, batch_offsets)
+                        masks.mask_batch(batch, batch_offsets, include_deleted)
                     }
                     .boxed(),
                 }
@@ -141,11 +173,19 @@ impl CellFlagMasks {
             .boxed()
     }
 
-    fn mask_batch(&self, batch: RecordBatch, batch_offsets: Option<&[u32]>) -> Result<RecordBatch> {
+    fn mask_batch(
+        &self,
+        batch: RecordBatch,
+        batch_offsets: Option<&[u32]>,
+        include_deleted: bool,
+    ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let num_rows = batch.num_rows();
         let mut columns = batch.columns().to_vec();
         for masked in &self.columns {
+            if !include_deleted && masked.is_live_valid {
+                continue;
+            }
             let index = schema.index_of(&masked.name).map_err(|_| {
                 Error::internal(format!(
                     "cannot mask field '{}' of fragment {}: the batch read has no such column \
@@ -209,6 +249,32 @@ impl CellFlagMasks {
     }
 }
 
+/// Count coverage inside physical bounds, then check only the deleted holes.
+/// Equal true/live cardinalities alone are insufficient: a true deleted row
+/// could hide a false live row. Physical copy-through views have no deletions,
+/// so their false slots never qualify for this fast path.
+fn covers_live_rows(
+    true_rows: &RoaringBitmap,
+    physical_rows: u32,
+    deleted: Option<&DeletionVector>,
+) -> bool {
+    let holes = u64::from(physical_rows) - true_rows.range_cardinality(0..physical_rows);
+    if holes == 0 {
+        return true;
+    }
+    let Some(deleted) = deleted else {
+        return false;
+    };
+    if holes > deleted.len() as u64 {
+        return false;
+    }
+    deleted
+        .iter()
+        .filter(|row| *row < physical_rows && !true_rows.contains(*row))
+        .count() as u64
+        == holes
+}
+
 fn is_contiguous(offsets: &[u32]) -> bool {
     offsets
         .windows(2)
@@ -268,6 +334,29 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::full(&[0, 1, 2, 3], &[], true)]
+    #[case::deleted_hole(&[0, 2, 3], &[1], true)]
+    #[case::true_deleted_row_and_false_live_row(&[0, 2, 3], &[0], false)]
+    #[case::one_live_hole(&[0, 3], &[1], false)]
+    #[case::physical_copy_view(&[0, 2, 3], &[], false)]
+    #[case::outside_true_offset(&[0, 2, 3, 99], &[1], true)]
+    #[case::outside_deleted_offset(&[0, 2, 3], &[99], false)]
+    fn live_coverage_requires_every_live_physical_offset(
+        #[case] true_offsets: &[u32],
+        #[case] deleted_offsets: &[u32],
+        #[case] expected: bool,
+        #[values(false, true)] use_bitmap: bool,
+    ) {
+        let rows = true_offsets.iter().copied().collect();
+        let deleted = if use_bitmap {
+            DeletionVector::Bitmap(deleted_offsets.iter().copied().collect())
+        } else {
+            DeletionVector::Set(deleted_offsets.iter().copied().collect())
+        };
+        assert_eq!(covers_live_rows(&rows, 4, Some(&deleted)), expected);
+    }
 
     #[rstest]
     #[case::all_true(0..100, 0, 99)]

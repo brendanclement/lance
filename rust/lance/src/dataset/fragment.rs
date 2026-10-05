@@ -1211,6 +1211,9 @@ impl FileFragment {
         }
 
         let num_physical_rows = self.physical_rows().await?;
+        let cell_flag_masks = cell_flag_masks
+            .map(|masks| masks.with_live_rows(num_physical_rows, deletion_vec.as_deref()))
+            .transpose()?;
 
         let mut reader = FragmentReader::try_new(
             self.id(),
@@ -3640,10 +3643,15 @@ impl FragmentReader {
         let Some(masks) = &self.cell_flag_masks else {
             return stream;
         };
+        if !masks.is_needed(self.make_deletions_null) {
+            return stream;
+        }
         let offsets_in_frag = masks
-            .needs_offsets()
+            .needs_offsets(self.make_deletions_null)
             .then(|| Arc::new(params.to_offsets_total(total_num_rows).values().to_vec()));
-        masks.clone().apply(stream, offsets_in_frag)
+        masks
+            .clone()
+            .apply(stream, offsets_in_frag, self.make_deletions_null)
     }
 
     async fn new_read_impl<'a, F>(

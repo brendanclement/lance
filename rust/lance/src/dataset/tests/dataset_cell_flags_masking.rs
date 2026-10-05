@@ -345,6 +345,63 @@ async fn test_every_reader_funnel_masks_each_batch(#[case] fragment_id: usize) {
 }
 
 #[rstest]
+#[tokio::test]
+async fn test_all_live_true_after_moving_unrelated_rows(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let (dataset, flag_id) = masked_articles(stable_row_ids).await;
+    let dataset = UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id = 2")
+        .unwrap()
+        .set("id", "id + 100")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap()
+        .new_dataset;
+    let flags = dataset.cell_flag_true_rows(flag_id).unwrap();
+    assert!(flags.contains(u64::from(RowAddress::new_from_parts(0, 1))));
+    assert!(!flags.contains(u64::from(RowAddress::new_from_parts(0, 2))));
+    let fragment = dataset.get_fragment(0).unwrap();
+    let mut reader = fragment
+        .open(&id_summary_projection(&dataset), FragReadConfig::default())
+        .await
+        .unwrap();
+    let live = collect_reads(reader.read_all(1).await.unwrap()).await;
+    assert_eq!(id_summaries(&live), expected(&[0, 1]));
+
+    // Retaining deleted slots must not expose the old value at the moved
+    // row's address, even though every live row in this fragment is true.
+    reader.with_row_address().with_make_deletions_null();
+    let physical = collect_reads(reader.read_all(1).await.unwrap()).await;
+    assert_eq!(physical.num_rows(), 4);
+    assert!(physical[ROW_ADDR].is_null(2));
+    assert!(physical["summary"].is_null(2));
+    let copied = collect_reads(
+        fragment
+            .read_physical_slice(0..4, &id_summary_projection(&dataset), 1)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(copied.num_rows(), 4);
+    assert!(copied["summary"].is_null(2));
+
+    let moved = dataset
+        .scan()
+        .project(&["id", "summary"])
+        .unwrap()
+        .filter("id = 102")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(id_summaries(&moved), vec![(102, Some("s2".to_string()))]);
+}
+
+#[rstest]
 #[case::is_null("summary IS NULL", &[1, 5, 7, 8, 10, 11], false)]
 #[case::is_not_null("summary IS NOT NULL", &[0, 2, 4], false)]
 #[case::stale_value("summary = 's5'", &[], false)]
