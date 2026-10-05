@@ -1181,7 +1181,20 @@ fn check_chains(stager: &PublicationStager, run: &Run) -> Result<()> {
     // Per output the commit clears on the row, the assigned output that
     // clears it.
     let mut cleared_by: Vec<Option<usize>> = vec![None; count];
-    for row in (0..run.len()).filter(|row| run.assigns(*row)) {
+    // Column presence and unmasked assignments are uniform across the run;
+    // values (including computed NULLs) never determine assignment. Validate
+    // that pattern once, retaining per-row checks for varying masks.
+    let rows = if run
+        .outputs
+        .iter()
+        .flatten()
+        .all(|assignment| assignment.mask.is_none())
+    {
+        run.len().min(1)
+    } else {
+        run.len()
+    };
+    for row in (0..rows).filter(|row| run.assigns(*row)) {
         for (index, assignment) in run.outputs.iter().enumerate() {
             is_assigned[index] = assignment
                 .as_ref()

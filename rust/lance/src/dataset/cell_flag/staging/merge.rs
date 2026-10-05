@@ -340,6 +340,33 @@ fn merge_column(
     assigned: &mut RoaringBitmap,
 ) -> Result<ArrayRef> {
     let len = copied.len();
+    if let [(index, rows)] = window
+        && *rows == len
+        && len > 0
+    {
+        let run = &pending[*index];
+        // Computed-row validation established strict ordering. Matching the
+        // window's bounds and row count therefore proves contiguous coverage.
+        // Avoid building per-row interleave indices just to return a slice.
+        if run.offset(0) == start
+            && u64::from(run.offset(len - 1)) + 1 == u64::from(start) + len as u64
+            && let Some(assignment) = &run.outputs[output]
+            && assignment
+                .mask
+                .as_ref()
+                .is_none_or(|mask| mask.slice(0, len).count_set_bits() == len)
+        {
+            if assigned.max().is_some_and(|previous| previous >= start) {
+                return Err(Error::internal(format!(
+                    "computed offset {start} of fragment {fragment_id} does not follow the \
+                     offsets merged before it"
+                )));
+            }
+            // `merge` bounds the window by the fragment's u32 physical count.
+            assigned.insert_range(start..start + len as u32);
+            return Ok(assignment.values.slice(0, len));
+        }
+    }
     let mut sources: Vec<&ArrayRef> = vec![copied];
     let mut indices: Vec<(usize, usize)> = Vec::new();
     let mut first_hit = None;
@@ -533,6 +560,14 @@ mod tests {
         )]
     )]
     #[case::one_assigned_one_copied(4, &[4], vec![text_run(&[0, 1, 2, 3], [None, Some(None)])])]
+    #[case::fully_assigned_prefixes_in_masked_runs(
+        4,
+        &[2, 2],
+        vec![text_run(
+            &[0, 1, 2, 3],
+            [Some(Some(vec![true, true, false, true])), Some(Some(vec![false, false, true, true]))],
+        )]
+    )]
     fn merge_places_values_by_offset(
         #[case] physical_rows: u32,
         #[case] windows: &[u32],
