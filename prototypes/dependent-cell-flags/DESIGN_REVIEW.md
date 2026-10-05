@@ -15,6 +15,9 @@ The review should settle the smallest useful product scope, the publication unit
 storage strategy, and the binding/lifecycle contract. Another optimization is useful only when
 it resolves a cost that matters to those choices.
 
+[CODING_PLAN.md](CODING_PLAN.md) turns these questions into ordered coding tasks, source-backed
+integration checks and worked publication examples with explicit acceptance conditions.
+
 ## 1. Goal and observable behavior
 
 An asynchronous worker computes `summary = f(title, body)` while ordinary table writes continue.
