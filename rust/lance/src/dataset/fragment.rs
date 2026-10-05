@@ -1152,7 +1152,15 @@ impl FileFragment {
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
         let cell_flag_masks = CellFlagMasks::resolve(&self.dataset, self.metadata.id, projection)?;
-        let open_files = self.open_readers(projection, &read_config);
+        let all_masked_projection = cell_flag_masks
+            .as_ref()
+            .and_then(|masks| masks.all_masked_projection(projection));
+        let decoded_projection = all_masked_projection
+            .as_ref()
+            .map(|masked| projection.exclude(masked))
+            .transpose()?;
+        let decoded_projection = decoded_projection.as_ref().unwrap_or(projection);
+        let open_files = self.open_readers(decoded_projection, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
 
         let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
@@ -1196,21 +1204,35 @@ impl FileFragment {
             last_updated_at_load,
             created_at_load
         );
-        let opened_files = opened_files?;
+        let mut opened_files = opened_files?;
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
         let last_updated_at_sequence = last_updated_at_sequence?;
         let created_at_sequence = created_at_sequence?;
 
-        if opened_files.is_empty() && !read_config.has_system_cols() {
+        if opened_files.is_empty()
+            && !read_config.has_system_cols()
+            && all_masked_projection.is_none()
+        {
             return Err(Error::not_found(format!(
                 "No data files found for schema: {}, fragment_id={}",
                 projection,
                 self.id()
             )));
         }
-
         let num_physical_rows = self.physical_rows().await?;
+        if let Some(masked_projection) = all_masked_projection {
+            let num_rows = u32::try_from(num_physical_rows).map_err(|_| {
+                Error::internal(format!(
+                    "fragment {} has {num_physical_rows} physical rows, outside cell flag offset bounds",
+                    self.id()
+                ))
+            })?;
+            opened_files.push(Box::new(NullReader::new(
+                Arc::new(masked_projection),
+                num_rows,
+            )));
+        }
         let cell_flag_masks = cell_flag_masks
             .map(|masks| masks.with_live_rows(num_physical_rows, deletion_vec.as_deref()))
             .transpose()?;
@@ -1229,7 +1251,7 @@ impl FileFragment {
         // Plan overlay resolution from coverage metadata (no files opened here); the
         // readers are opened lazily on read, pruned to the rows each read touches.
         if !self.metadata.overlays.is_empty() {
-            let planner = plan_overlays(self, projection)?;
+            let planner = plan_overlays(self, decoded_projection)?;
             if !planner.is_empty() {
                 reader.overlay = Some(OverlayReadState {
                     planner: Arc::new(planner),

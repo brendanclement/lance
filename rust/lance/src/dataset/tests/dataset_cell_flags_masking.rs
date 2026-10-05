@@ -402,6 +402,70 @@ async fn test_all_live_true_after_moving_unrelated_rows(
 }
 
 #[rstest]
+#[case::scalar(false)]
+#[case::vector(true)]
+#[tokio::test]
+async fn test_wholly_masked_output_reads_without_data_io(#[case] is_vector: bool) {
+    let (dataset, flag_id, column) = if is_vector {
+        let (dataset, flag_id) = masked_embeddings(false).await;
+        (dataset, flag_id, "embedding")
+    } else {
+        let (dataset, flag_id) = masked_articles(false).await;
+        (dataset, flag_id, "summary")
+    };
+    let flags = dataset.cell_flag_true_rows(flag_id).unwrap();
+    assert!(flags.get(&2).is_none());
+    let fragment = dataset.get_fragment(2).unwrap();
+    let projection = dataset.schema().project(&[column]).unwrap();
+    let mut reader = fragment
+        .open(&projection, FragReadConfig::default())
+        .await
+        .unwrap();
+    reader.with_row_address().with_make_deletions_null();
+    let store = dataset.object_store(None).await.unwrap();
+    store.io_stats_incremental();
+    let reads = [
+        (
+            collect_reads(reader.read_all(1).await.unwrap()).await,
+            vec![0, 1, 2, 3],
+        ),
+        (
+            collect_reads(
+                reader
+                    .read_ranges(Arc::from(vec![0..1, 2..4]), 1)
+                    .await
+                    .unwrap(),
+            )
+            .await,
+            vec![0, 2, 3],
+        ),
+        (
+            reader.take_as_batch(&[3, 1, 0], None).await.unwrap(),
+            vec![3, 1, 0],
+        ),
+    ];
+    for (batch, offsets) in reads {
+        assert_eq!(batch.num_rows(), offsets.len());
+        assert_eq!(batch[column].null_count(), offsets.len());
+        let expected: Vec<_> = offsets
+            .into_iter()
+            .map(|offset| (offset != 1).then(|| addr(2, offset)))
+            .collect();
+        assert_eq!(
+            batch[ROW_ADDR]
+                .as_primitive::<UInt64Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    let stats = store.io_stats_incremental();
+    assert_eq!(stats.read_bytes, 0);
+    assert_eq!(stats.read_iops, 0);
+    assert_eq!(dataset.cell_flag_true_rows(flag_id).unwrap(), flags);
+}
+
+#[rstest]
 #[case::is_null("summary IS NULL", &[1, 5, 7, 8, 10, 11], false)]
 #[case::is_not_null("summary IS NOT NULL", &[0, 2, 4], false)]
 #[case::stale_value("summary = 's5'", &[], false)]

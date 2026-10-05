@@ -115,6 +115,25 @@ impl CellFlagMasks {
         Ok(Arc::new(self))
     }
 
+    /// Fields that can be supplied by a NULL reader instead of decoded.
+    /// Partial masks still require the stored values of their true rows.
+    pub(super) fn all_masked_projection(&self, projection: &Schema) -> Option<Schema> {
+        if !self
+            .columns
+            .iter()
+            .any(|column| matches!(column.mask, ColumnMask::AllMasked))
+        {
+            return None;
+        }
+        let mut masked = projection.clone();
+        masked.fields.retain(|field| {
+            self.columns.iter().any(|column| {
+                column.name == field.name && matches!(column.mask, ColumnMask::AllMasked)
+            })
+        });
+        Some(masked)
+    }
+
     pub(super) fn is_needed(&self, include_deleted: bool) -> bool {
         self.columns
             .iter()
@@ -196,6 +215,7 @@ impl CellFlagMasks {
                 ))
             })?;
             columns[index] = match &masked.mask {
+                ColumnMask::AllMasked if columns[index].null_count() == num_rows => continue,
                 ColumnMask::AllMasked => new_null_array(columns[index].data_type(), num_rows),
                 ColumnMask::Partial(state) => {
                     let Some(RowAddrSelection::Partial(true_rows)) = state.get(&self.fragment_id)
