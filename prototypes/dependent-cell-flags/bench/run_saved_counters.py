@@ -14,7 +14,9 @@ completed from the recorded checkout; this does not reconstruct past source.
 """
 
 import argparse
+import errno
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -81,7 +83,14 @@ def saved_build(name, snapshot, profile, out, bench):
     if rotation.sha256_file(binary) != entry["sha256"]:
         rotation.fail(f"snapshot binary hash changed: {binary}")
     destination = out / "bins" / binary.name
-    shutil.copy2(binary, destination)
+    # Snapshots are immutable and may be several GiB with debug symbols.
+    # Reuse their bytes across rotations while retaining the hash checks.
+    try:
+        os.link(binary, destination)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        shutil.copy2(binary, destination)
     shutil.copy2(entry["source"]["patch"], out / "source" / f"{name}.patch")
     entry["binary"] = str(destination)
     return entry
