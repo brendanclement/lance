@@ -1,0 +1,114 @@
+{
+  "started": "2026-10-05T20:16:11+00:00",
+  "config": {
+    "bench": "cell_flags_costs",
+    "profile": "release-with-debug",
+    "rounds": 6,
+    "samples": 6,
+    "warmup": 2,
+    "workloads": [
+      "backfill_one",
+      "backfill_plain_one",
+      "backfill_shared",
+      "backfill_plain_shared",
+      "backfill_chain",
+      "backfill_plain_chain",
+      "cycle_inplace_sparse_one",
+      "cycle_inplace_sparse_plain_one"
+    ],
+    "control": "after",
+    "allow_build_differences": false
+  },
+  "host": {
+    "platform": "Linux-7.2.8-100.fc43.x86_64-x86_64-with-glibc2.42",
+    "machine": "x86_64",
+    "cpu_count": 24,
+    "python": "3.14.7",
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "memory_bytes": 134974488576
+  },
+  "dataset_before": {
+    "path": "/tmp/cell-flags-data",
+    "files": 430,
+    "bytes": 1646205778,
+    "sha256": "dbe1097acc4e0aee2c9af1447b2d1fe507987e2702621769a8944173044e250a"
+  },
+  "builds": [
+    {
+      "name": "before",
+      "checkout": "/home/brendan/work/lance-cell-flags",
+      "source": {
+        "head": "c822c90ba588f692c7c99586f6e9dd9059598269",
+        "status": [
+          " M prototypes/dependent-cell-flags/bench/run_saved_counters.py"
+        ],
+        "working_tree": "ac2d253d8ab9d65c2f67203098827aa69757cb7e",
+        "patch": "/tmp/cell-flags-snapshots/before.patch",
+        "untracked": {}
+      },
+      "executable": "/tmp/cell-flags-build/release-with-debug/deps/cell_flags_costs-246a7a051e604dad",
+      "binary": "/tmp/cell-flags-results/final/mutations/bins/before-79ab713d41b9",
+      "sha256": "79ab713d41b94f4b3f5dc6c9401bf151b48839083ffa847621923f79683c547b",
+      "profile_name": "release-with-debug",
+      "profile": 10041900056574661758,
+      "features": "[\"aws\", \"azure\", \"default\", \"gcp\", \"geo\", \"goosefs\", \"huggingface\", \"oss\", \"tencent\", \"tos\"]",
+      "fingerprint_rustflags": [
+        "-C",
+        "target-cpu=haswell",
+        "-C",
+        "target-feature=+avx2,+fma,+f16c"
+      ],
+      "fingerprint_features": "[\"aws\", \"azure\", \"default\", \"gcp\", \"geo\", \"goosefs\", \"huggingface\", \"oss\", \"tencent\", \"tos\"]",
+      "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)\nbinary: rustc\ncommit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3\ncommit-date: 2026-07-07\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.0\nLLVM version: 22.1.6\n",
+      "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)\nrelease: 1.97.0\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0-DEV (sys:0.4.88+curl-8.20.0 vendored ssl:OpenSSL/3.6.2)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Fedora 43.0.0 [64-bit]\n",
+      "cargo_configs": {
+        "/home/brendan/work/lance-cell-flags/.cargo/config.toml": "3a91fd668c40a72fc8f5e4e9051bac3aff1bd4c3c151f0e61bc43d3e56504406"
+      },
+      "environment": {},
+      "protoc_adapter_sha256": "86ce602ef16b0c3d30e7886b6b035504b108d3458fe5210eb0ed39f7afcce12b"
+    },
+    {
+      "name": "after",
+      "checkout": "/home/brendan/work/lance-cell-flags",
+      "source": {
+        "head": "fabb89983996569ceb0ba480696528cdd34b34b5",
+        "status": [],
+        "working_tree": "8b0ae435e4c5977fa615b2d4b6bfab4db790e9ae",
+        "patch": "/tmp/cell-flags-snapshots/after.patch",
+        "untracked": {}
+      },
+      "executable": "/tmp/cell-flags-build/release-with-debug/deps/cell_flags_costs-246a7a051e604dad",
+      "binary": "/tmp/cell-flags-results/final/mutations/bins/after-88a8ca0d1b10",
+      "sha256": "88a8ca0d1b106fdee5f684b891db513ba06c959b88d387947655fc66845b35d8",
+      "profile_name": "release-with-debug",
+      "profile": 10041900056574661758,
+      "features": "[\"aws\", \"azure\", \"default\", \"gcp\", \"geo\", \"goosefs\", \"huggingface\", \"oss\", \"tencent\", \"tos\"]",
+      "fingerprint_rustflags": [
+        "-C",
+        "target-cpu=haswell",
+        "-C",
+        "target-feature=+avx2,+fma,+f16c"
+      ],
+      "fingerprint_features": "[\"aws\", \"azure\", \"default\", \"gcp\", \"geo\", \"goosefs\", \"huggingface\", \"oss\", \"tencent\", \"tos\"]",
+      "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)\nbinary: rustc\ncommit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3\ncommit-date: 2026-07-07\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.0\nLLVM version: 22.1.6\n",
+      "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)\nrelease: 1.97.0\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0-DEV (sys:0.4.88+curl-8.20.0 vendored ssl:OpenSSL/3.6.2)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Fedora 43.0.0 [64-bit]\n",
+      "cargo_configs": {
+        "/home/brendan/work/lance-cell-flags/.cargo/config.toml": "3a91fd668c40a72fc8f5e4e9051bac3aff1bd4c3c151f0e61bc43d3e56504406"
+      },
+      "environment": {},
+      "protoc_adapter_sha256": "86ce602ef16b0c3d30e7886b6b035504b108d3458fe5210eb0ed39f7afcce12b"
+    }
+  ],
+  "labels": {
+    "before": "before",
+    "after": "after",
+    "after-copy": "after"
+  },
+  "dataset_after": {
+    "path": "/tmp/cell-flags-data",
+    "files": 430,
+    "bytes": 1646205778,
+    "sha256": "dbe1097acc4e0aee2c9af1447b2d1fe507987e2702621769a8944173044e250a"
+  },
+  "finished": "2026-10-05T20:27:59+00:00"
+}

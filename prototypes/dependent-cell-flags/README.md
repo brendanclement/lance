@@ -8,7 +8,14 @@
 **For the design review, start with [`DESIGN_REVIEW.md`](DESIGN_REVIEW.md).** This README is the
 detailed research record: every decision, check, departure and benchmark, kept as history.
 
+**Local continuation (2026-10-05):** [`CONTINUATION.md`](CONTINUATION.md) records the standalone
+Linux restoration, read/stager optimizations, matched before/after results and current tests.
+It preserves the concurrency contract and parent-only vector NULL masking decision.
+
 ## Status
+
+This table records the transferred prototype's historical state. The local continuation above
+supersedes its checkout, code-head and current-machine test details.
 
 | | |
 |---|---|
@@ -624,7 +631,11 @@ deleted rows, which still counts toward the ordinary-flag gate for row-moving wr
 
 ## Benchmarks
 
-**Current measurement:** [`bench/results/feature-costs/`](bench/results/feature-costs/README.md)
+**Local optimization comparison:** [`bench/results/linux-local-optimizations/`](bench/results/linux-local-optimizations/README.md)
+compares the transferred Rust implementation with the continuation on Linux, with matched data,
+build settings and controls. See [`CONTINUATION.md`](CONTINUATION.md) for the results and limits.
+
+**Original feature-cost measurement:** [`bench/results/feature-costs/`](bench/results/feature-costs/README.md)
 measures the final code across the feature: reads without flags against `main`, masked scalar and
 vector reads against all-valid tables and tables storing equal NULLs, unrelated and source
 writes, refresh cycles by phase, races under `Reject` and `Skip`, and reopen and commits after

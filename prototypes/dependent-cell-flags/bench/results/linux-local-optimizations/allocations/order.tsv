@@ -1,0 +1,10 @@
+round	label	binary
+1	before	/tmp/cell-flags-results/final/allocations/bins/before-79ab713d41b9
+1	after	/tmp/cell-flags-results/final/allocations/bins/after-88a8ca0d1b10
+1	after-copy	/tmp/cell-flags-results/final/allocations/bins/after-88a8ca0d1b10
+2	after	/tmp/cell-flags-results/final/allocations/bins/after-88a8ca0d1b10
+2	after-copy	/tmp/cell-flags-results/final/allocations/bins/after-88a8ca0d1b10
+2	before	/tmp/cell-flags-results/final/allocations/bins/before-79ab713d41b9
+3	after-copy	/tmp/cell-flags-results/final/allocations/bins/after-88a8ca0d1b10
+3	before	/tmp/cell-flags-results/final/allocations/bins/before-79ab713d41b9
+3	after	/tmp/cell-flags-results/final/allocations/bins/after-88a8ca0d1b10

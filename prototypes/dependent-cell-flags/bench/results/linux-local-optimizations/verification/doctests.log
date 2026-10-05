@@ -1,0 +1,123 @@
+   Compiling lance-arrow v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-arrow)
+warning: lance-linalg@13.0.0-beta.14: fp16kernels feature is not enabled, skipping build of fp16 kernels
+warning: lance-linalg@13.0.0-beta.14: fp16kernels feature is not enabled, skipping build of bf16 kernels
+warning: lance-linalg@13.0.0-beta.14: fp16kernels feature is not enabled, skipping build of fp16 kernels
+warning: lance-linalg@13.0.0-beta.14: fp16kernels feature is not enabled, skipping build of bf16 kernels
+   Compiling lance-core v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-core)
+   Compiling lance-testing v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-testing)
+   Compiling lance-namespace v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-namespace)
+   Compiling lance-encoding v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-encoding)
+   Compiling lance-select v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-select)
+   Compiling lance-geo v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-geo)
+   Compiling lance-linalg v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-linalg)
+   Compiling lance-datafusion v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-datafusion)
+   Compiling lance-io v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-io)
+   Compiling lance-index-core v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-index-core)
+   Compiling lance-file v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-file)
+   Compiling lance-table v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-table)
+   Compiling lance-index v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance-index)
+   Compiling lance v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance)
+    Finished `ci` profile [unoptimized + debuginfo] target(s) in 8m 02s
+   Doc-tests lance
+
+running 96 tests
+test rust/lance/src/dataset.rs - dataset::Dataset::list_detached_manifests (line 2675) ... ignored
+test rust/lance/src/dataset/builder.rs - dataset::builder::DatasetBuilder::from_namespace (line 119) ... ignored
+test rust/lance/src/dataset/builder.rs - dataset::builder::DatasetBuilder::with_storage_option (line 345) ... ignored
+test rust/lance/src/dataset/builder.rs - dataset::builder::DatasetBuilder::with_storage_options_accessor (line 446) ... ignored
+test rust/lance/src/dataset/builder.rs - dataset::builder::DatasetBuilder::with_storage_options_provider (line 385) ... ignored
+test rust/lance/src/dataset.rs - dataset::Dataset::read_blobs (line 1883) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::read_blob_ranges (line 1916) ... ok
+test rust/lance/src/blob.rs - blob::blob_field_with_options (line 92) ... ok
+test rust/lance/src/dataset/cell_flag.rs - dataset::cell_flag::Dataset::drop_cell_flag (line 243) ... ok
+test rust/lance/src/dataset/cell_flag.rs - dataset::cell_flag::Dataset::replace_cell_flag (line 207) ... ok
+test rust/lance/src/dataset/cell_flag.rs - dataset::cell_flag::Dataset::cell_flags (line 262) ... ok
+test rust/lance/src/dataset/cell_flag/publication.rs - dataset::cell_flag::publication::PublicationReport::reusable_rows (line 224) ... ok
+test rust/lance/src/dataset/cell_flag.rs - dataset::cell_flag (line 45) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::read_transaction_by_version (line 1396) ... ok
+test rust/lance/src/blob.rs - blob::PackedBlobWriter::write_packed_blobs (line 870) ... ok
+test rust/lance/src/dataset/cell_flag.rs - dataset::cell_flag::Dataset::cell_flag_true_rows (line 297) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::update_field_metadata (line 4039) ... ok
+test rust/lance/src/dataset/cell_flag.rs - dataset::cell_flag::Dataset::cell_flag (line 282) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::take_blobs_by_indices (line 1850) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::delta (line 1225) ... ok
+test rust/lance/src/dataset/cell_flag/staging.rs - dataset::cell_flag::staging::PublicationStager::stage (line 437) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::read_version_transaction (line 1333) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::take_blobs_by_addresses (line 1821) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::update_config (line 3965) ... ok
+test rust/lance/src/dataset/cell_flag/staging.rs - dataset::cell_flag::staging::ComputedBatch (line 143) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::take_blobs (line 1790) ... ok
+test rust/lance/src/dataset/index/frag_reuse.rs - dataset::index::frag_reuse::Dataset::frag_reuse_index (line 56) - compile ... ok
+test rust/lance/src/dataset/index/frag_reuse.rs - dataset::index::frag_reuse::cleanup_frag_reuse_index (line 97) - compile ... ok
+test rust/lance/src/dataset/mem_wal/api.rs - dataset::mem_wal::api::DatasetMemWalExt::mem_wal_writer (line 559) ... ignored
+test rust/lance/src/dataset/mem_wal/api.rs - dataset::mem_wal::api::InitializeMemWalBuilder (line 120) ... ignored
+test rust/lance/src/dataset/mem_wal/memtable.rs - dataset::mem_wal::memtable::MemTable::scan (line 796) ... ignored
+test rust/lance/src/dataset/mem_wal/memtable/batch_store.rs - dataset::mem_wal::memtable::batch_store::BatchStore (line 169) ... ignored
+test rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs - dataset::mem_wal::memtable::scanner::builder::MemTableScanner (line 489) ... ignored
+test rust/lance/src/dataset/mem_wal/scanner.rs - dataset::mem_wal::scanner (line 23) ... ignored
+test rust/lance/src/dataset/mem_wal/scanner/builder.rs - dataset::mem_wal::scanner::builder::LsmScanner (line 179) ... ignored
+test rust/lance/src/dataset.rs - dataset::Dataset::update_schema_metadata (line 3998) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::update_metadata (line 3932) ... ok
+test rust/lance/src/dataset/cell_flag/staging.rs - dataset::cell_flag::staging::FollowUpPlan (line 184) ... ok
+test rust/lance/src/dataset/cell_flag.rs - dataset::cell_flag::Dataset::register_cell_flag (line 167) ... ok
+test rust/lance/src/dataset/scanner.rs - dataset::scanner::AggregateExpr::builder (line 864) ... ignored
+test rust/lance/src/dataset/scanner.rs - dataset::scanner::Scanner (line 1068) ... ignored
+test rust/lance/src/dataset/scanner.rs - dataset::scanner::Scanner::create_plan (line 3198) ... ignored
+test rust/lance/src/dataset/scanner.rs - dataset::scanner::Scanner::create_plan (line 3204) ... ignored
+test rust/lance/src/dataset/scanner.rs - dataset::scanner::Scanner::create_plan (line 3212) ... ignored
+test rust/lance/src/dataset/scanner.rs - dataset::scanner::Scanner::create_plan (line 3221) ... ignored
+test rust/lance/src/dataset/scanner.rs - dataset::scanner::Scanner::filter (line 1670) ... ignored
+test rust/lance/src/dataset/scanner.rs - dataset::scanner::Scanner::filter_query (line 1692) ... ignored
+test rust/lance/src/dataset/scanner.rs - dataset::scanner::Scanner::full_text_search (line 1714) ... ignored
+test rust/lance/src/dataset/scanner.rs - dataset::scanner::Scanner::with_row_addr_prefilter (line 1625) - compile ... ok
+test rust/lance/src/dataset/udtf.rs - dataset::udtf::FtsQueryUDTF (line 131) ... ignored
+test rust/lance/src/dataset/cell_flag/staging.rs - dataset::cell_flag::staging::PublicationStager::follow_up (line 525) ... ok
+test rust/lance/src/dataset/cell_flag/staging.rs - dataset::cell_flag::staging::PublicationStager::flag_id (line 373) ... ok
+test rust/lance/src/dataset/data_file.rs - dataset::data_file::DataFileTarget::new (line 65) ... ok
+test rust/lance/src/dataset/data_file.rs - dataset::data_file::DataFileTarget (line 37) ... ok
+test rust/lance/src/dataset/fragment.rs - dataset::fragment::FileFragment::write_overlay (line 2906) ... ok
+test rust/lance/src/dataset/data_file_part.rs - dataset::data_file_part::DataFilePart (line 24) ... ok
+test rust/lance/src/dataset/delta.rs - dataset::delta::DatasetDelta::get_upserted_rows (line 558) ... ok
+test rust/lance/src/dataset/delta.rs - dataset::delta::DatasetDelta::get_deleted_row_ids (line 330) ... ok
+test rust/lance/src/dataset/delta.rs - dataset::delta::DatasetDeltaBuilder (line 67) ... ok
+test rust/lance/src/dataset/write.rs - dataset::write::Dataset::concat_data_file_parts (line 263) ... ok
+test rust/lance/src/dataset/delta.rs - dataset::delta::DatasetDelta::get_updated_rows (line 495) ... ok
+test rust/lance/src/dataset/cell_flag/staging.rs - dataset::cell_flag::staging::PublicationStager (line 69) ... ok
+test rust/lance/src/dataset/cell_flag/staging.rs - dataset::cell_flag::staging::PublicationStager::try_new (line 248) ... ok
+test rust/lance/src/dataset/data_file.rs - dataset::data_file::DataFileTarget::finish (line 166) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::migrate_manifest_paths_v2 (line 3162) ... ok
+test rust/lance/src/dataset.rs - dataset::Dataset::take_rows (line 1735) ... ok
+test rust/lance/src/index.rs - index::Dataset::create_index_builder (line 1847) ... ok
+test rust/lance/src/dataset/delta.rs - dataset::delta::DatasetDelta::get_inserted_rows (line 437) ... ok
+test rust/lance/src/dataset/fragment.rs - dataset::fragment::FileFragment::read_physical_slice (line 2009) ... ok
+test rust/lance/src/dataset/fragment.rs - dataset::fragment::FileFragment::write_column_with_version (line 2685) ... ok
+test rust/lance/src/dataset/write/insert.rs - dataset::write::insert::InsertBuilder<'a>::execute_uncommitted (line 115) ... ok
+test rust/lance/src/dataset/mem_wal/write.rs - dataset::mem_wal::write::ShardWriter::delete (line 2798) ... ok
+test rust/lance/src/session.rs - session::Session::with_spill_store (line 159) - compile ... ok
+test rust/lance/src/dataset/optimize.rs - dataset::optimize::CompactionOptions::data_storage_version (line 316) ... ok
+test rust/lance/src/dataset/write.rs - dataset::write::Dataset::write_data_file_part (line 137) ... ok
+test rust/lance/src/dataset/write/commit.rs - dataset::write::commit::CommitBuilder<'a>::with_dependency_conflict_policy (line 291) ... ok
+test rust/lance/src/dataset/data_file.rs - dataset::data_file::DataFileTarget::cleanup (line 193) ... ok
+test rust/lance/src/dataset/write/update.rs - dataset::write::update::UpdateBuilder (line 57) ... ok
+test rust/lance/src/dataset/write/commit.rs - dataset::write::commit::CommitBuilder<'a>::with_retry_timeout (line 218) ... ok
+test rust/lance/src/dataset/write/merge_insert.rs - dataset::write::merge_insert::MergeInsertBuilder (line 687) ... ok
+test rust/lance/src/dataset/write/update.rs - dataset::write::update::UpdateBuilder::data_storage_version (line 230) ... ok
+test rust/lance/src/dataset/write/delete.rs - dataset::write::delete::DeleteBuilder::execute_uncommitted (line 182) ... ok
+test rust/lance/src/index/vector/dedup.rs - index::vector::dedup::find_duplicate_pairs_in_partition (line 195) ... ok
+test rust/lance/src/index/vector/dedup.rs - index::vector::dedup::DuplicatePairsOptions (line 63) ... ok
+test rust/lance/src/dataset/write/delete.rs - dataset::write::delete::DeleteBuilder (line 106) ... ok
+test rust/lance/src/index.rs - index::Dataset::create_index_builder (line 1862) ... ok
+test rust/lance/src/dataset/mem_wal/util.rs - dataset::mem_wal::util::bit_reverse_u64 (line 95) ... ok
+test rust/lance/src/dataset/write/merge_insert.rs - dataset::write::merge_insert::MergeInsertBuilder::data_storage_version (line 946) ... ok
+test rust/lance/src/index/vector/dedup.rs - index::vector::dedup::find_duplicate_pairs (line 141) ... ok
+test rust/lance/src/dataset/write/commit.rs - dataset::write::commit::CommitBuilder<'a>::execute_with_report (line 335) ... ok
+test rust/lance/src/lib.rs - (line 21) ... ok
+test rust/lance/src/index/vector/dedup.rs - index::vector::dedup::find_duplicate_pairs_in_partition_with_options (line 227) ... ok
+test rust/lance/src/index/vector/dedup.rs - index::vector::dedup::find_duplicate_pairs_with_options (line 168) ... ok
+test rust/lance/src/session.rs - session::Session::with_cache_backends (line 195) ... ok
+test rust/lance/src/lib.rs - (line 46) ... ok
+test rust/lance/src/dataset/optimize.rs - dataset::optimize (line 26) ... ok
+
+test result: ok. 74 passed; 0 failed; 22 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+all doctests ran in 21.26s; merged doctests compilation took 20.03s

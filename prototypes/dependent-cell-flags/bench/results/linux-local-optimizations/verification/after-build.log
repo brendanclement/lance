@@ -1,0 +1,7 @@
+warning: lance-linalg@13.0.0-beta.14: fp16kernels feature is not enabled, skipping build of fp16 kernels
+warning: lance-linalg@13.0.0-beta.14: fp16kernels feature is not enabled, skipping build of bf16 kernels
+warning: lance-linalg@13.0.0-beta.14: fp16kernels feature is not enabled, skipping build of fp16 kernels
+warning: lance-linalg@13.0.0-beta.14: fp16kernels feature is not enabled, skipping build of bf16 kernels
+   Compiling lance v13.0.0-beta.14 (/home/brendan/work/lance-cell-flags/rust/lance)
+    Finished `release-with-debug` profile [optimized + debuginfo] target(s) in 16m 11s
+  Executable benches/cell_flags_costs.rs (/tmp/cell-flags-build/release-with-debug/deps/cell_flags_costs-246a7a051e604dad)

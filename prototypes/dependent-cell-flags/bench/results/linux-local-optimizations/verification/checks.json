@@ -1,0 +1,43 @@
+{
+  "code_head": "fabb89983996569ceb0ba480696528cdd34b34b5",
+  "restored_head": "cd44c394c8599df366016a8830380b6b684aaf8a",
+  "flat_search_fix_head": "8d09fb6236b27a4be9acf41cc086fb9844815396",
+  "fmt": "passed",
+  "diff_check": "passed",
+  "git_fsck": "passed",
+  "lance_lib": {
+    "passed": 4604,
+    "ignored": 4,
+    "cell_flag_passed_subset": 442,
+    "cell_flag_ignored_subset": 1
+  },
+  "lance_table": {
+    "passed": 580,
+    "doc_passed": 2
+  },
+  "lance_doc": {
+    "passed": 74,
+    "ignored": 22
+  },
+  "clippy": "cargo clippy -p lance --tests --benches --profile release-with-debug --locked -j 12 -- -D warnings",
+  "protoc": "libprotoc 3.19.6",
+  "descriptor_pairs_equal": 6,
+  "python_utilities": "stdlib py_compile passed; no Python binding tests run",
+  "filesystems": {
+    "source": "cifs",
+    "builds_and_data": "tmpfs"
+  },
+  "sophon": {
+    "status_before": "clean",
+    "status_after": "clean",
+    "lance_pin": "c3c8d6fb505fb437b2b673c5195e1d4b74436b2f",
+    "lancedb_pin": "00f5dd6f77e6a6a2387a4bae613f2fed35ca4525"
+  },
+  "benchmark_sample_records": {
+    "reads": 5040,
+    "mutations": 864,
+    "allocations": 324
+  },
+  "dataset_hashes_unchanged": true,
+  "push_or_pr": false
+}
