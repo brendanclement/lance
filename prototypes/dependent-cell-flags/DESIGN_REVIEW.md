@@ -1,310 +1,351 @@
-# Dependency-aware cell flags: design-review handoff
+# Dependency-aware cell flags: design and tradeoffs
 
-> **Research prototype, not for production.** The format is unstable and gated by
-> `FLAG_UNSTABLE_CELL_FLAGS`; release builds refuse flagged datasets unless
-> `LANCE_ENABLE_UNSTABLE_CELL_FLAGS` is set. Nothing here is pushed or proposed as a PR.
+Review draft, 2026-10-05. **Unstable research prototype; no production acceptance or integration approval.**
+The reviewed implementation is `fabb89983996569ceb0ba480696528cdd34b34b5`, with results and
+handoff committed at `c9ff941b5`. The transferred prototype remains at `cd44c394c`.
 
-- **Branch:** `brendan/dependency-aware-cell-flags`.
-- **Baseline:** `e3671b2f5`.
-- **Final code:** `b56278dc8` (the last commit that changes code).
-- **Research record** (kept separately):
-  - [`README.md`](README.md): the detailed log of every decision, check and departure;
-  - [`bench/REPORT.md`](bench/REPORT.md) and `bench/results/`: every benchmark run with raw
-    samples;
-  - [`bench/results/10m-noflag-investigation/`](bench/results/10m-noflag-investigation/README.md)
-    and [`bench/results/vector-masking/`](bench/results/vector-masking/README.md);
-  - [`bench/results/feature-costs/`](bench/results/feature-costs/README.md): the cost of each
-    operation, with the cost table.
+**Recommendation:** retain option D's logical contract: Lance atomically invalidates outputs
+when their declared inputs change, masks unavailable outputs, and validates publication of
+computed results. Keep functions and jobs in LanceDB/Sophon. Treat whole-fragment publication
+and inline flag state as prototype choices whose production suitability still needs a decision.
+The evidence supports this direction and several local optimizations; it does not establish that
+the entire branch is ready to integrate.
 
-## What it is
+The review should settle the smallest useful product scope, the publication unit, the state
+storage strategy, and the binding/lifecycle contract. Another optimization is useful only when
+it resolves a cost that matters to those choices.
 
-A *dependent* cell flag is a per-row Boolean on an output field, cleared in the same commit as any
-write to the fields it is computed from. With `mask_when_false`, reads return NULL for the output
-wherever the flag is false.
+## 1. Goal and observable behavior
 
-A refresh reads a snapshot, computes outputs outside Lance, and publishes them as an ordinary
-`DataReplacement` that sets the flags true. Lance validates the publication against everything
-committed since the snapshot. It either rejects the publication or publishes the safe part and
-reports the rest.
+An asynchronous worker computes `summary = f(title, body)` while ordinary table writes continue.
+If `body` changes, a new snapshot must immediately show `summary` as NULL until a result based on
+the new inputs publishes. An older retained snapshot can still show its old, consistent pair.
+A worker based on old inputs must never make stale output visible or destroy a newer result.
 
-## API
+Readiness is separate from Arrow validity:
 
-```rust
-// Register: `summary` is computed from `title` and `body`, and reads NULL until published.
-let ready = dataset.register_cell_flag("summary", "ready",
-    CellFlagOptions::default().with_clear_on_write(["title", "body"]).with_mask_when_false(true)).await?;
+| Ready flag | Stored value | Logical value and meaning |
+| --- | --- | --- |
+| false | Anything | NULL; result unavailable and needs computation |
+| true | NULL | NULL; computation completed with a NULL result |
+| true | Non-NULL | Available computed result |
 
-// Refresh: stream computed rows (`_rowaddr` + output columns, optional per-output masks)
-// against a fixed snapshot; the stager copies every other cell from that snapshot.
-let snapshot = Arc::new(dataset.clone());
-let stager = PublicationStager::try_new(snapshot.clone(), &["summary"])?;
-if let Some(publication) = stager.stage(computed).await? {
-    let result = CommitBuilder::new(snapshot)
-        .with_dependency_conflict_policy(DependencyConflictPolicy::Skip) // default: Reject
-        .execute_with_report(publication)
-        .await?;
-    // Follow up at exactly the version the report names, then pick up remaining pending rows
-    // (moved or vacated rows) with a live scan filtered by `cell_flag_true_rows`.
-    let plan = PublicationStager::try_new(Arc::new(result.dataset), &["summary"])?
-        .follow_up(&result.report).await?;          // per output: reuse / recompute rows
-}
+`IS NULL` matches both kinds of NULL. Work selection must inspect readiness rather than use
+`output IS NULL`, or legitimate NULL results will be recomputed indefinitely. Readiness certifies
+declared table dependencies under the caller's computation contract; it does not detect an
+external model changing, prove correct function execution, or promise deterministic results.
 
-// Vectors: a nullable FixedSizeList<Float16|32|64> embedding can be masked the same way;
-// unindexed nearest-neighbor search is a flat search that never returns masked rows.
-scanner.nearest("embedding", &query, 10)?;
-```
+## 2. Why option D
 
-The public surface:
-- **Registration and state:** `register_cell_flag`, `replace_cell_flag`, `drop_cell_flag`,
-  `cell_flags`, `cell_flag_true_rows`.
-- **Transactions:** `CellFlagChanges` / `CellFlagUpdate` on `Transaction`.
-- **Commit:** `CommitBuilder::with_dependency_conflict_policy` and `execute_with_report`, which
-  returns a `PublicationResult { dataset, report }`.
-- **Staging:** `PublicationStager` (`try_new`, `flag_id`, `stage`, `follow_up`), `ComputedBatch`
-  (`new`, `with_assigned`), `FollowUpPlan`, `FollowUpRows`.
+The alternatives below come from the packet's saved *Derived Columns & Source Updates* document.
+They are design alternatives, not claims about current upstream APIs.
 
-Everything is Rust only.
+| Approach | Benefit | Tradeoff for this goal | Assessment |
+| --- | --- | --- | --- |
+| Synchronous computation in every source write | Outputs are always available and current | Slow functions and remote resources become prerequisites for ordinary writes | Unsuitable for expensive asynchronous functions |
+| A: commit preconditions | Reject results whose inputs changed during computation | A source write after publication can still leave visible stale output | Necessary publication protection, insufficient alone |
+| B: LanceDB detects changes during refresh and permits stale values | Smaller engine change; stale values remain usable | Visible output can disagree with current inputs until refresh catches up | Requires a different product contract |
+| C: mask using row update versions and a column calculation version | Can hide stale output with version comparisons | Row-wide tracking can invalidate unrelated outputs; incremental publication, derived writes and raw writers need precise rules | Viable alternative, less direct for field-specific dependencies |
+| D: declared dependencies, atomic clearing, mandatory masking and validated publication | Enforces the contract at the source-write boundary; all supported readers agree | Adds engine state, write bookkeeping, read semantics and maintenance obligations | Recommended for the requested contract |
 
-## Guarantees
+Physical NULL as a pending marker cannot distinguish a completed NULL result. Separate assignment
+state is required regardless of publication encoding. A flag's name has no magic meaning: its dependency
+and masking configuration gives it these rules. Generic explicitly writable flags remain distinct
+from dependent readiness flags.
 
-**Invalidation.**
-- A write to a watched field clears the flag on the written rows in that same commit, and records
-  the clear even when the flag was already false.
-- Clears propagate down chains of computed outputs.
-- Registering or dropping a masking flag on a source clears the flags watching it.
+## 3. Ownership and reconciliation with the original function design
 
-**Publication.**
-- A dependent flag becomes true only through a publication: a `DataReplacement` that writes its
-  output, validated against its read version.
-- The read version never changes across retries.
-- Replacing or dropping a registration fences older publishers.
+| Layer | Responsibilities |
+| --- | --- |
+| Lance | Stable field/flag identities; dependency graph; snapshot readiness; atomic invalidation; publication admission and outcome reports; logical masking; preservation or explicit refusal of unsupported writers/readers |
+| LanceDB | Exact immutable function version; binding inputs and outputs; sibling membership; atomic binding changes using Lance identities; local execution; user query policies and refresh results |
+| Sophon | Distributed execution, resources, checkpoints, retries, progress and maintenance scheduling under the same table contract |
 
-**Conflicts.**
-- `Reject` (the default) fails an unsafe publication as a retryable conflict and exposes nothing.
-  The one exception: rows deleted since the read are dropped and reported `RowVacated`.
-- `Skip` publishes the safe groups and defers the rest, each with a reason: `InputChanged`,
-  `RowVacated`, `UpstreamNotPublished`, `NewerResult`, `OutputWritten`, `FragmentRemoved` or
-  `FragmentRewritten`.
-- Under either policy, a replacement file never overwrites a newer result anywhere in its
-  footprint.
+The original first-class-functions document put dependency enforcement and query policies in
+LanceDB and proposed rejecting raw Lance mutations through an application capability. D changes
+that boundary: supported raw Lance writes must invalidate dependencies correctly, and ordinary
+Lance reads must mask. LanceDB can add `error` and `skip` consumption policies above that baseline;
+those policies and the proposed function APIs are not implemented by this prototype.
 
-**Report.** Rows `reusable_rows` certifies are safe to reuse at the version the report names.
-Rows deferred `InputChanged` or `UpstreamNotPublished` must be recomputed. A recorded clear and an
-input change are tracked as different things.
+The product may still need to restrict ordinary writes to managed outputs. The prototype instead
+invalidates an output written outside its validated publication. Agree that application policy
+explicitly; do not present the original managed-output rejection rule as current behavior.
 
-**Masking.** A false masking flag makes the cell read NULL on every read path:
-- scans, filters and aggregates;
-- `take`, `take_rows` and late materialization;
-- SQL and flat full-text search;
-- unindexed vector search.
+Replacing a flag allocates a new ID and fences old publications. That provides an engine-level
+identity boundary, but does not implement a function catalog, a durable function sibling group,
+or atomic binding metadata replacement. Integration must install/reset the relevant flags and
+the exact function binding together. A worker-side check before or after publication is too late
+to establish that atomicity.
 
-Masking nulls a vector's list slot only: the stored vector, stale or never published, can remain
-in the child array under it (`b56278dc8`).
+Prefer a Boolean readiness bit and a function version recorded once in the snapshot binding.
+Per-cell function-version provenance is warranted only if mixed versions within one output and
+snapshot become a product requirement. This is a recommendation; provenance is not implemented.
 
-**Torch consumers.** `lance.torch` maps a NULL vector (masked, computed NULL, or ordinary) to a NaN
-row whatever values sit under its slot. Integer vectors in a batch holding a NULL become float64
-with NaN rows. Arrays without NULLs stay zero-copy.
+## 4. Proposed contract and implemented mechanism
 
-**Stager.**
-- Copy-through holds by construction. Unassigned cells are copied from the same snapshot as read
-  through Lance, and each copy window is checked against its row addresses.
-- Assignment comes from column presence and masks, never from values, so a computed NULL is
-  distinct from an unassigned cell.
-- Refused before anything is written:
-  - bad row addresses: out of range, deleted, duplicated, out of order or revisited;
-  - wrong types;
-  - outputs without a dependent flag;
-  - blob and JSON outputs, and V1 datasets;
-  - chains through an undeclared output, or a row that skips the declared output between two
-    outputs.
-- Memory is bounded per copy window, not per fragment. The bound excludes the scan's own
-  read-ahead.
-- A stored output and a newly added all-NULL output publish together in one file per fragment.
-  The ordinary `DataReplacement` build now tombstones the stored fields and appends the file
-  (`ded2e02e93a2583f4912420d2323ec3b79265d79`).
+### Registration and source writes
 
-## Caller obligations (Lance cannot verify these)
+Dependencies are row-local, within one table, and refer to stable top-level field IDs. The current
+implementation supports several inputs, independent outputs and acyclic chains. Cycles and a
+second dependent flag on the same output are refused. Stable row IDs are optional and are not
+interchangeable with physical row addresses.
 
-- **Values:** computed values must be functions of the snapshot's inputs as read through Lance.
-  Wrong values publish under true flags.
-- **Chains:** a downstream output assigned in the same row as its upstream must be computed from
-  that upstream value.
-- **Follow-ups:**
-  - Run at exactly `committed_version.unwrap_or(checked_version)`.
-  - Then find the remaining pending rows with a live scan filtered by `cell_flag_true_rows`,
-    because moved rows get new addresses.
-  - A follow-up that assigns an upstream must also assign the declared downstream outputs on the
-    same row.
-- **Hand-built publications** (without the stager) must copy every unassigned row unchanged.
-- **Staged files:** files of a publication that is dropped, rejected or partly deferred stay until
-  `cleanup_old_versions` removes them, after 7 days by default. There is no lease.
-- **Vectors:** readers must respect the list validity. A reader that takes a fixed-size list's
-  values without it (a `.values` reshape, a user `to_tensor_fn`, an Arrow C Data consumer in
-  another engine) can see a masked slot's stored vector.
+A dependent flag watches its inputs and its own output. A supported logical write clears affected
+flags and descendants in the same commit as the data write. An explicit source write counts even
+if the bytes are equal. Physically copying an unchanged field is not a logical input write.
+Invalidation resolves the latest registry on every commit attempt, including registrations made
+after a writer staged its data.
 
-## Unsupported (explicit errors)
+The transaction records an invalidation event even if the flag was already false. Looking only
+at the current true-set would miss inputs changing while a worker was computing, including
+`A -> B -> A` updates. Row-moving writes carry unaffected state to new addresses and account for
+vacated old positions.
 
-**Indexes:**
-- any index on a masked output: scalar, full-text or vector (IVF, HNSW, prebuilt segments), at
-  build and at commit;
-- masking an indexed field.
+### Compute, stage and publish
 
-**Operations:** compaction (`Rewrite`), `Overwrite`, `DataOverlay` on a watched field, dropping or
-casting a watched field, and a `Merge` that rewrites a source.
+1. Read inputs from fixed snapshot R and retain its output/flag identities.
+2. Compute outside Lance. Stream `_rowaddr` and output arrays to `PublicationStager`.
+3. Column presence and optional assignment masks identify computed cells, including computed NULLs.
+4. The stager copies unassigned cells from R through Lance's logical reads and writes one
+   full-fragment file containing its declared outputs for each fragment with assigned work.
+5. Commit an ordinary `DataReplacement` plus typed true assignments. Validate against relevant
+   commits after R and the latest registration state. A manifest retry never advances R.
+6. Consume the outcome report, then follow up at exactly the version it names.
 
-**Types:** masking a non-nullable, list, struct, blob or V1 field, or a vector whose items are not
-Float16/32/64.
+Typed flag changes travel on existing transactions; registration uses `UpdateConfig`. There is no
+special output value and no UDF runtime inside Lance. The stager keeps overlapping computed batches
+and a small number of copy windows rather than collecting a whole fragment. Caller batch sizes and
+the scan's own decode/IO read-ahead also affect memory. Late streaming errors can follow staged writes: no publication
+does not mean no bytes were written.
 
-**Other:**
-- MemWAL or LSM together with masking;
-- detached or batch commits carrying flag changes;
-- `Skip` without `execute_with_report`;
-- Python and Java APIs (bindings drop flag changes on a round trip).
+Copy-through is guaranteed by the stager. A hand-built publication must satisfy it itself; Lance
+cannot prove that unassigned file contents are unchanged. It also cannot prove that computed
+values came from R's inputs. Prefer the stager for application integration while keeping this
+trust boundary visible in the lower-level API.
 
-## Tests actually run
+### Conflict policy and reports
 
-**On the final code, `b56278dc8`** (macOS), after removing child-nulling:
-- `cargo fmt --all` and `cargo clippy -p lance --tests --benches -- -D warnings`: clean.
-- `cargo test -p lance --lib -- cell_flag`: 422 passed, 1 ignored (the fixture generator).
-- `python/python/tests/torch_tests/` and `test_torch.py`, against a `pylance` built from
-  `b56278dc8`: 90 passed, 3 skipped (CUDA). The torch fixture test now reads a stale vector under a
-  masked slot.
+`Reject` is the default: unsafe publication fails without partial visibility. Deleted assignments
+are an exception: they can be omitted and reported as `RowVacated` while the rest commits.
+`Skip` is explicitly limited to output-and-flag publications through `execute_with_report`;
+it is not arbitrary partial application of mixed transactions.
 
-Everything below ran on `19bb42a65`, which differs only in `mask_batch`, its rustdoc and the
-tests' child-value assertions.
+`Skip` can install a safe file while withholding stale rows' assignments, or defer an unsafe
+file/group entirely. A physical file that would overwrite a newer output anywhere in its
+footprint is unsafe, including rows copied through rather than computed. Dropping only the flag
+assignments would not protect that newer result.
 
-**macOS (Apple M5 Pro):**
-- `cargo fmt --all -- --check` and `cargo clippy --all --tests --benches -- -D warnings`: clean.
-- `cargo test -p lance --lib`: 4584 passed, 4 ignored.
-- `cargo test -p lance-table`: 580 passed, plus 2 doctests.
-- `cargo test -p lance-index --lib vector::flat`: 30 passed.
-- `cargo test -p lance --doc -- cell_flag staging PublicationStager ComputedBatch FollowUpPlan`: 15
-  passed.
-- `python/python/tests/torch_tests/` and `test_torch.py`: 90 passed, 3 skipped (CUDA).
-  - These ran against the cached torch 2.11.0 through `uv run --with`. The locked torch 2.14.0 is
-    not cached, and its roughly 128 MB download was not made.
-  - `uv run make lint` passed on the Torch change.
+| Report category | Meaning for follow-up |
+| --- | --- |
+| Published | Values and true assignments committed |
+| Reusable staged rows | Values certified against the checked snapshot; can be reused when the follow-up's inputs permit |
+| `InputChanged` | Recompute from current inputs |
+| `UpstreamNotPublished` | Recompute downstream from the upstream actually used by the follow-up |
+| `RowVacated` | Old address is no longer live; discover moved pending rows at their new addresses |
+| `NewerResult` / `OutputWritten` | File was deferred; keep the winner, use per-output row classifications to plan remaining work |
+| `FragmentRemoved` / `FragmentRewritten` | Staged physical positions are unusable; do not certify those rows as reusable |
 
-**Linux (a local aarch64 Docker container, Rust 1.97):**
-- `cell_flag`, `fragment_write_columns` and the DataReplacement tests: 471 passed, 1 ignored (the
-  fixture generator).
-- `lance-table`: 580 passed, plus 2 doctests.
-- `lance-index` `vector::flat`: 30 passed.
-- Doctests: 15 passed.
-- `lance` benches compile.
+A report is snapshot-bound, not a permanent freshness certificate. `follow_up` uses
+`committed_version.unwrap_or(checked_version)`, normally excludes already-ready rows, propagates
+upstream recomputation even to ready downstream rows, and leaves vacated addresses out. A subsequent live pending-row scan finds moved
+rows. An empty follow-up plan therefore does not prove that every current live row is ready.
 
-**MSRV:** CI's msrv command, `cargo check --profile ci --workspace --tests --benches` with every
-workspace feature except `protoc`, passes under Rust 1.91.0 in the same container.
+### The concurrency cases that define correctness
 
-**Mutation checks:** the checks listed in the README's Tests table were disabled in turn, and at
-least one test failed each time.
+| Controlled commit ordering | Required result |
+| --- | --- |
+| Publish, then source write | New source and masked output become visible together |
+| Source write, then old publication | Changed rows cannot become ready from old work |
+| Clear while already false; inputs change and change back | Old work still loses eligibility |
+| Source write staged before publication, committed afterward | Latest ready state is cleared correctly |
+| New worker publishes, then old worker finishes | New values and readiness survive over the old file's entire footprint |
+| Commit loses its manifest slot repeatedly | Checks retain the original input basis and all intervening changes |
+| Registration replaced/dropped during work | Obsolete flag identities cannot publish |
+| Rows move or are deleted | No resurrection or reuse of vacated physical addresses |
+| Upstream and downstream staged together; file deferred | Downstream based on the unpublished upstream is not reusable |
+| Competitor republishes upstream and downstream together | Upstream publication is an input change even if no downstream clear was recorded |
 
-**History caveat:** one intermediate commit, `58c874a67`, fails clippy on its own. The lint fixes
-for its tests landed in `792c462d9`, and history was not rewritten.
+Chains add a caller obligation: a downstream assigned alongside its upstream must use the new
+upstream value in that publication. A follow-up that republishes upstream must recompute the
+relevant downstream, even if its old staged value otherwise appeared reusable. The packet's
+adversarial reproducer exposed exactly this issue; current tests cover the corrected reports.
 
-**Not run:**
-- Linux x86_64;
-- `python/` beyond the torch tests;
-- `java/` (no Java runtime here; only a Javadoc changed);
-- torch 2.14;
-- any representative performance environment.
+## 5. Representation and API tradeoffs
 
-**Flat-search fix, separately:** `brendan/flat-search-null-offset` (`8d09fb623`) is based on
-`2c4934cfe`, which was `origin/main` when the fix was extracted. It merges cleanly onto the
-current `origin/main`, three commits ahead. It passed on its own:
-- clippy for `lance-index` and `lance`;
-- 51 `vector::flat` tests;
-- 318 scanner tests;
-- 189 `io::exec::knn` tests.
+These recommendations distinguish an experimental default from a production commitment.
 
-Its new scanner test and two of its three unit cases fail on `main` without the fix.
+| Decision | Current choice and benefit | Cost / alternative | Recommendation and decision trigger |
+| --- | --- | --- | --- |
+| Publication representation | Ordinary `DataReplacement` plus typed flag changes reuses commit machinery | Safe eligibility is row-level, but physical publication is whole-fragment; a dedicated primitive could express mapping, group identity and reconciliation directly | Keep the current primitive for the bounded prototype. Specify a new operation only if required mapping/lifecycle contracts cannot remain clear and safe on the existing API |
+| Publication granularity | Full output columns have simple mapping and bounded copy-through | Sparse work rewrites unrelated rows and one output race can defer a whole file. Filtered staged-value overlays or an explicit immutable value mapping can preserve outside rows | Decide whether fragment fallback is acceptable for the first useful workload. If not, write a separate row-selective publication design before more storage implementation |
+| Output grouping | A stager's outputs publish atomically in one file | Grouping independent outputs couples their conflicts; Lance does not know which outputs are siblings of a function | Use the smallest required atomic group; define sibling membership in binding metadata and enforce it on integration |
+| Flag state storage | Inline compressed true-sets avoid new objects, caches and cleanup paths | Every open decodes state; commits serialize it; holes and additional flags grow metadata. External immutable per-fragment state reduces rewritten metadata but adds requests and lifecycle work | Retain inline state as the experimental baseline. Compare inline, external and threshold-based spill on representative storage before selecting a format |
+| Row identity | Physical fragment offsets match current replacement files | Moves require explicit state carry and invalidate staged positions; stable row IDs do not themselves repair file alignment | Keep `_rowaddr` as an explicit snapshot identity in this API. Require verified mapping or deferral for every physical rewrite |
+| Dependency scope | Chains are implemented and covered by adversarial tests | They complicate invalidation, same-publication provenance and reuse | Preserve existing guarantees and tests. Decide whether public function bindings expose chains initially; a narrower product surface need not discard the engine work |
+| Rejection vs selective progress | `Reject` is easy to consume; `Skip` retains safe progress and exposes reuse | `Skip` needs report-driven orchestration. `Reject` stops early and provides no complete reuse certificate | Keep both; use `Skip` for expensive asynchronous jobs after the executor consumes reports correctly. Do not equate rejection with mandatory full recomputation |
+| Reusable staging lifecycle | Unreferenced files are eventually collected | Long jobs/retries can accumulate or lose work; no lease protects deferred files | Specify ownership, discard, history retention and expiry before durable checkpoint integration. A lease buys reuse guarantees at the cost of lifecycle metadata |
 
-## Performance evidence and uncertainties
+Existing overlays cannot be made row-selective by simply subtracting coverage bits: value positions
+are determined by rank in the coverage bitmap. Removing a middle bit shifts later positions.
+Either rewrite/filter staged values into an aligned file, without rerunning the function, or
+specify separate immutable stored-row mapping and effective coverage. Both need conflict-footprint,
+deletion, compaction, index and cleanup rules.
 
-Measurements of the current prototype (`b56278dc8`), on one Apple M5 Pro laptop running macOS
-with a local SSD and a warm page cache, in `release-with-debug`, on 2026-09-30. None of it
-describes production builds or object storage. The Linux wheels use thin LTO, 1 codegen unit,
-`haswell` on x86_64, and the `metrics` features. **Performance acceptance is open:** no
-representative environment or agreed threshold was available. The full cost table, its
-evidence and what was not measured are in
-[`bench/results/feature-costs/`](bench/results/feature-costs/README.md). At 1M rows in 10
-fragments, against tables without flags:
+External flag storage addresses metadata, not sparse output write amplification or the partial-mask
+processing path. These are separate decisions and should have separate evidence.
 
-- **Reads without flags:** 1.014–1.023× `main` at 10M rows, with intervals that include 1.0; an
-  identical binary reads 1.017–1.027× `main`. Instructions +0.1%, allocations identical.
-  Unresolved, as before; `2fd300ac2` stays a maintainability choice, not a proven speed-up.
-- **Masked reads:** free when every fragment's flags are whole (0.98–0.99×). When fragments have
-  lost rows, reads cost 1.72× even with every flag true: a per-row mask is built from the
-  fragment's row-set state. 1% masked costs 1.65–1.69× equal ordinary NULLs. A fully masked
-  column still decodes its stored values: 2.5–3.0× all-NULL scans, 16× takes. Masked vectors
-  cost 1.01× an all-valid table at 1% masked, and 0.46× equal NULL vectors. Takes are unaffected
-  unless every row is masked.
-- **Writes:** unrelated writes cost 0.99–1.01×, and sparse source writes 1.00×. A dense source
-  write (100k rows moved) costs 1.24–1.25× (+15 ms), and leaves 163 KB of manifest flag state for
-  one flag, 323 KB for two, against 2.5 KB.
-- **Refresh:** staging pending rows that sit in a new fragment is 20× faster than the
-  `merge_insert` a plain table would use (0.56 ms against 11 ms). Staging 100 rows scattered in
-  place rewrites every touched fragment: 65.6 ms against 23.9 ms for `merge_insert`
-  `RewriteColumns`, which rewrites them too, and 117× the same rows staged in a new fragment.
-  Backfills stage 3.5–5.4× slower than a plain `write_columns`. Commits (validation and
-  publication) cost 0.99–1.15×. Finding pending rows with the documented live scan costs 10.7 ms
-  per 1M rows. Complete cycles cost 0.84–0.96× (row-moving sparse), 1.16–1.30× (dense) and
-  1.40–1.49× (in place) the plain cycle.
-- **Races:** a `Reject` retry redoes the whole refresh (0.97–1.06× the first attempt), and
-  recomputes twice the rows. A `Skip` follow-up of an in-place race costs 0.59–0.73× of the first
-  refresh at 10 fragments and 0.20–0.22× at 40, because it restages every fragment a raced row is
-  in.
-- **Over time:** a publication after 32 unrelated commits costs the same as plain Lance
-  (1.00–1.01×). Opens after 16–64 updates cost 1.09–1.31× (+0.02–0.05 ms), and appends and
-  updates 0.96–1.05×. Holes at moved rows stay in the flag state after a refresh.
-- **Flat search with any NULL vector is slow, flags or not:** 219–230 ms against 15 ms. This looks
-  like a separate flat KNN issue on `main`.
+### Ordinary DataReplacement partial coverage
 
-What these costs come from:
-- The semantics require the flag clears and conflict checks.
-- Inline storage causes the manifest and transaction growth.
-- Whole-fragment `DataReplacement` causes the in-place and `Skip` rewrites.
-- The prototype's own code causes the stager's speed and the row-set mask path.
-- The refresher's own code causes the pending-row scan.
+The prototype lets a stored output and a newly added metadata-only all-NULL output publish together:
+it tombstones the stored V2 fields and appends their combined file. This avoids an extra publication
+and permits atomic siblings, but broadens ordinary `DataReplacement` behavior for every caller.
+It requires an independent maintainer review of field/schema coverage, nested mappings, versions,
+row counts and overlay supersession. The builder still has an existing TODO to check replacement
+file length; stager alignment does not establish validation for arbitrary callers.
 
-## Decisions needed before production work
+The alternatives are to accept and validate this general rule, constrain the extension to an
+explicitly supported publication contract, or refuse mixed layouts. Publishing siblings separately
+changes their atomicity and is not an equivalent fallback. Keep this change independently reviewable.
 
-1. **Vector child values (decided: validity only).** `b56278dc8` removed child-nulling, so
-   reading a masked vector correctly is a caller obligation (see above). `lance.torch` respects
-   vector validity (`90c31aad8`, and `58e4a4dc1` for `KMeans`). Confirm the contract, and whether
-   other consumers need it documented.
-2. **`DataReplacement` partial coverage.** This changes `main`'s rule for every caller: a file
-   that writes a stored field next to an unstored one now tombstones and appends instead of
-   failing.
-   - It needs a `main` reviewer.
-   - Consider validating the new file's field ids against the schema.
-   - The Java `DataReplacement` Javadoc now matches (`19bb42a65`); no Java runtime was available to
-     check its formatting.
-3. **Flag state storage.** Inline state grows with holes and flags. A dense update leaves
-   163 KB per flag. A 50% in-place clear leaves 163 KB, and writes a 331 KB transaction twice:
-   inline and as the transaction file. Holes at moved rows are permanent without compaction.
-   Locally this added only 0.02–0.15 ms to opens and commits. Object-storage latency on every
-   open and commit was not measured. Decide whether to spill the state to external per-fragment
-   files before production.
-4. **Publication granularity and stager speed.** Whole-fragment `DataReplacement` makes a refresh
-   of 100 scattered rows rewrite 13.8 MiB per output, and makes `Skip` follow-ups rewrite again.
-   The stager is also 2.6–5.4× slower than plain Lance writes of the same columns, though it uses
-   far less memory. Decide whether a finer-grained publication, a faster stager, or both are
-   needed. Measurement only so far.
-5. **Index maintenance over masked outputs** (scalar, full-text and ANN) and **compaction** that
-   remaps flag state. Both are refused today.
-6. **Bindings.** Python and Java APIs are needed for real use.
-7. **Staged-file lifecycle.** Leases, or explicit discard, for uncommitted publications.
-8. **Performance acceptance.** Agree an environment (Linux x86_64 wheel builds, object storage), a
-   threshold and a wheel-matching Rust profile. Run `bench/run_costs.sh` there; each rotation has
-   an identical-binary control.
-9. **Torch NULL representation** (`90c31aad8`).
-   - Float NULL vectors become NaN rows.
-   - Integer vectors with NULLs become float64 with NaN rows, a dtype that depends on the batch.
-   - Accept or change this. It was tested only on the cached torch 2.11, not the locked 2.14.
-10. **Upstream fixes, independent of cell flags.**
-   - The flat-search null-offset fix is ready on the local branch `brendan/flat-search-null-offset`
-     (`8d09fb623`), also saved as `upstream/0001-flat-search-null-offset.patch`.
-   - The flat KNN slowdown with NULL vectors needs its own investigation.
-  - A `take` of 1,000 rows from a table with 1% of rows moved takes 1.5 s, with or without
-    flags. Not investigated.
+## 6. Read masking and vectors
+
+Masking belongs in logical value resolution before predicates, aggregates, ordering, SQL, take
+and search consume the output. Query indexes and statistics must never bypass it. The current
+prototype refuses indexes on masked outputs instead of maintaining their coverage.
+
+**Settled decision: vector NULLs mask only parent list validity.** Preserve ordinary Arrow NULL
+semantics and the Torch/KMeans validity-and-slice fixes. Stored child values can remain under a
+NULL slot; readers must honor the parent bitmap. This is logical masking, not secure erasure.
+Removing child-nulling avoided a measured large copy/allocation cost on the old machine; those
+old 10–18x figures describe a superseded implementation, not current vector masking overhead.
+
+The current Torch adapter represents NULL floating vectors as NaN rows. Nullable integer tensors
+are a separate unresolved policy: casting a NULL-containing batch to float64 changes dtype and
+can lose integer precision above `2**53`. Choices include preserving integers with a separate
+validity mask, explicit refusal without a converter, or an explicitly accepted lossy conversion.
+Prefer lossless values plus validity in a future API, but review its compatibility and tensor
+consumer requirements before changing the existing adapter. Parent-only masking remains fixed.
+
+## 7. What the measurements tell the design review
+
+The Linux continuation compares the same generated data/history and matched before/after builds
+on one Ryzen 9 3900X host. Source is on CIFS; timed data/builds are local tmpfs. These are warm
+processing measurements, not network-mount, SSD, S3, cold-cache or wheel-build acceptance.
+Function computation is excluded. Absolute times below are pooled sample medians; the paired
+ratios and confidence intervals are in [CONTINUATION.md](CONTINUATION.md).
+
+| Workload, 1M live rows | Before -> after, ms | Equivalent plain workload after, ms | Design implication |
+| --- | ---: | ---: | --- |
+| All-ready scan after row movement | 45.23 -> 22.95 | 23.39, same movement | Deleted holes do not require per-row masking of valid live rows |
+| Wholly masked scalar scan | 8.44 -> 1.06 | 1.67, physically stored all-NULL | Hidden outputs can use a NULL reader; data IO fell from 14.00 MiB to zero |
+| Fully assigned backfill stage, one output | 246.71 -> 127.23 | 119.25, `write_columns` | Most of the measured former backfill processing cost was avoidable |
+| Fully assigned backfill, shared / chained pair | 401.04 / 403.51 -> 158.14 / 151.92 | 144.89 / 145.81 | Bulk slices help without changing concurrency or bounded streaming |
+| Scalar scan, 1% masked | 16.50 -> 17.20 | 8.78, equivalent stored NULLs | Partial-mask processing remains unresolved |
+| Stage 100 scattered rows in place | 146.40 -> 149.26 | 56.21, plain merge staging | No demonstrated sparse-stage gain; whole columns still rewrite |
+
+The large improvements exceed identical-binary controls. Mutation controls are noisy enough that
+small differences are not established. This phase compares combined optimizations and does not
+isolate each commit's contribution. Allocation measurements count requested capacity and peak
+live growth, not RSS; they exclude precomputed buffers already live at phase start.
+
+Sparse staging still writes about **13.8 MiB per output for 100 results**. The plain in-place
+comparison also rewrites whole columns, so amplification is a representation cost, not all a
+flag-specific penalty. Lower CPU overhead can improve that path without lowering its bytes.
+
+The earlier feature-wide Mac measurements add evidence the Linux phase did not rerun: dense
+100k-row source updates added roughly 15 ms; inline state reached roughly 163 KiB per flag;
+pending-row discovery enumerated all live addresses; and fragment count affected sparse staging
+and follow-up cost. They identify questions for storage/scale evaluation, not portable targets.
+No consistent no-flag regression was demonstrated by the latest Mac repetitions; representative
+acceptance remains open. Follow-up time adds to the first attempt, and permissive plain races
+do not provide the same freshness guarantees.
+
+The NULL-vector flat-search slowdown and slow take after row movement occurred with and without
+flags on the prototype build. They need clean-main reproduction before upstream attribution.
+The independent null-bitmap-offset correctness fix is preserved separately at `8d09fb623`.
+
+## 8. Scope and risks before integration
+
+The implemented experimental surface includes selected nullable top-level scalar outputs and
+nullable `FixedSizeList<Float16/32/64>` vectors on V2 storage, supported source writes, deletions,
+multi-fragment publication, chains and report-driven follow-ups. The exact operation/error matrix
+is in [README.md](README.md#supported--unsupported).
+
+| Current boundary | Implication for a useful first release |
+| --- | --- |
+| All scalar, full-text and ANN indexes on masked outputs refused | Flat queries can demonstrate semantics; an embedding product needing ANN needs a separate coverage design |
+| Compaction refused while flags are registered | Long-lived tables accumulate layout/state costs; remapping cannot be treated as optional for a general mutable-table release |
+| Watched-field overlays, some merges, overwrite, watched-field drop/cast and other modes refused | Supported writers must be documented precisely; new writers require explicit classification |
+| MemWAL/LSM with masking refused | No fresh-tier support; stale shard handles/base-table-less readers remain a documented activation gap needing closure or an enforced scope boundary |
+| Rust-only flag APIs; Python/Java transaction round trips drop changes | Bindings must preserve typed changes and semantics before application publication uses them |
+| No protected staged-file lease or complete checkpoint/reconciliation contract | Durable jobs need retention of staged work and validation history, plus handling of ambiguous commit outcomes |
+| Unstable reader and writer gates | Release access requires the opt-in environment variable; audit supported client versions and every entry point before rollout |
+
+The MemWAL handle gap is recorded in the packet and remains visible in the source: shard-only
+readers do not consult a base table manifest. A manifest-level mutual-exclusion check alone
+does not fence a handle left alive across mode changes. This review does not claim a new
+end-to-end reproduction; activation/handle lifetime needs explicit validation before release.
+
+Format/API review also includes the public transaction field, moved-row payload, sticky registry
+feature bit, restore/clone behavior and stable-ID allocation. Replacing a binding must not reuse
+an old publication identity. Missing validation history must fail conservatively rather than
+certify unknown freshness.
+
+Current Linux checks at `fabb89983`: 4,604 Lance library tests passed (including 442 cell-flag
+cases), 580 lance-table tests, 76 doctests, formatting and Lance tests/benches Clippy. The
+continuation preserves the full logs and ignored-test counts. These checks were run during the
+optimization phase, not rerun for this documentation review. Historical Torch/MSRV/aarch64 checks
+are separately dated; current Torch, Java, full bindings, parallel storage writers and production
+performance acceptance remain unverified.
+
+## 9. Decisions and next work
+
+1. **Review the logical contract and ownership.** Confirm D, the caller trust boundary, the
+   original snapshot through retries, parent-only vector masking, and required atomic sibling
+   behavior. Reconcile the original function design's raw-writer and query-policy rules.
+2. **Choose the first useful workload and supported surface.** Decide whether flat scalar/vector
+   use with fragment fallback is enough for an experimental integration. If ANN, compaction or
+   long-lived checkpoints are required, those designs are prerequisites.
+3. **Resolve publication and state storage independently.** Use sparse refresh density, raced
+   fragment counts, output width, metadata size and storage requests as decision criteria.
+   State the acceptable write/retry amplification; do not silently turn an optimization into
+   a new publication format.
+4. **Review the general DataReplacement extension and integration contract.** Define atomic
+   binding reset, sibling enforcement, typed binding round trips, retained validation history,
+   staged-file ownership and commit-outcome reconciliation.
+5. **Validate that chosen design.** Agree workload-specific latency, bytes, reuse and memory
+   budgets; use representative Linux deployment builds and intended storage with cold/warm
+   reads and concurrent writers. Keep the existing controlled-order concurrency regressions.
+   Optimize partial scalar masking and sparse-stage processing if they threaten those budgets.
+
+Split later integration into reviewable changes: independent flat-search correctness fix;
+ordinary replacement semantics; flag model/gates and invalidation; publication/report safety;
+masking and adapters; stager; then bindings/application integration. Preserve their shared
+regressions and the frozen experimental baseline. No push, PR or Sophon pin change is part of
+this review.
+
+## 10. Packet coverage and evidence map
+
+The review used the full packet inventory, restoration/context/continuation instructions, original
+function design, Weston's A–D alternatives, option-D draft, September 17 advice, four saved agent
+reports, historical design handoff/plan/research log, benchmark methods/analyses and relevant
+current implementation/test paths. All 1,320 checksummed payload files matched. All 25 JSON files
+and 802 JSONL files parsed successfully, covering 167,264 records including run and warm-up records.
+Those integrity checks are not a rerun of the historical experiments or a formal audit of every
+line in the bundle's Git history.
+
+| Evidence | Role and precedence |
+| --- | --- |
+| Transfer `START_HERE.md`, `CONTEXT.md`, `NEW_AGENT_PROMPT.md`, reference snapshots and agent reports | Goal, explicit decisions, alternatives and earlier recommendations; supplied dated snapshots, no live external lookup |
+| [Transferred design handoff](DESIGN_REVIEW_2026-09-30.md), [PLAN.md](PLAN.md), [README.md](README.md) | Preserved implementation history and detailed contracts; older head/test/performance claims need their revision context |
+| [Feature-wide costs](bench/results/feature-costs/README.md) | Latest transferred scalar/vector/writes/races/history/scale evidence on the Mac |
+| [No-flag investigation](bench/results/10m-noflag-investigation/README.md), [vector investigation](bench/results/vector-masking/README.md), [REPORT.md](bench/REPORT.md) | Controls and superseded experiments; neither old no-flag percentages nor child-nulling costs are current acceptance claims |
+| [CONTINUATION.md](CONTINUATION.md), [Linux records](bench/results/linux-local-optimizations/README.md) | Current local optimization evidence, exact source/build identities and test logs |
+| `rust/lance-table/src/{format/cell_flag.rs,transaction/cell_flag_commit.rs,transaction/manifest_build.rs}` | Persisted state, invalidation/gates and ordinary replacement behavior |
+| `rust/lance/src/{io/commit.rs,io/commit/conflict_resolver/publication.rs,dataset/cell_flag/}` | Fixed snapshot, publication validation, reports, staging and follow-ups |
+| `rust/lance/src/dataset/{fragment.rs,fragment/cell_flag_mask.rs,tests/dataset_cell_flags*.rs}` and Torch adapters | Logical reads, local fast paths, adversarial regressions and validity-aware consumers |
+
+Precedence corrections incorporated here: chains and ordinary transactions supersede the early
+no-chain/special-operation advice; parent validity supersedes child-nulling; mixed layouts are
+now supported by the prototype; Linux checks supersede historical “x86_64 not run” statements;
+late streaming errors may leave bytes; no storage/performance release decision has been made.

@@ -8,6 +8,10 @@
 **For the design review, start with [`DESIGN_REVIEW.md`](DESIGN_REVIEW.md).** This README is the
 detailed research record: every decision, check, departure and benchmark, kept as history.
 
+The current review compares the original alternatives, reconciles Lance/LanceDB/Sophon ownership,
+and states the publication, state-storage and release-scope tradeoffs using the Linux continuation
+evidence. The transferred handoff is preserved in [`DESIGN_REVIEW_2026-09-30.md`](DESIGN_REVIEW_2026-09-30.md).
+
 **Local continuation (2026-10-05):** [`CONTINUATION.md`](CONTINUATION.md) records the standalone
 Linux restoration, read/stager optimizations, matched before/after results and current tests.
 It preserves the concurrency contract and parent-only vector NULL masking decision.
