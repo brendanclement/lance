@@ -465,6 +465,61 @@ async fn test_wholly_masked_output_reads_without_data_io(#[case] is_vector: bool
     assert_eq!(dataset.cell_flag_true_rows(flag_id).unwrap(), flags);
 }
 
+#[tokio::test]
+async fn test_wholly_masked_subset_keeps_projected_unmasked_values() {
+    let batch = record_batch!(
+        ("body", Utf8, ["b0", "b1"]),
+        ("summary", Utf8, ["s0", "s1"])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .register_cell_flag(
+            "summary",
+            "ready",
+            CellFlagOptions::default()
+                .with_clear_on_write(["body"])
+                .with_mask_when_false(true),
+        )
+        .await
+        .unwrap();
+    let store = dataset.object_store(None).await.unwrap();
+    let batch = dataset
+        .scan()
+        .project(&["summary", "body"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch["summary"].null_count(), 2);
+    assert_eq!(
+        batch["body"].as_string::<i32>().iter().collect::<Vec<_>>(),
+        vec![Some("b0"), Some("b1")]
+    );
+    store.io_stats_incremental();
+    let batch = dataset
+        .scan()
+        .project(&["summary"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch["summary"].null_count(), 2);
+    assert_eq!(store.io_stats_incremental().read_bytes, 0);
+}
+
 #[rstest]
 #[case::is_null("summary IS NULL", &[1, 5, 7, 8, 10, 11], false)]
 #[case::is_not_null("summary IS NOT NULL", &[0, 2, 4], false)]

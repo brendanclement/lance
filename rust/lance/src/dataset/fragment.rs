@@ -1155,10 +1155,13 @@ impl FileFragment {
         let all_masked_projection = cell_flag_masks
             .as_ref()
             .and_then(|masks| masks.all_masked_projection(projection));
-        let decoded_projection = all_masked_projection
-            .as_ref()
-            .map(|masked| projection.exclude(masked))
-            .transpose()?;
+        let decoded_projection = all_masked_projection.as_ref().map(|masked| {
+            let mut decoded = projection.clone();
+            decoded
+                .fields
+                .retain(|field| !masked.fields.iter().any(|hidden| hidden.id == field.id));
+            decoded
+        });
         let decoded_projection = decoded_projection.as_ref().unwrap_or(projection);
         let open_files = self.open_readers(decoded_projection, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
