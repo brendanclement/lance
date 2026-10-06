@@ -1,21 +1,42 @@
 # Concrete coding work for the design review
 
-2026-10-05. Companion to [DESIGN_REVIEW.md](DESIGN_REVIEW.md), based on production
-code at `fabb89983` and the review at `bf237febc`. This is a work queue and source
-audit, not a claim that the following experiments or fixes have run.
+2026-10-06. Companion to [DESIGN_REVIEW.md](DESIGN_REVIEW.md), based on production
+code at `fabb89983`. The original queue was committed at `16413f22b`; experiments
+1–3 now have evidence in separate local branches. Production code is unchanged.
 
 The agent can turn the remaining design questions into small reproducible examples,
 tests and measurements. Start with the existing primitives and keep each finding
 independently reviewable. Keep the established concurrency guarantees and parent-only
 vector NULL masking throughout.
 
+## Current findings and remaining work
+
+| Task | Status and consequence |
+| --- | --- |
+| 1: binding reset | Characterized at `cb288925b`. One `UpdateConfig` handles the tested masked siblings and downstream atomically. The application must own the binding record, complete siblings and immutable snapshot basis. Old downstream `Skip` can commit invisible stale files; do not assert that all old transactions are refused. |
+| 2: replacement validation | Characterized through round 2 at `1282616ce`. Malformed real files can commit. Preflight against the file's actual footer is a candidate, not an implemented fix; valid external imports and nested logical mappings need compatibility rules before coding it. |
+| 3: costs | Characterized at `b5a59bd77`. Scattered partial masks cost about 2.1–2.2x matched stored-NULL wall time. Sparse publication bytes follow touched fragments and are shared with ordinary replacement. No new processing optimization was implemented. |
+| 4: activation and lifecycle | Still open. This is the next independent correctness characterization before integration; it can proceed without choosing a publication format. |
+
+The reports and qualified comparisons are linked in DESIGN_REVIEW's evidence map. Do not merge
+test/benchmark branches merely to consolidate the findings. The next review decision is whether
+the first workload accepts full-fragment bytes and latency. Otherwise compare row-selective
+designs below before implementing a writer. Scattered-mask optimization and bounded staging
+concurrency are optional budget-driven tasks; neither reduces whole-fragment publication bytes.
+
+For task 4, keep activation fencing and cleanup/history retention independently reviewable.
+Record observed behavior through real handles and files, not just source inspection. Distinguish
+retained input snapshots from retained intervening validation history, and committed files from
+unreferenced staging. Missing history must never certify freshness. Characterize first, without
+adding a lease/epoch format or changing the concurrency contract automatically.
+
 ## Work that can start without choosing a new format
 
 | Order | Coding task | Concrete deliverable and pass condition |
 | --- | --- | --- |
-| 1 | Prove atomic binding reset using the current Rust transaction API | One `UpdateConfig` transaction changes an illustrative binding metadata record and drops/re-registers all sibling flags. Test two outputs, an existing downstream dependent output, an old worker, a concurrent source writer and competing binding resets. Every observed snapshot has a consistent binding and registry; both siblings become pending; downstream readiness clears; the old worker cannot publish; a conflicting binding change is not silently overwritten. |
-| 2 | Characterize ordinary replacement validation | Extend existing replacement tests with a real short/long replacement file, mixed stored/all-NULL fields, deletion holes, nested V2 fields and overlay supersession. Record what is accepted and what reads return. If a malformed file can commit, make a minimal reproducer and a focused validation fix with a regression test. Do not assume the stager protects arbitrary callers. |
-| 3 | Measure the unresolved read and staging costs | Use the existing saved-binary harness for partial masks at several densities and sparse publication concentrated in one fragment versus scattered across many. Record decode/IO bytes, stage bytes, allocations and timing with matched ordinary-NULL/plain controls. Optimize only the measured processing bottleneck; retain unchanged publication semantics. |
+| 1 | Prove atomic binding reset using the current Rust transaction API | One `UpdateConfig` transaction changes an illustrative binding metadata record and drops/re-registers all sibling flags. Test two outputs, an existing downstream dependent output, an old worker, a concurrent source writer and competing binding resets. Every observed snapshot has a consistent binding and registry; both siblings become pending; downstream readiness clears; old work cannot make stale output visible; a conflicting binding change is not silently overwritten. |
+| 2 | Characterize ordinary replacement validation | Extend existing replacement tests with a real short/long replacement file, mixed stored/all-NULL fields, deletion holes, nested V2 fields and overlay supersession. Record what is accepted and what reads return. Preserve minimal reproducers; agree logical mapping/import compatibility before a focused validation fix. Do not assume the stager protects arbitrary callers. |
+| 3 | Measure the unresolved read and staging costs | Use the existing saved-binary harness for partial masks at several densities and sparse publication concentrated in one fragment versus scattered across many. Record decode/IO bytes, stage bytes, allocations and timing with matched ordinary-NULL/plain controls. Implement an optimization only when the measured processing bottleneck matters to the selected workload budget; retain unchanged publication semantics. |
 | 4 | Reproduce activation and lifecycle gaps | Hold a MemWAL writer/reader open across index removal and masking registration; exercise the fresh-tier-only reader. Separately stage work, advance the table, run cleanup, and attempt publication after its files or required validation history disappear. Pass means enforced refusal/fencing or a clearly specified supported lifetime; missing history never certifies freshness. |
 
 Task 1 is a Rust characterization fixture, not a function catalog implementation.
@@ -26,7 +47,7 @@ Do not start by redesigning the existing Python/Java public APIs.
 
 ## What the source audit establishes
 
-- **Atomic reset has a useful starting point.**
+- **Atomic reset now has a tested starting point.**
   [TransactionBuilder](../../rust/lance-table/src/transaction/builder.rs) attaches
   `CellFlagChanges` to one ordinary transaction;
   [manifest construction](../../rust/lance-table/src/transaction/manifest_build.rs)
@@ -44,11 +65,12 @@ Do not start by redesigning the existing Python/Java public APIs.
   not by itself define binding ownership or an expected-binding precondition.
   Test sibling resets as one transaction and re-evaluate a conflicting reset
   rather than blindly resubmitting it against a newer binding.
-- **Replacement validation remains a separate audit.**
-  The manifest builder explicitly leaves checking replacement-file length as a
-  TODO. That is source evidence of a missing check at this layer, not an
-  end-to-end corruption reproduction. A real-file test must locate any earlier
-  validation before calling it a confirmed bug or choosing where to fix it.
+- **Replacement validation now has real-file reproductions.**
+  Experiment 2 confirms the missing commit checks for row counts and mappings,
+  and shows why footer row count alone misses ragged fields. Validate actual
+  logical fields, not raw nested physical-column lengths. General imports,
+  schema compatibility and trustworthy footer caching need a contract before
+  selecting the preflight implementation.
 - **The fresh-tier guard needs a lifetime test.**
   [The LSM collector](../../rust/lance/src/dataset/mem_wal/scanner/collector.rs)
   checks masking when it has a base dataset and returns success when that

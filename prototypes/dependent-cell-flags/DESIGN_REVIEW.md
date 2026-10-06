@@ -1,8 +1,10 @@
 # Dependency-aware cell flags: design and tradeoffs
 
-Review draft, 2026-10-05. **Unstable research prototype; no production acceptance or integration approval.**
+Review draft, 2026-10-06. **Unstable research prototype; no production acceptance or integration approval.**
 The reviewed implementation is `fabb89983996569ceb0ba480696528cdd34b34b5`, with results and
 handoff committed at `c9ff941b5`. The transferred prototype remains at `cd44c394c`.
+The later binding-reset, replacement-validation and cost experiments start from `16413f22b`
+and add tests, benchmarks and evidence only. Their revisions and local reports are in section 10.
 
 **Recommendation:** retain option D's logical contract: Lance atomically invalidates outputs
 when their declared inputs change, masks unavailable outputs, and validates publication of
@@ -74,11 +76,20 @@ The product may still need to restrict ordinary writes to managed outputs. The p
 invalidates an output written outside its validated publication. Agree that application policy
 explicitly; do not present the original managed-output rejection rule as current behavior.
 
-Replacing a flag allocates a new ID and fences old publications. That provides an engine-level
-identity boundary, but does not implement a function catalog, a durable function sibling group,
-or atomic binding metadata replacement. Integration must install/reset the relevant flags and
-the exact function binding together. A worker-side check before or after publication is too late
-to establish that atomicity.
+Experiment 1 establishes that the current Rust API can atomically replace binding metadata and
+drop/re-register both sibling flags in one `UpdateConfig`. New IDs fence old sibling workers;
+resetting masking siblings also clears the existing downstream output. Concurrent source writes,
+competing resets and failed registrations preserve the tested snapshot contract. An old downstream
+worker under `Skip` may still commit a file beneath a false flag: the guarantee is that stale
+output stays invisible, not that every old transaction is refused.
+
+No new engine primitive is required for that tested fixed-output, masking contract. Lance still
+does not enforce a binding namespace, immutable function version or complete sibling membership.
+The application must own those rules and obtain the function, inputs, flag identities and original
+read version from the same snapshot. Resolve newly allocated IDs through field/slot descriptors
+in the committed snapshot; never predict them or attach old computation to a new read version.
+The negative controls accept metadata-only resets, incomplete siblings and dishonest restaging.
+Non-masking reset behavior and atomic output removal remain outside the demonstrated contract.
 
 Prefer a Boolean readiness bit and a function version recorded once in the snapshot binding.
 Per-cell function-version provenance is warranted only if mixed versions within one output and
@@ -203,8 +214,28 @@ The prototype lets a stored output and a newly added metadata-only all-NULL outp
 it tombstones the stored V2 fields and appends their combined file. This avoids an extra publication
 and permits atomic siblings, but broadens ordinary `DataReplacement` behavior for every caller.
 It requires an independent maintainer review of field/schema coverage, nested mappings, versions,
-row counts and overlay supersession. The builder still has an existing TODO to check replacement
-file length; stager alignment does not establish validation for arbitrary callers.
+row counts and overlay supersession. Experiment 2 reproduces malformed real files committing:
+short/long replacements, relabeled fields, invalid/swapped physical mappings and unequal field
+lengths. Some reads fail; others silently return values at the wrong positions. A hand-built
+dependent publication can mark such data ready. Footer row-count validation alone misses both
+mapping errors and unequal field lengths. Most tested gaps reproduce at the local pre-extension
+revision `4ac8492d2`; the extension admits additional malformed mixed-field descriptors. This is
+historical attribution, not a test of current upstream.
+
+The candidate fix is a preflight against the uploaded file's actual footer, before commit retries:
+version-aware logical field mapping and schema compatibility, with each replaced logical field
+covering the fragment's physical rows, including deleted slots. The validated descriptor must be
+the one installed by every manifest arm. Raw footer field-ID equality and sums of every physical
+column's page lengths are not general contracts: legitimate named external imports, non-leaf
+mapping forms and nested lists need normalization. Type/nullability/storage compatibility and
+decoded-footer cache provenance also need review. A cache derived from the proposed manifest
+cannot independently validate that manifest. Reusing preflight across retries requires the file
+to remain immutable and any cached footer to identify that actual uploaded object. The validator
+remains unimplemented.
+
+Keep the trusted stager as the experimental application path; general replacement validation is
+an integration prerequisite. Even structural validation cannot prove computed values, copy-through
+contents or equal-size files' intended fragment provenance. Those remain caller obligations.
 
 The alternatives are to accept and validate this general rule, constrain the extension to an
 explicitly supported publication contract, or refuse mixed layouts. Publishing siblings separately
@@ -254,6 +285,44 @@ live growth, not RSS; they exclude precomputed buffers already live at phase sta
 Sparse staging still writes about **13.8 MiB per output for 100 results**. The plain in-place
 comparison also rewrites whole columns, so amplification is a representation cost, not all a
 flag-specific penalty. Lower CPU overhead can improve that path without lowering its bytes.
+
+### Later cost characterization: density, layout and touched fragments
+
+Experiment 3 uses the current optimized code, compared with itself as an identical-binary
+control. It is a workload characterization, not another before/after optimization. The quiet
+read replication and the main mutation rotation are reported separately; neither is pooled with
+the earlier table. There are 1M rows, ten 100k-row fragments, narrow string outputs and warm tmpfs
+data. Function computation remains excluded.
+
+| Comparison | Measurement | Design implication |
+| --- | --- | --- |
+| Scattered partial masks, 0.1–50%, against matched stored NULLs | 2.09–2.20x wall time; 1.06–1.14x process CPU. At 1%: 15.35 vs 7.31 ms; paired wall ratio 2.09 [2.06, 2.11] | Partial-mask processing is a measured optimization target; profile/source evidence places extra work on the task polling the scan |
+| Clustered masks against matched stored NULLs | Wall ratios 1.01, 1.07 and 1.03 at 1%, 10% and 50%; wholly masked 0.58 | Layout matters. The report's 0–3% clustered claim uses the all-ready baseline; the matched logical comparison reaches 7% |
+| Refresh 100 rows in one vs ten fragments | Stage 14.7 vs 144.1 ms; output 1.37 vs 13.83 MiB; refresh 25.8 vs 163.1 ms | Concentration cuts staging 9.75x and bytes 10.1x, but cost still follows touched fragments |
+| Same-column ordinary replacement | Writes the same bytes; stager stage costs 6–12% more | Most sparse output cost belongs to whole-column representation; shaving stager overhead will not remove it |
+| Dense backfill, 1M assignments | Same 13.83 MiB; 14.5 bytes/assignment vs 14,321–145,029 for sparse work | Approximately 1,000–10,000x bytes per assignment is the publication-granularity question |
+| Fragment-serial stage vs concurrent `merge_insert`, ten fragments | Stage 144.1 vs merge 54.3 ms; phase peak live growth 12.9 vs 103.4 MiB; merge uses about 1.7x CPU | Illustrates latency versus memory/CPU; different algorithms and rewritten fields prevent predicting a parallel stager's speedup |
+
+Matched stored-NULL tables have identical visible values. The all-ready `one` baseline has the
+same underlying stored values but different visible NULLs; it is useful for isolating added
+processing, not an identical logical result. Bytes also vary: at 50% scattered masks, flagged
+data reads 13.59 MiB versus 9.32 MiB for stored NULLs. Stale values are still decoded before
+masking; IO request counts match but IO bytes are not uniformly identical. The profiles identify
+work within a polling-thread-biased sample and do not measure CPU shares or prove an attainable
+2x optimization. The quiet replication confirms the direction despite contention in the first run.
+
+The 12.9 MiB figure is stage-phase peak live growth, not total job memory or RSS; source writes
+have their own much larger peaks and rewrite cost. Inline manifest state grows from 2.2 KiB
+fully ready to 163 KiB for scattered 10–50% masks, excluding the inline transaction payload.
+Open/serialization cost was not timed. External flags would address that metadata decision,
+without reducing output bytes or stale-value decode. Wide vectors, other fragment sizes,
+cold/object-store IO, a replacement validator and raced workloads remain unmeasured here.
+
+The agent's committed checks report 481 focused tests passing, one existing ignored fixture,
+clean benchmark Clippy/formatting, matched visible-value digests and unchanged root file hashes.
+This review checked source, methods, records and summary ratios; it did not rerun that build.
+
+### Historical context and unresolved performance attribution
 
 The earlier feature-wide Mac measurements add evidence the Linux phase did not rerun: dense
 100k-row source updates added roughly 15 ms; inline state reached roughly 163 KiB per flag;
@@ -309,17 +378,23 @@ performance acceptance remain unverified.
 2. **Choose the first useful workload and supported surface.** Decide whether flat scalar/vector
    use with fragment fallback is enough for an experimental integration. If ANN, compaction or
    long-lived checkpoints are required, those designs are prerequisites.
-3. **Resolve publication and state storage independently.** Use sparse refresh density, raced
-   fragment counts, output width, metadata size and storage requests as decision criteria.
-   State the acceptable write/retry amplification; do not silently turn an optimization into
-   a new publication format.
-4. **Review the general DataReplacement extension and integration contract.** Define atomic
-   binding reset, sibling enforcement, typed binding round trips, retained validation history,
-   staged-file ownership and commit-outcome reconciliation.
+3. **Decide publication granularity against a stated workload budget.** Narrow, concentrated
+   scalar refresh is a candidate for fragment fallback, subject to acceptable bytes and latency;
+   the experiment does not establish product acceptance. If scattered small refreshes or wide
+   outputs exceed that budget, compare filtered overlays and immutable row mapping before more
+   storage implementation. Evaluate flag storage separately after timing open/commit state cost.
+4. **Close replacement validation and the integration contract.** Design a footer preflight that
+   preserves legitimate mappings/imports, then implement and test it independently. Binding reset
+   has a demonstrated primitive; application ownership and sibling enforcement still need a
+   contract. Reproduce activation and cleanup/history lifetime gaps (task 4), then define typed
+   binding round trips, staged-file ownership and commit-outcome reconciliation.
 5. **Validate that chosen design.** Agree workload-specific latency, bytes, reuse and memory
    budgets; use representative Linux deployment builds and intended storage with cold/warm
    reads and concurrent writers. Keep the existing controlled-order concurrency regressions.
-   Optimize partial scalar masking and sparse-stage processing if they threaten those budgets.
+   Scattered partial masking is the justified processing target if reads threaten those budgets.
+   Consider bounded staging concurrency only when its latency/memory tradeoff is useful; it does
+   not fix publication bytes. Preserve the original read version, whole-file conflict protection,
+   report semantics and parent-only NULL masking throughout.
 
 Split later integration into reviewable changes: independent flat-search correctness fix;
 ordinary replacement semantics; flag model/gates and invalidation; publication/report safety;
@@ -344,6 +419,9 @@ line in the bundle's Git history.
 | [Feature-wide costs](bench/results/feature-costs/README.md) | Latest transferred scalar/vector/writes/races/history/scale evidence on the Mac |
 | [No-flag investigation](bench/results/10m-noflag-investigation/README.md), [vector investigation](bench/results/vector-masking/README.md), [REPORT.md](bench/REPORT.md) | Controls and superseded experiments; neither old no-flag percentages nor child-nulling costs are current acceptance claims |
 | [CONTINUATION.md](CONTINUATION.md), [Linux records](bench/results/linux-local-optimizations/README.md) | Current local optimization evidence, exact source/build identities and test logs |
+| [Experiment 1: binding reset](/home/brendan/work/lance-cell-flags-binding-reset/prototypes/dependent-cell-flags/BINDING_RESET.md), tests `8008fbe64`, report `cb288925b` | Existing atomic Rust primitive for the tested masking/sibling contract; negative controls define application obligations |
+| [Experiment 2: replacement validation](/home/brendan/work/lance-cell-flags-replacement-validation/prototypes/dependent-cell-flags/REPLACEMENT_VALIDATION.md), round-2 tests `c70df79e8`, report `1282616ce` | Confirmed structural-validation gaps; normalization/import compatibility prevents treating the proposed footer checks as a finished fix |
+| [Experiment 3: costs](/home/brendan/work/lance-cell-flags-cost-review/prototypes/dependent-cell-flags/COST_REVIEW.md), bench `c3362349f`, profiling `17e60c827`, evidence `b5a59bd77` | Density/layout and publication concentration controls, quiet replication, raw records and checks; qualifications above take precedence over shorthand conclusions |
 | `rust/lance-table/src/{format/cell_flag.rs,transaction/cell_flag_commit.rs,transaction/manifest_build.rs}` | Persisted state, invalidation/gates and ordinary replacement behavior |
 | `rust/lance/src/{io/commit.rs,io/commit/conflict_resolver/publication.rs,dataset/cell_flag/}` | Fixed snapshot, publication validation, reports, staging and follow-ups |
 | `rust/lance/src/dataset/{fragment.rs,fragment/cell_flag_mask.rs,tests/dataset_cell_flags*.rs}` and Torch adapters | Logical reads, local fast paths, adversarial regressions and validity-aware consumers |
@@ -352,3 +430,5 @@ Precedence corrections incorporated here: chains and ordinary transactions super
 no-chain/special-operation advice; parent validity supersedes child-nulling; mixed layouts are
 now supported by the prototype; Linux checks supersede historical “x86_64 not run” statements;
 late streaming errors may leave bytes; no storage/performance release decision has been made.
+The experiment links name separate local worktrees on this machine. Their commits preserve the
+reports and raw cost evidence across reboot; they have not been merged into the production branch.
