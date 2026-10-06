@@ -1,10 +1,6 @@
 # Cell flags prototype: review handoff
 
-Prepared 2026-10-06. **Unstable research prototype; not approved for production or merging.**
-
-This branch preserves the dependency-aware prototype, its history, Linux optimizations and reports
-from three later review experiments. Their test/benchmark branches and additional raw evidence
-remain local with Brendan; they are not published in this fork. This handoff branch starts
+This branch preserves the dependency-aware prototype. This handoff branch starts
 at `667d654ca` and adds documentation/navigation only; the last production change is `fabb89983`.
 The prototype has not been rebased onto current upstream main.
 
