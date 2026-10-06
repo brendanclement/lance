@@ -5,6 +5,7 @@ The reviewed implementation is `fabb89983996569ceb0ba480696528cdd34b34b5`, with 
 handoff committed at `c9ff941b5`. The transferred prototype remains at `cd44c394c`.
 The later binding-reset, replacement-validation and cost experiments start from `16413f22b`
 and add tests, benchmarks and evidence only. Their revisions and local reports are in section 10.
+For the fork's reading order, branches and reproduction notes, start with [WYATT_HANDOFF.md](WYATT_HANDOFF.md).
 
 **Recommendation:** retain option D's logical contract: Lance atomically invalidates outputs
 when their declared inputs change, masks unavailable outputs, and validates publication of
@@ -419,9 +420,9 @@ line in the bundle's Git history.
 | [Feature-wide costs](bench/results/feature-costs/README.md) | Latest transferred scalar/vector/writes/races/history/scale evidence on the Mac |
 | [No-flag investigation](bench/results/10m-noflag-investigation/README.md), [vector investigation](bench/results/vector-masking/README.md), [REPORT.md](bench/REPORT.md) | Controls and superseded experiments; neither old no-flag percentages nor child-nulling costs are current acceptance claims |
 | [CONTINUATION.md](CONTINUATION.md), [Linux records](bench/results/linux-local-optimizations/README.md) | Current local optimization evidence, exact source/build identities and test logs |
-| [Experiment 1: binding reset](/home/brendan/work/lance-cell-flags-binding-reset/prototypes/dependent-cell-flags/BINDING_RESET.md), tests `8008fbe64`, report `cb288925b` | Existing atomic Rust primitive for the tested masking/sibling contract; negative controls define application obligations |
-| [Experiment 2: replacement validation](/home/brendan/work/lance-cell-flags-replacement-validation/prototypes/dependent-cell-flags/REPLACEMENT_VALIDATION.md), round-2 tests `c70df79e8`, report `1282616ce` | Confirmed structural-validation gaps; normalization/import compatibility prevents treating the proposed footer checks as a finished fix |
-| [Experiment 3: costs](/home/brendan/work/lance-cell-flags-cost-review/prototypes/dependent-cell-flags/COST_REVIEW.md), bench `c3362349f`, profiling `17e60c827`, evidence `b5a59bd77` | Density/layout and publication concentration controls, quiet replication, raw records and checks; qualifications above take precedence over shorthand conclusions |
+| [Experiment 1: binding reset](BINDING_RESET.md), local tests `8008fbe64`, report `cb288925b` | Existing atomic Rust primitive for the tested masking/sibling contract; negative controls define application obligations |
+| [Experiment 2: replacement validation](REPLACEMENT_VALIDATION.md), local round-2 tests `c70df79e8`, report `1282616ce` | Confirmed structural-validation gaps; normalization/import compatibility prevents treating the proposed footer checks as a finished fix |
+| [Experiment 3: costs](COST_REVIEW.md), local bench `c3362349f`, profiling `17e60c827`, evidence `b5a59bd77` | Density/layout and publication concentration controls, quiet replication, raw records and checks; qualifications above take precedence over shorthand conclusions |
 | `rust/lance-table/src/{format/cell_flag.rs,transaction/cell_flag_commit.rs,transaction/manifest_build.rs}` | Persisted state, invalidation/gates and ordinary replacement behavior |
 | `rust/lance/src/{io/commit.rs,io/commit/conflict_resolver/publication.rs,dataset/cell_flag/}` | Fixed snapshot, publication validation, reports, staging and follow-ups |
 | `rust/lance/src/dataset/{fragment.rs,fragment/cell_flag_mask.rs,tests/dataset_cell_flags*.rs}` and Torch adapters | Logical reads, local fast paths, adversarial regressions and validity-aware consumers |
@@ -430,5 +431,6 @@ Precedence corrections incorporated here: chains and ordinary transactions super
 no-chain/special-operation advice; parent validity supersedes child-nulling; mixed layouts are
 now supported by the prototype; Linux checks supersede historical “x86_64 not run” statements;
 late streaming errors may leave bytes; no storage/performance release decision has been made.
-The experiment links name separate local worktrees on this machine. Their commits preserve the
-reports and raw cost evidence across reboot; they have not been merged into the production branch.
+The reports are copied into the handoff branch for reading. Their original commits, added tests,
+benchmark cases and additional raw cost evidence remain local with Brendan, outside this fork
+branch. Those experiment changes have not been merged into the production code.
