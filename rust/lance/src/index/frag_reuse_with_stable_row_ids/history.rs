@@ -2327,6 +2327,7 @@ mod tests {
         dir: &TempStrDir,
         relocation: Relocation,
     ) -> (Dataset, HashMap<u64, (u64, i32)>, u32, String) {
+        let origin_uri = format!("{}/origin", dir.as_str());
         let source_uri = format!("{}/source", dir.as_str());
         let clone_uri = format!("{}/clone", dir.as_str());
         let elsewhere = match relocation {
@@ -2335,21 +2336,14 @@ mod tests {
             }
             _ => format!("{}/elsewhere", dir.as_str()),
         };
-        let (source, before) = recording_table(&source_uri, Storage::External).await;
-        // A base the source already has, so the clone's history base gets an
-        // explicit id rather than 0, which `UpdateBases` reads as "assign one".
-        let mut source = Arc::new(source)
-            .add_bases(
-                vec![BasePath::new(
-                    0,
-                    format!("{}/extra", dir.as_str()),
-                    Some("extra".to_string()),
-                    false,
-                )],
-                None,
-            )
-            .await
-            .unwrap();
+        let (mut origin, before) = recording_table(&origin_uri, Storage::External).await;
+        // A source that is itself a shallow clone holds base id 0, so the clone's
+        // history base gets an explicit id rather than 0, which `UpdateBases`
+        // reads as "assign one". Its own recorded compaction stores the history
+        // under the source.
+        let mut source = clone_table(&mut origin, &source_uri, true).await;
+        let options = compaction_of(&source, &[6, 7]);
+        compact_files(&mut source, options, None).await.unwrap();
         let clone = clone_table(&mut source, &clone_uri, true).await;
         let entry = frag_reuse_entry(&clone).await;
         let base_id = entry.base_id.unwrap();
