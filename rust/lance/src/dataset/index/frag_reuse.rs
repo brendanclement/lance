@@ -100,6 +100,9 @@ impl Dataset {
 /// Typically run after [`compact_files`] with deferred remap and per-index
 /// [`remap_column_index`] have caught the indexes up.
 ///
+/// A table with stable row ids keeps every version and this commits nothing:
+/// readers other than indices translate old row addresses through the history.
+///
 /// # Errors
 ///
 /// Returns [`Error::RetryableCommitConflict`] if the fragment reuse index changed
@@ -130,6 +133,15 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     else {
         return Ok(());
     };
+
+    if dataset.manifest.uses_stable_row_ids() {
+        log::warn!(
+            "Kept every fragment reuse version of {}: a table with stable row ids keeps its \
+             row-address history for translation",
+            dataset.uri()
+        );
+        return Ok(());
+    }
 
     // Hard fork by index_version: tagged histories trim per transition in
     // fresh code below, while the v0 path stays exactly as it was.
