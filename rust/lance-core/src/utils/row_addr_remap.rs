@@ -1054,7 +1054,9 @@ fn apply_step(
 #[cold]
 #[inline(never)]
 fn shrink(positions: &mut Vec<u32>) {
-    positions.shrink_to_fit();
+    // Moved to a new block: shrinking in place can leave the old block's
+    // remainder unusable for later lists, growing the heap at every step.
+    *positions = positions.to_vec();
 }
 
 impl DeepSizeOf for CompactRowAddrRemap {
