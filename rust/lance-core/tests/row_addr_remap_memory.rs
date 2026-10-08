@@ -119,8 +119,8 @@ impl Chain {
         );
     }
 
-    /// Remaps `batch` through the chain, checking the answers against the maps
-    /// and the memory held against the bound.
+    /// Remaps `batch` through the chain, checking the answers of the batch and
+    /// of `get` against the maps, and the memory held against the bound.
     fn check(self, mut batch: Vec<Option<u64>>) {
         let mut fragments = HashSet::new();
         let expected = batch
@@ -142,6 +142,15 @@ impl Chain {
             })
             .collect::<Vec<_>>();
         let chain = RowAddrRemap::chained(self.steps);
+        for (row_addr, answer) in batch.iter().zip(&expected) {
+            if let Some(old_addr) = *row_addr {
+                assert_eq!(
+                    chain.get(old_addr).unwrap_or(Some(old_addr)),
+                    *answer,
+                    "address {old_addr:#x}"
+                );
+            }
+        }
         let peak = remap_measuring_peak(&chain, &mut batch);
         assert_eq!(batch, expected);
         let bound = scratch_bound(batch.len().min(PASS_ROWS), fragments.len());

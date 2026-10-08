@@ -1613,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_remap_spanning_several_passes_matches_get() {
+    fn test_batch_remap_spanning_several_passes_matches_step_by_step() {
         // Fragment k moves into k + 1 at step k, losing a row every tenth step.
         let mut rows = 4u32;
         let steps = (0..MIN_STEPS_TO_INDEX as u32 + 8)
@@ -1628,17 +1628,40 @@ mod tests {
                 step
             })
             .collect::<Vec<_>>();
-        let chain = RowAddrRemap::chained(steps);
+        let chain = RowAddrRemap::chained(steps.clone());
         assert!(compact_chain(&chain).fragment_steps.is_some());
 
         let mut batch = (0..2 * REMAP_BATCH_ROWS + 5)
             .map(|i| (i % 1_000 != 999).then(|| addr((i % 7) as u32 * 5, (i % 5) as u32)))
             .collect::<Vec<_>>();
+        // Each step applied on its own.
+        let step_by_step = |old_addr: u64| {
+            steps
+                .iter()
+                .try_fold(old_addr, |current, step| match step.get(current) {
+                    None => Some(current),
+                    Some(mapped) => mapped,
+                })
+        };
+        // The batch repeats 35 addresses.
+        let answers = batch
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|old_addr| (old_addr, step_by_step(old_addr)))
+            .collect::<HashMap<_, _>>();
+        for (&old_addr, &answer) in &answers {
+            assert_eq!(
+                chain.get(old_addr).unwrap_or(Some(old_addr)),
+                answer,
+                "address {old_addr:#x}"
+            );
+        }
         let expected = batch
             .iter()
-            .map(|row_addr| {
-                row_addr.and_then(|old_addr| chain.get(old_addr).unwrap_or(Some(old_addr)))
-            })
+            .map(|row_addr| row_addr.and_then(|old_addr| answers[&old_addr]))
             .collect::<Vec<_>>();
         chain.remap_in_place(&mut batch);
         assert_eq!(batch, expected);
