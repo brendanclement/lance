@@ -59,7 +59,7 @@ unsafe impl GlobalAlloc for MeasuringAllocator {
 #[global_allocator]
 static ALLOCATOR: MeasuringAllocator = MeasuringAllocator;
 
-/// Rows a batch remap tracks at a time (`REMAP_BATCH_ROWS`).
+// Keep in sync with REMAP_BATCH_ROWS.
 const PASS_ROWS: usize = 1 << 16;
 
 /// The most a batch remap may hold at once while tracking `rows` rows that pass
@@ -71,7 +71,6 @@ fn scratch_bound(rows: usize, fragments: usize) -> usize {
     28 * rows + 240 * fragments + 1024
 }
 
-/// Remaps `row_addrs` in place, returning the most memory the remap held at once.
 fn remap_measuring_peak(remap: &RowAddrRemap, row_addrs: &mut [Option<u64>]) -> usize {
     LIVE_BYTES.set(0);
     PEAK_BYTES.set(0);
@@ -86,7 +85,6 @@ fn addr(fragment: u32, offset: u32) -> u64 {
     RowAddress::new_from_parts(fragment, offset).into()
 }
 
-/// A chain's steps, and the maps they stand for as the reference.
 #[derive(Default)]
 struct Chain {
     steps: Vec<RowAddrRemap>,
@@ -99,8 +97,7 @@ impl Chain {
         self.maps.push(map);
     }
 
-    /// Rewrites offsets `0..rows` of `fragment` into `new_fragment`. Higher
-    /// offsets are outside the step's layout, so it leaves them unaffected.
+    /// Offsets in `rows..` are outside the layout and remain unaffected.
     fn compact(&mut self, fragment: u32, rows: u32, new_fragment: u32) {
         let mut rewritten = RoaringTreemap::new();
         rewritten.insert_range(addr(fragment, 0)..addr(fragment, rows));
@@ -119,8 +116,6 @@ impl Chain {
         );
     }
 
-    /// Remaps `batch` through the chain, checking the answers of the batch and
-    /// of `get` against the maps, and the memory held against the bound.
     fn check(self, mut batch: Vec<Option<u64>>) {
         let mut fragments = HashSet::new();
         let expected = batch
@@ -222,7 +217,6 @@ fn split_scratch_across_passes_is_bounded_by_a_pass() {
     const FAMILIES: u32 = 9;
     const FAMILY_ROWS: u32 = 8_192;
     const STEPS: u32 = 32;
-    // Each step splits every other family.
     const SPLITS: u32 = STEPS / 2;
     let fragment = |family: u32, splits: u32| family * 1_000 + splits;
     let chain = RowAddrRemap::chained((0..STEPS).map(|step| {

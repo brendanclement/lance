@@ -612,7 +612,6 @@ impl CompactRemapStep {
         self.get_in(old_frag, addr)
     }
 
-    /// Look up `addr`, whose fragment this step rewrote with layout `old_frag`.
     // Always inlined, so `get` compiles as it did before the split.
     #[inline(always)]
     fn get_in(&self, old_frag: &OldFragmentRemap, addr: u64) -> Option<Option<u64>> {
@@ -780,7 +779,7 @@ impl DeepSizeOf for FragmentSteps {
 #[derive(Clone, Debug)]
 pub struct CompactRowAddrRemap {
     steps: Vec<RemapStep>,
-    /// Built from `steps` for long chains.
+    /// `None` keeps short chains on the step-by-step path.
     fragment_steps: Option<FragmentSteps>,
 }
 
@@ -999,8 +998,7 @@ impl CompactRowAddrRemap {
     }
 }
 
-/// Adds the rows at `positions` in `row_addrs` to the lists of their fragments,
-/// skipping deleted rows and hashing once per run of rows in one fragment.
+/// Hash once per run of rows in the same fragment.
 fn add_rows(
     rows_by_fragment: &mut IntMap<u32, Vec<u32>>,
     row_addrs: &[Option<u64>],
@@ -1018,8 +1016,6 @@ fn add_rows(
     }
 }
 
-/// Applies one step to the rows at `positions`, keeping those it leaves
-/// unaffected; the positions of rows it moves go to `moved`.
 fn apply_step(
     positions: &mut Vec<u32>,
     row_addrs: &mut [Option<u64>],
@@ -1042,9 +1038,7 @@ fn apply_step(
             }
         }
     });
-    // `retain` keeps the capacity: a step that moves most of a list's rows would
-    // otherwise leave its old allocation behind, once per step, for the rest of
-    // the pass.
+    // Release excess capacity so mostly emptied lists do not accumulate per step.
     if positions.len() < positions.capacity() / 4 {
         shrink(positions);
     }
@@ -1054,8 +1048,8 @@ fn apply_step(
 #[cold]
 #[inline(never)]
 fn shrink(positions: &mut Vec<u32>) {
-    // Moved to a new block: shrinking in place can leave the old block's
-    // remainder unusable for later lists, growing the heap at every step.
+    // Copy instead of shrink_to_fit: in-place shrinking caused glibc RSS growth
+    // by leaving block remainders unusable for later lists.
     *positions = positions.to_vec();
 }
 
@@ -1506,8 +1500,6 @@ mod tests {
         );
     }
 
-    /// Rewrites the rows of `old` fragments (id, physical rows), except `deleted`,
-    /// into fragment `new_id`.
     fn rewrite(old: &[(u32, u32)], deleted: &[u64], new_id: u32) -> RowAddrRemap {
         let rewritten = old
             .iter()
@@ -1540,13 +1532,10 @@ mod tests {
             // Fragment 5 has 4 rows here and 8 rows when named again below, so
             // (5, 6) is out of range for this step and moves at the later one.
             rewrite(&[(5, 4)], &[], 20),
-            // An identity move, then the same fragment rewritten again.
             rewrite(&[(30, 3)], &[], 30),
             rewrite(&[(30, 3)], &[], 31),
-            // A deletion at an intermediate step.
             rewrite(&[(40, 4)], &[addr(40, 2)], 41),
             rewrite(&[(41, 3)], &[addr(41, 0)], 42),
-            // Moves at consecutive steps, then one more after a gap.
             rewrite(&[(50, 2), (55, 1)], &[], 51),
             rewrite(&[(51, 3)], &[], 52),
             rewrite(&[(52, 3)], &[addr(52, 2)], 53),
@@ -1619,7 +1608,6 @@ mod tests {
 
     #[test]
     fn test_batch_remap_spanning_several_passes_matches_step_by_step() {
-        // Fragment k moves into k + 1 at step k, losing a row every tenth step.
         let mut rows = 4u32;
         let steps = (0..MIN_STEPS_TO_INDEX as u32 + 8)
             .map(|k| {
@@ -1639,7 +1627,6 @@ mod tests {
         let mut batch = (0..2 * REMAP_BATCH_ROWS + 5)
             .map(|i| (i % 1_000 != 999).then(|| addr((i % 7) as u32 * 5, (i % 5) as u32)))
             .collect::<Vec<_>>();
-        // Each step applied on its own.
         let step_by_step = |old_addr: u64| {
             steps
                 .iter()
@@ -1648,7 +1635,6 @@ mod tests {
                     Some(mapped) => mapped,
                 })
         };
-        // The batch repeats 35 addresses.
         let answers = batch
             .iter()
             .flatten()
@@ -1724,14 +1710,10 @@ mod tests {
         }
     }
 
-    /// One step of a generated history, and the same step as a materialized map.
     type GeneratedStep = (RowAddrRemap, HashMap<u64, Option<u64>>);
 
-    /// A random table history. Each step deletes some rows, then compacts a few
-    /// live fragments, in one or two groups of up to three sources, into new
-    /// fragments. A new fragment sometimes reuses a retired id or one of its own
-    /// sources' ids, and some steps are materialized maps. Also returns every
-    /// (fragment, physical rows) the table ever held.
+    /// Histories include deletions, multiple rewrite groups, reused fragment ids,
+    /// and direct steps. Materialized maps provide an independent oracle.
     fn random_history(seed: u64, num_steps: usize) -> (Vec<GeneratedStep>, Vec<(u32, u32)>) {
         let mut rng = Rng(seed);
         let mut live = (0..6u32)
@@ -1780,7 +1762,6 @@ mod tests {
                     } else {
                         remaining
                     };
-                    // One of this step's own sources, a retired id, or a new one.
                     let own = sources
                         .iter()
                         .map(|(id, _, _)| *id)
@@ -1851,9 +1832,6 @@ mod tests {
         ProptestConfig::with_cases(cases.div_ceil(LONG_INDEXED_CHAINS.end) as u32)
     }
 
-    /// A chain must answer like applying each step's materialized map in turn,
-    /// for every address the table ever held and offsets past them, whether or
-    /// not it is long enough to be indexed by fragment.
     fn check_chain_matches_materialized_steps(
         seed: u64,
         num_steps: usize,
@@ -1877,7 +1855,6 @@ mod tests {
         };
 
         let flat = RowAddrRemap::chained(steps.iter().map(|(remap, _)| remap.clone()));
-        // The same steps chained in pieces, then chained again.
         let mut bounds = splits
             .into_iter()
             .filter(|&at| at < steps.len())
@@ -1914,7 +1891,6 @@ mod tests {
                     seed
                 );
             }
-            // In order and reversed, with deleted entries mixed in.
             for reversed in [false, true] {
                 let mut batch = Vec::new();
                 let mut remapped = Vec::new();
