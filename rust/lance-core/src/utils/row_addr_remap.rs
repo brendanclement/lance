@@ -1069,7 +1069,10 @@ impl DeepSizeOf for CompactRowAddrRemap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::ProptestConfig;
+    use proptest::test_runner::TestCaseResult;
     use proptest::{prop_assert, prop_assert_eq};
+    use std::ops::Range;
 
     fn addr(frag: u32, offset: u32) -> u64 {
         u64::from(RowAddress::new_from_parts(frag, offset))
@@ -1834,80 +1837,143 @@ mod tests {
         (steps, seen)
     }
 
-    proptest::proptest! {
-        /// A chain must answer like applying each step's materialized map in
-        /// turn, for every address the table ever held and offsets past them,
-        /// whether or not it is long enough to be indexed by fragment.
-        #[test]
-        fn test_chain_matches_materialized_steps(
-            seed in proptest::num::u64::ANY,
-            num_steps in 0..(2 * MIN_STEPS_TO_INDEX + 8),
-            splits in proptest::collection::vec(0..(2 * MIN_STEPS_TO_INDEX + 8), 0..3),
-        ) {
-            let (steps, seen) = random_history(seed, num_steps);
-            let reference = |old_addr: u64| {
-                let mut current = old_addr;
-                let mut was_affected = false;
-                for (_, map) in &steps {
-                    match map.get(&current) {
-                        None => {}
-                        Some(None) => return Some(None),
-                        Some(Some(mapped)) => {
-                            current = *mapped;
-                            was_affected = true;
-                        }
-                    }
-                }
-                was_affected.then_some(Some(current))
-            };
+    // History lengths split three ways, so each property test stays short; together
+    // they cover chains on both sides of the indexing threshold.
+    const SHORT_CHAINS: Range<usize> = 0..MIN_STEPS_TO_INDEX;
+    const INDEXED_CHAINS: Range<usize> = MIN_STEPS_TO_INDEX..MIN_STEPS_TO_INDEX + 20;
+    const LONG_INDEXED_CHAINS: Range<usize> = MIN_STEPS_TO_INDEX + 20..2 * MIN_STEPS_TO_INDEX + 8;
 
-            let flat = RowAddrRemap::chained(steps.iter().map(|(remap, _)| remap.clone()));
-            // The same steps chained in pieces, then chained again.
-            let mut bounds = splits.into_iter().filter(|&at| at < steps.len()).collect::<Vec<_>>();
-            bounds.extend([0, steps.len()]);
-            bounds.sort_unstable();
-            let nested = RowAddrRemap::chained(bounds.windows(2).map(|piece| {
-                RowAddrRemap::chained(steps[piece[0]..piece[1]].iter().map(|(remap, _)| remap.clone()))
-            }));
-            if let RowAddrRemap::Compact(chain) = &flat {
-                prop_assert_eq!(
-                    chain.fragment_steps.is_some(),
-                    chain.steps.len() >= MIN_STEPS_TO_INDEX
-                );
-            }
+    /// The share of the default case budget for histories of `num_steps` steps,
+    /// in proportion to the range's width. `PROPTEST_CASES`, when set, applies to
+    /// each test in full.
+    fn cases_for(num_steps: Range<usize>) -> ProptestConfig {
+        let cases = ProptestConfig::default().cases as usize * num_steps.len();
+        ProptestConfig::with_cases(cases.div_ceil(LONG_INDEXED_CHAINS.end) as u32)
+    }
 
-            let mut queries = seen
-                .iter()
-                .flat_map(|&(id, rows)| (0..rows + 2).map(move |offset| addr(id, offset)))
-                .collect::<Vec<_>>();
-            queries.extend([addr(99, 0), addr(0xFFFF_FFF0, 3)]);
-            let expected = queries.iter().map(|&a| reference(a)).collect::<Vec<_>>();
-            for remap in [&flat, &nested] {
-                for (&old_addr, answer) in queries.iter().zip(&expected) {
-                    prop_assert_eq!(remap.get(old_addr), *answer, "address {:#x}, seed {}", old_addr, seed);
-                }
-                // In order and reversed, with deleted entries mixed in.
-                for reversed in [false, true] {
-                    let mut batch = Vec::new();
-                    let mut remapped = Vec::new();
-                    for (i, (&old_addr, answer)) in queries.iter().zip(&expected).enumerate() {
-                        if i % 7 == 0 {
-                            batch.push(None);
-                            remapped.push(None);
-                        }
-                        batch.push(Some(old_addr));
-                        remapped.push(answer.unwrap_or(Some(old_addr)));
+    /// A chain must answer like applying each step's materialized map in turn,
+    /// for every address the table ever held and offsets past them, whether or
+    /// not it is long enough to be indexed by fragment.
+    fn check_chain_matches_materialized_steps(
+        seed: u64,
+        num_steps: usize,
+        splits: Vec<usize>,
+    ) -> TestCaseResult {
+        let (steps, seen) = random_history(seed, num_steps);
+        let reference = |old_addr: u64| {
+            let mut current = old_addr;
+            let mut was_affected = false;
+            for (_, map) in &steps {
+                match map.get(&current) {
+                    None => {}
+                    Some(None) => return Some(None),
+                    Some(Some(mapped)) => {
+                        current = *mapped;
+                        was_affected = true;
                     }
-                    if reversed {
-                        batch.reverse();
-                        remapped.reverse();
-                    }
-                    remap.remap_in_place(&mut batch);
-                    prop_assert_eq!(&batch, &remapped, "seed {}", seed);
                 }
             }
+            was_affected.then_some(Some(current))
+        };
+
+        let flat = RowAddrRemap::chained(steps.iter().map(|(remap, _)| remap.clone()));
+        // The same steps chained in pieces, then chained again.
+        let mut bounds = splits
+            .into_iter()
+            .filter(|&at| at < steps.len())
+            .collect::<Vec<_>>();
+        bounds.extend([0, steps.len()]);
+        bounds.sort_unstable();
+        let nested = RowAddrRemap::chained(bounds.windows(2).map(|piece| {
+            RowAddrRemap::chained(
+                steps[piece[0]..piece[1]]
+                    .iter()
+                    .map(|(remap, _)| remap.clone()),
+            )
+        }));
+        if let RowAddrRemap::Compact(chain) = &flat {
+            prop_assert_eq!(
+                chain.fragment_steps.is_some(),
+                chain.steps.len() >= MIN_STEPS_TO_INDEX
+            );
         }
 
+        let mut queries = seen
+            .iter()
+            .flat_map(|&(id, rows)| (0..rows + 2).map(move |offset| addr(id, offset)))
+            .collect::<Vec<_>>();
+        queries.extend([addr(99, 0), addr(0xFFFF_FFF0, 3)]);
+        let expected = queries.iter().map(|&a| reference(a)).collect::<Vec<_>>();
+        for remap in [&flat, &nested] {
+            for (&old_addr, answer) in queries.iter().zip(&expected) {
+                prop_assert_eq!(
+                    remap.get(old_addr),
+                    *answer,
+                    "address {:#x}, seed {}",
+                    old_addr,
+                    seed
+                );
+            }
+            // In order and reversed, with deleted entries mixed in.
+            for reversed in [false, true] {
+                let mut batch = Vec::new();
+                let mut remapped = Vec::new();
+                for (i, (&old_addr, answer)) in queries.iter().zip(&expected).enumerate() {
+                    if i % 7 == 0 {
+                        batch.push(None);
+                        remapped.push(None);
+                    }
+                    batch.push(Some(old_addr));
+                    remapped.push(answer.unwrap_or(Some(old_addr)));
+                }
+                if reversed {
+                    batch.reverse();
+                    remapped.reverse();
+                }
+                remap.remap_in_place(&mut batch);
+                prop_assert_eq!(&batch, &remapped, "seed {}", seed);
+            }
+        }
+        Ok(())
+    }
+
+    proptest::proptest! {
+        #![proptest_config(cases_for(SHORT_CHAINS))]
+        #[test]
+        fn test_short_chain_matches_materialized_steps(
+            seed in proptest::num::u64::ANY,
+            num_steps in SHORT_CHAINS,
+            splits in proptest::collection::vec(0..LONG_INDEXED_CHAINS.end, 0..3),
+        ) {
+            check_chain_matches_materialized_steps(seed, num_steps, splits)?;
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(cases_for(INDEXED_CHAINS))]
+        #[test]
+        fn test_indexed_chain_matches_materialized_steps(
+            seed in proptest::num::u64::ANY,
+            num_steps in INDEXED_CHAINS,
+            splits in proptest::collection::vec(0..LONG_INDEXED_CHAINS.end, 0..3),
+        ) {
+            check_chain_matches_materialized_steps(seed, num_steps, splits)?;
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(cases_for(LONG_INDEXED_CHAINS))]
+        #[test]
+        fn test_long_indexed_chain_matches_materialized_steps(
+            seed in proptest::num::u64::ANY,
+            num_steps in LONG_INDEXED_CHAINS,
+            splits in proptest::collection::vec(0..LONG_INDEXED_CHAINS.end, 0..3),
+        ) {
+            check_chain_matches_materialized_steps(seed, num_steps, splits)?;
+        }
+    }
+
+    proptest::proptest! {
         /// The compact remap must answer exactly like a materialized old-to-new map. A
         /// wrong answer here silently points an index at the wrong physical row, so this
         /// compares the two forms address by address over randomized rewrites.
