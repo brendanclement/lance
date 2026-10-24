@@ -3913,6 +3913,8 @@ class LanceDataset(pa.dataset.Dataset):
             * "ngram": produces character N-grams for substring search.
             * "icu": ICU dictionary-based Unicode word segmentation.
             * "icu/split": ICU segmentation with simple-style delimiter splitting.
+            * "code": splits code-like text. Requires FTS format v3 and enables
+              the code analyzer options below.
         language: str, default "English"
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
@@ -3937,6 +3939,34 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
             This would remove accents like "é" -> "e".
+        analyzer: str, optional
+            This is for the ``INVERTED`` index. Selects an analyzer profile:
+            ``"text"`` (the default) or ``"code"``. The ``"code"`` profile sets
+            ``base_tokenizer="code"`` and applies code-oriented defaults:
+            ``split_identifiers=False``, ``split_on_numerics=True``,
+            ``preserve_original=True``, ``stem=False``, and
+            ``remove_stop_words=False``. If unset, the profile is inferred from
+            ``base_tokenizer="code"``. Explicit arguments override the profile
+            defaults. Code analysis requires FTS format v3.
+        split_identifiers: bool, default False
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            identifiers such as ``getUserName`` are split into subwords
+            (``get``, ``User``, ``Name``) so each subword is searchable. When
+            False, an identifier is only indexed as a whole, so ``getUserName``
+            is not matched by ``user``.
+        split_on_numerics: bool, default False (True for the "code" analyzer)
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            identifier subwords are split at letter/number boundaries, for
+            example ``value42`` into ``value`` and ``42``. Only takes effect
+            when ``split_identifiers=True``.
+        preserve_original: bool, default False (True for the "code" analyzer)
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            the complete identifier is indexed in addition to its subwords.
+            Only takes effect when ``split_identifiers=True``.
+        index_operators: bool, default False
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            code operators such as ``::``, ``->``, and ``!=`` are indexed.
+            Other punctuation is still dropped.
 
         Examples
         --------
@@ -7625,10 +7655,69 @@ class LanceScanner(pa.dataset.Scanner):
         return lst
 
     def take(self, indices):
+        """Select rows of data by their position in the scan results.
+
+        ``indices`` are 0-based positions within this scanner's output — the
+        rows that survive the scanner's filter, in scan order. This matches
+        ``pyarrow.dataset.Scanner.take()`` and is different from
+        :meth:`LanceDataset.take`, which ignores the scanner filter and takes
+        rows by absolute dataset row number.
+
+        Parameters
+        ----------
+        indices : int or array-like
+            Positions of the matching rows to select. A large index requires
+            scanning through the matching rows up to it, so the cost is
+            proportional to the largest index, not to the number of indices.
+
+        Returns
+        -------
+        Table
         """
-        Not implemented
-        """
-        raise NotImplementedError("take")
+        if isinstance(indices, int):
+            indices = [indices]
+        elif isinstance(indices, pa.Array):
+            # pyarrow Scanner.take() also accepts pa.Array; list() on one
+            # yields pyarrow Scalars, so normalize to python ints.
+            indices = indices.to_pylist()
+        indices = list(indices)
+        if not indices:
+            raise ValueError("take requires at least one index")
+        if any(not isinstance(i, (int, np.integer)) or i < 0 for i in indices):
+            raise ValueError(f"indices must be non-negative integers, got {indices}")
+
+        # Collect the rows at the requested filtered-relative positions. Rows
+        # are gathered in scan order first and re-ordered to the caller's
+        # index order at the end, so repeated and unsorted indices work.
+        max_index = max(indices)
+        sorted_unique = sorted(set(indices))
+        batches = []
+        matched = 0  # number of matching rows consumed so far
+        exhausted = False
+        for batch in self.to_batches():
+            batch_end = matched + batch.num_rows
+            positions = [i - matched for i in sorted_unique if matched <= i < batch_end]
+            if positions:
+                batches.append(batch.take(positions))
+            matched = batch_end
+            if matched > max_index:
+                exhausted = True
+                break
+        if not exhausted:
+            # The stream ended before covering max_index, so matched is the
+            # full row count of the scan output. (count_rows is unavailable
+            # here anyway when the scanner has a limit/offset.)
+            raise IndexError(
+                f"index {max_index} is out of bounds for a scan with {matched} rows"
+            )
+
+        # Reaching here means max_index was covered by the scan, so at least
+        # one row was collected.
+        table = pa.Table.from_batches(batches)
+        # rows are in sorted-unique index order; map back to the caller's order.
+        row_lookup = {idx: i for i, idx in enumerate(sorted_unique)}
+        take_order = [row_lookup[i] for i in indices]
+        return table.take(take_order)
 
     def head(self, num_rows):
         """
