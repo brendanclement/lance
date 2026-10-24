@@ -3561,8 +3561,8 @@ mod tests {
 
     /// Pointing the base a cloned history resolves through at another
     /// location must not publish when a reader of the new manifest would find
-    /// no history there, or a different one. The commit path reaches the
-    /// history check: nothing earlier refuses re-pointing an existing base id.
+    /// no history there, or a different one. Base registration rejects this
+    /// before history validation; the test above checks the validator directly.
     #[rstest]
     #[tokio::test]
     async fn test_moving_the_history_base_is_refused(
@@ -3607,13 +3607,7 @@ mod tests {
                 }
             );
         }
-        assert_refused(
-            result,
-            match relocation {
-                Relocation::Missing => "history is missing where the manifest locates it",
-                _ => "Cannot drop or alter the fragment reuse version",
-            },
-        );
+        assert_refused(result, "Cannot replace base ID");
         let latest = Dataset::open(&clone_uri).await.unwrap();
         assert_eq!(latest.manifest.version, clone.manifest.version);
         assert_same_history(&history(&latest).await, &recorded);
