@@ -1178,8 +1178,10 @@ impl Transaction {
                 Self::advance_rewritten_index_dataset_versions(
                     &mut final_indices,
                     rewritten_indices,
+                    &final_fragments,
+                    &schema,
                     new_version,
-                );
+                )?;
 
                 match (frag_reuse_index, assembly) {
                     // Tagged history: splice the entry the commit path
