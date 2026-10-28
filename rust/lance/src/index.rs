@@ -2016,10 +2016,13 @@ async fn remap_deletes_all_indexed_rows(
     Ok(true)
 }
 
+/// Restrict rows to `owned_fragments` only for sources of a staging merge,
+/// before translating their addresses. Independent and deferred remaps pass None.
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
     row_id_map: &RowAddrTranslator,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<RemapResult> {
     // A remap is maintenance: a segment the tagged reader excludes from the
     // listing is still reachable here (its caller decided whether to touch
@@ -2163,6 +2166,7 @@ pub(crate) async fn remap_index(
                 &new_id,
                 matched,
                 row_id_map,
+                owned_fragments,
             )
             .await?;
 
@@ -3275,10 +3279,10 @@ impl DatasetIndexExt for Dataset {
         let mut indices = indices
             .iter()
             .filter(|idx| {
-                // We shouldn't have any indices with empty fields, but just in case, log an error
-                // but don't fail the operation (we might not be using that index)
+                // System indices are fieldless by design. Report malformed user indices,
+                // but don't fail the operation (we might not be using that index).
                 if idx.fields.is_empty() {
-                    if idx.name != FRAG_REUSE_INDEX_NAME {
+                    if !is_system_index(idx) {
                         log::error!("Index {} has no fields", idx.name);
                     }
                     false
@@ -5226,6 +5230,7 @@ mod tests {
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::details::target_partition_size_from_details;
     use crate::session::Session;
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, compact_into_two, copy_test_data_to_tmp,
@@ -7316,6 +7321,24 @@ mod tests {
             let num_rows = dataset.count_all_rows().await.unwrap();
             assert_eq!(indexed_rows, expected_indexed_rows);
             assert_eq!(unindexed_rows, num_rows - expected_indexed_rows);
+            for metadata in dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|metadata| metadata.name == "text_idx")
+            {
+                let index = dataset
+                    .open_scalar_index("text", &metadata.uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let live_index = Arc::downgrade(&index);
+                drop(index);
+                assert!(
+                    live_index.upgrade().is_none(),
+                    "optimization retained a live FTS index in the session cache"
+                );
+            }
         }
 
         let num_rows = dataset.count_all_rows().await.unwrap();
@@ -7456,6 +7479,7 @@ mod tests {
             compact_files(&mut dataset, CompactionOptions::default(), None)
                 .await
                 .unwrap();
+            assert_indexed_rows(&dataset, num_rows).await;
             for &word in uppercase_words.iter() {
                 let query_result = dataset
                     .scan()
@@ -7676,6 +7700,84 @@ mod tests {
 
         // 300 / 256 = 1, not the 1000 requested.
         assert_eq!(trained_partitions(&dataset).await, vec![1]);
+
+        // The target recorded is the 300 vectors the one partition holds, not
+        // 300 / 1000, which would have optimize split it apart.
+        let details = dataset.load_indices().await.unwrap()[0]
+            .index_details
+            .clone()
+            .unwrap();
+        assert_eq!(target_partition_size_from_details(&details), Some(300));
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![1]);
+    }
+
+    /// An index built from a partition count, or from centroids that fix one,
+    /// records the vectors per partition it was built at and keeps its
+    /// partitions through an optimize with nothing new to index. With no target
+    /// partition size recorded, optimize joined every partition under a quarter
+    /// of the index type's default, and 500 vectors a partition is under that
+    /// for every IVF type. Null rows are not indexed, so they do not count: a
+    /// target taken from 50,000 rows would join partitions under 625.
+    #[rstest]
+    #[case::num_partitions(VectorIndexParams::ivf_flat(20, DistanceType::L2))]
+    #[case::centroids(ivf_flat_from_centroids(20))]
+    #[tokio::test]
+    async fn test_optimize_keeps_trained_partitions(
+        #[case] params: VectorIndexParams,
+        #[values(0, 40_000)] null_rows: usize,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset =
+            partly_null_vector_dataset(test_dir.path(), 10_000 + null_rows, 10_000).await;
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![20]);
+        let details = dataset.load_indices().await.unwrap()[0]
+            .index_details
+            .clone()
+            .unwrap();
+        assert_eq!(target_partition_size_from_details(&details), Some(500));
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![20]);
+    }
+
+    /// IVF_FLAT params carrying `partitions` precomputed centroids and no
+    /// partition count. The centroids are trained on a fresh sample of the
+    /// distribution `vector_reader` draws from, so the partitions they cut are
+    /// balanced; random centroids could leave one under the join threshold.
+    fn ivf_flat_from_centroids(partitions: usize) -> VectorIndexParams {
+        let dimension = 16;
+        let sample = generate_random_array(partitions * 256 * dimension as usize);
+        let centroids = train_kmeans::<Float32Type>(
+            &sample,
+            KMeansParams::new(None, 10, 1, DistanceType::L2),
+            dimension as usize,
+            partitions,
+            256,
+        )
+        .unwrap()
+        .centroids
+        .as_primitive::<Float32Type>()
+        .clone();
+        let centroids =
+            Arc::new(FixedSizeListArray::try_new_from_values(centroids, dimension).unwrap());
+        VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams {
+                centroids: Some(centroids),
+                ..Default::default()
+            },
+        )
     }
 
     /// Partition counts for a trained logical vector index, one per segment.
@@ -7940,7 +8042,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A dataset of `rows` rows where only the first `non_null` hold a vector.
+    /// A dataset of `rows` rows where only the first `non_null` hold a vector,
+    /// each random.
     async fn partly_null_vector_dataset(
         dir: &std::path::Path,
         rows: usize,
@@ -7960,11 +8063,13 @@ mod tests {
             arrow_array::builder::Float32Builder::new(),
             dimensions,
         );
+        let values = generate_random_array(non_null * dimensions as usize);
         for row in 0..rows {
             if row < non_null {
-                for value in 0..dimensions {
-                    builder.values().append_value(value as f32);
-                }
+                let start = row * dimensions as usize;
+                builder
+                    .values()
+                    .append_slice(&values.values()[start..start + dimensions as usize]);
                 builder.append(true);
             } else {
                 for _ in 0..dimensions {
@@ -8784,6 +8889,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(remap_to_empty.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -8821,6 +8927,7 @@ mod tests {
             &dataset,
             &index_meta.uuid,
             &RowAddrTranslator::sync(remap.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -8896,6 +9003,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(RowAddrRemap::empty()),
+            None,
         )
         .await
         .unwrap_err();
@@ -8973,6 +9081,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(RowAddrRemap::empty()),
+            None,
         )
         .await
         .expect_err("malformed covering metadata must not be silently accepted");
@@ -15750,17 +15859,18 @@ mod tests {
         }
     }
 
-    /// Compactions rewrite fragments 0 and 1 into 4 and 5, 2 and 3 into 6 and
-    /// 7, then 5 and 6 into 8 and 9. The index is caught up past the first
-    /// one, so a cleanup trims its record: 4 and 5 no longer trace to the
-    /// build, and neither do 8 and 9, though their other source, 6, does, as 7
-    /// still does.
+    /// Compactions rewrite fragments 2 and 3 into 4 and 5, then 0 and 1 into
+    /// 6 and 7 (relabeling 4 and 5 to 8 and 9), then 7 and 8 into 10 and 11
+    /// (relabeling 9 to 12). The index is caught up past the first compaction,
+    /// so a cleanup trims its record: 10, 11 and 12 no longer trace to the
+    /// build through 4 and 5, though the shared group's other source, 7, does,
+    /// as 6 still does.
     #[tokio::test]
     async fn test_sources_at_build_fails_on_a_missing_link_beside_a_traced_one() {
         let dir = TempStrDir::default();
         let (mut dataset, built) = recording_btree_table(dir.as_str(), 4).await;
         let version = dataset.manifest.version;
-        let first = compact_into_two(&mut dataset, &[0, 1]).await;
+        let first = compact_into_two(&mut dataset, &[2, 3]).await;
         crate::dataset::optimize::remapping::remap_column_index(
             &mut dataset,
             &["i"],
@@ -15768,8 +15878,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let second = compact_into_two(&mut dataset, &[2, 3]).await;
-        let third = compact_into_two(&mut dataset, &[first[1], second[0]]).await;
+        let second = compact_into_two(&mut dataset, &[0, 1]).await;
+        let third = compact_into_two(&mut dataset, &[second[1], 8]).await;
+        assert_eq!(first, [4, 5]);
+        assert_eq!(second, [6, 7]);
+        assert_eq!(third, [10, 11]);
+        assert_eq!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            [6, 10, 11, 12]
+        );
         let trace = |versions: &[FragReuseVersion], fragment: u64| {
             sources_at_build(versions, version, fragment as u32, |id| built.contains(id)).map(
                 |mut sources| {
@@ -15789,13 +15911,13 @@ mod tests {
             .unwrap();
         let kept = dataset.frag_reuse_index().await.unwrap().unwrap();
         assert_eq!(kept.details.versions.len(), 2);
-        for fragment in [first[0], third[0], third[1]] {
+        for fragment in [12, third[0], third[1]] {
             assert_eq!(
                 trace(&kept.details.versions, fragment),
                 None,
                 "fragment {fragment}"
             );
         }
-        assert_eq!(trace(&kept.details.versions, second[1]), Some(vec![2, 3]));
+        assert_eq!(trace(&kept.details.versions, second[0]), Some(vec![0, 1]));
     }
 }
