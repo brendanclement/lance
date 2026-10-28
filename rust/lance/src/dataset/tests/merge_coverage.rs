@@ -2067,7 +2067,7 @@ async fn test_republished_segment_keeps_its_build_fragments_without_a_history(
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
 }
 
-/// A `val_idx` BTree that an eager compaction of fragments 0 and 1 carried onto
+/// A `val_idx` BTree that an eager compaction of fragments 2 and 3 carried onto
 /// its output, fragment 4, on a table that never had a fragment reuse index, is
 /// committed again: over itself or after being dropped, as it is or merged
 /// first. The eager remap rewrites the entries into the post-compaction address
@@ -2086,12 +2086,14 @@ async fn test_republished_segment_over_an_eager_compaction_without_a_history(
     commit_val_idx(&mut dataset, IndexType::BTree).await;
     let options = CompactionOptions {
         target_rows_per_fragment: 1_000,
-        excluded_fragment_ids: vec![2, 3],
+        excluded_fragment_ids: vec![0, 1],
         ..Default::default()
     };
-    compact_files(&mut dataset, options, None).await.unwrap();
+    let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+    assert_eq!((metrics.fragments_removed, metrics.fragments_added), (2, 1));
     assert!(dataset.frag_reuse_index().await.unwrap().is_none());
-    let covered = RoaringBitmap::from_iter([2, 3, 4]);
+    assert_eq!(fragment_ids(&dataset), [0, 1, 4]);
+    let covered = RoaringBitmap::from_iter([0, 1, 4]);
     assert_eq!(val_idx_coverage(&dataset).await, covered);
 
     let saved = dataset.load_indices_by_name("val_idx").await.unwrap();
@@ -2356,10 +2358,10 @@ async fn test_republished_segment_whose_build_version_is_gone_covers_nothing() {
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
 }
 
-/// An optimize merges `val_idx`, which an eager compaction carried onto its
-/// output without a record, with rows appended since. The merged segment keeps
-/// its source's build version, but it carries that source's coverage of the
-/// output and indexes the appended rows itself, so it commits with all of it.
+/// An optimize merges `val_idx`, which an eager compaction of fragments 2 and 3
+/// carried onto its output without a record, with rows appended since. The
+/// merged segment carries that source's coverage of the output and indexes the
+/// appended rows itself, so it commits with all of it at the read version.
 #[tokio::test]
 async fn test_optimized_segment_keeps_coverage_an_eager_compaction_carried() {
     let dir = TempStrDir::default();
@@ -2367,18 +2369,18 @@ async fn test_optimized_segment_keeps_coverage_an_eager_compaction_carried() {
     commit_val_idx(&mut dataset, IndexType::BTree).await;
     let options = CompactionOptions {
         target_rows_per_fragment: 1_000,
-        excluded_fragment_ids: vec![2, 3],
+        excluded_fragment_ids: vec![0, 1],
         ..Default::default()
     };
-    compact_files(&mut dataset, options, None).await.unwrap();
+    let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+    assert_eq!((metrics.fragments_removed, metrics.fragments_added), (2, 1));
     assert!(dataset.frag_reuse_index().await.unwrap().is_none());
     assert_eq!(
         val_idx_coverage(&dataset).await,
-        RoaringBitmap::from_iter([2, 3, 4])
+        RoaringBitmap::from_iter([0, 1, 4])
     );
-    let built = dataset.load_indices_by_name("val_idx").await.unwrap()[0].dataset_version;
-
     append_val_fragment(&mut dataset).await;
+    let optimized_at = dataset.manifest.version;
     dataset
         .optimize_indices(&OptimizeOptions::merge(1))
         .await
@@ -2386,10 +2388,10 @@ async fn test_optimized_segment_keeps_coverage_an_eager_compaction_carried() {
 
     let segments = dataset.load_indices_by_name("val_idx").await.unwrap();
     assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].dataset_version, built);
+    assert_eq!(segments[0].dataset_version, optimized_at);
     assert_eq!(
         val_idx_coverage(&dataset).await,
-        RoaringBitmap::from_iter([2, 3, 4, 5])
+        RoaringBitmap::from_iter([0, 1, 4, 5])
     );
     assert_uses_val_idx(&dataset, "val = 0").await;
     assert_val_lookups_match_scan(&dataset, (0..30).map(|id| id * 10), "").await;
@@ -2416,24 +2418,24 @@ async fn append_val_fragment(dataset: &mut Dataset) -> u32 {
 }
 
 /// The `val_idx` segment of a [`val_table`], saved after a deferred compaction
-/// of fragments 0 and 1 moved its coverage of them onto the output, with the
+/// of fragments 2 and 3 moved its coverage of them onto the output, with the
 /// index then dropped. `id_idx` is caught up, so nothing else needs the
-/// compaction's record. Returns the saved segment, which covers fragments 2
-/// and 3 and the output, and the output.
+/// compaction's record. Returns the saved segment, which covers fragments 0
+/// and 1 and the output, and the output.
 async fn saved_segment_beside_a_compaction(
     uri: &str,
     index_type: IndexType,
 ) -> (Vec<IndexMetadata>, u32) {
     let mut dataset = val_table(uri, 4).await;
     commit_val_idx(&mut dataset, index_type).await;
-    let compacted = compact_deferred(&mut dataset, &[0, 1]).await;
+    let compacted = compact_deferred(&mut dataset, &[2, 3]).await;
     remap_column_index(&mut dataset, &["id"], Some("id_idx".into()))
         .await
         .unwrap();
     let saved = dataset.load_indices_by_name("val_idx").await.unwrap();
     assert_eq!(
         saved[0].fragment_bitmap.clone().unwrap(),
-        RoaringBitmap::from_iter([2, 3, compacted])
+        RoaringBitmap::from_iter([0, 1, compacted])
     );
     dataset.drop_index("val_idx").await.unwrap();
     (saved, compacted)
@@ -2478,7 +2480,7 @@ async fn test_raw_replacement_does_not_vouch_for_a_saved_segment(
                 index_type,
                 &params,
                 "val_idx",
-                vec![2, 3],
+                vec![0, 1],
             )
             .await;
             dataset
@@ -2503,7 +2505,7 @@ async fn test_raw_replacement_does_not_vouch_for_a_saved_segment(
         let published = result.unwrap();
         assert_eq!(
             val_idx_coverage(&published).await,
-            RoaringBitmap::from_iter([2, 3, compacted])
+            RoaringBitmap::from_iter([0, 1, compacted])
         );
         assert_uses_val_idx(&published, "val < 100").await;
         assert_val_lookups_match_scan(&published, probes(), &trace).await;
@@ -2534,7 +2536,7 @@ async fn test_raw_replacement_does_not_vouch_for_a_saved_segment(
 /// After such a refusal the table is maintained as usual: an optimize merges
 /// the current `val_idx` with rows appended since, which neither its build
 /// version holds nor any history records. The optimize indexed them itself, so
-/// the merged segment commits covering them, under the build version it keeps.
+/// the merged segment commits covering them.
 #[rstest]
 #[tokio::test]
 async fn test_optimize_after_a_refused_replacement_indexes_appended_rows(
@@ -2559,16 +2561,21 @@ async fn test_optimize_after_a_refused_replacement_indexes_appended_rows(
     assert!(refused.is_err(), "{trace}");
 
     let appended = append_val_fragment(&mut dataset).await;
+    let optimized_at = dataset.manifest.version;
     dataset
         .optimize_indices(&OptimizeOptions::merge(1))
         .await
         .unwrap();
     let segments = dataset.load_indices_by_name("val_idx").await.unwrap();
     assert_eq!(segments.len(), 1, "{trace}");
-    assert_eq!(segments[0].dataset_version, current[0].dataset_version);
+    let expected_version = match index_type {
+        IndexType::BTree => optimized_at,
+        _ => current[0].dataset_version,
+    };
+    assert_eq!(segments[0].dataset_version, expected_version);
     assert_eq!(
         val_idx_coverage(&dataset).await,
-        RoaringBitmap::from_iter([2, 3, compacted, appended])
+        RoaringBitmap::from_iter([0, 1, compacted, appended])
     );
     assert_uses_val_idx(&dataset, "val >= 240").await;
     assert_val_lookups_match_scan(&dataset, (0..30).map(|id| id * 10), &trace).await;

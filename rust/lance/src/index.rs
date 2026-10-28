@@ -12460,15 +12460,15 @@ mod tests {
     /// type proves it stores stable row ids, which the compaction leaves valid.
     /// Address-domain types and unknown plugin types do not qualify. The
     /// segment claims fragment 4, which an eager compaction made of fragments
-    /// 0 and 1 after its build, as one saved while a history translated it
+    /// 2 and 3 after its build, as one saved while a history translated it
     /// would.
     #[rstest]
-    #[case::stable_row_ids("type.googleapis.com/lance.table.BTreeIndexDetails", 0, &[2, 3, 4])]
-    #[case::addresses("type.googleapis.com/lance.table.ZoneMapIndexDetails", 0, &[2, 3])]
+    #[case::stable_row_ids("type.googleapis.com/lance.table.BTreeIndexDetails", 0, &[0, 1, 4])]
+    #[case::addresses("type.googleapis.com/lance.table.ZoneMapIndexDetails", 0, &[0, 1])]
     #[case::unknown_plugin(
         "type.googleapis.com/example.CustomIndexDetails",
         0,
-        &[2, 3]
+        &[0, 1]
     )]
     #[tokio::test]
     async fn test_missing_history_keeps_post_build_coverage_only_of_stable_row_ids(
@@ -12491,7 +12491,7 @@ mod tests {
         let built = dataset.manifest.version;
         let options = CompactionOptions {
             target_rows_per_fragment: 1_000,
-            excluded_fragment_ids: vec![2, 3],
+            excluded_fragment_ids: vec![0, 1],
             ..Default::default()
         };
         compact_files(&mut dataset, options, None).await.unwrap();
@@ -12508,7 +12508,7 @@ mod tests {
             fields: vec![field_id],
             covering_fields: vec![],
             dataset_version: built,
-            fragment_bitmap: Some(RoaringBitmap::from_iter([2, 3, 4])),
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0, 1, 4])),
             index_details: Some(Arc::new(details)),
             index_version,
             created_at: None,
