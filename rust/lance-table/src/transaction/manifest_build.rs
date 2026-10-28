@@ -1124,7 +1124,6 @@ impl Transaction {
                             &mut final_indices,
                             rewritten_indices,
                             &ordered_groups,
-                            new_version,
                         )?;
                     }
                     // If there is an FRI and the index uses addresses then we can
@@ -1168,7 +1167,6 @@ impl Transaction {
                         &mut final_indices,
                         rewritten_indices,
                         &ordered_groups,
-                        new_version,
                     )?;
                 }
 
@@ -1177,6 +1175,11 @@ impl Transaction {
                 // the pre-overlay values, so drop the rewritten fragment from its
                 // coverage to keep it from serving stale values.
                 Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups, &schema);
+                Self::advance_rewritten_index_dataset_versions(
+                    &mut final_indices,
+                    rewritten_indices,
+                    new_version,
+                );
 
                 match (frag_reuse_index, assembly) {
                     // Tagged history: splice the entry the commit path

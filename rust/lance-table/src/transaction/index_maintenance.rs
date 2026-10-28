@@ -767,7 +767,6 @@ impl Transaction {
         indices: &mut Vec<IndexMetadata>,
         rewritten_indices: &[RewrittenIndex],
         groups: &[RewriteGroup],
-        remapped_at_version: u64,
     ) -> Result<()> {
         let mut modified_indices = HashSet::new();
         for rewritten_index in rewritten_indices {
@@ -865,10 +864,11 @@ impl Transaction {
                     Some(Arc::new(rewritten_index.new_index_details.clone()));
                 replacement.index_version = rewritten_index.new_index_version as i32;
             }
-            // The index files and coverage now describe the post-rewrite
-            // address space, so the dataset-version watermark advances even
-            // when an independent remap keeps the source's details.
-            replacement.dataset_version = remapped_at_version;
+            replacement.dataset_version = source_indices
+                .iter()
+                .map(|(_, source)| source.dataset_version)
+                .min()
+                .unwrap_or(replacement.dataset_version);
             // Update file sizes to match the new index files. When not available
             // (e.g., from older writers), clear the old file sizes to avoid
             // using stale sizes from the pre-remap index.
@@ -880,6 +880,28 @@ impl Transaction {
             indices.insert(insert_at.min(indices.len()), replacement);
         }
         Ok(())
+    }
+
+    /// Advance the watermark of indices whose files were rewritten in place.
+    ///
+    /// This runs after overlay-staleness reconciliation, which needs the
+    /// pre-remap watermark to identify an index that predates an overlay folded
+    /// into the rewrite. Only then does the new address space make the rewritten
+    /// index metadata describe the target dataset version.
+    pub(super) fn advance_rewritten_index_dataset_versions(
+        indices: &mut [IndexMetadata],
+        rewritten_indices: &[RewrittenIndex],
+        remapped_at_version: u64,
+    ) {
+        let rewritten_ids = rewritten_indices
+            .iter()
+            .map(|index| index.new_id)
+            .collect::<HashSet<_>>();
+        for index in indices {
+            if rewritten_ids.contains(&index.uuid) {
+                index.dataset_version = remapped_at_version;
+            }
+        }
     }
 
     fn duplicate_rewrite_error(version: u64, fragment_id: u64) -> Error {
@@ -1648,7 +1670,7 @@ mod tests {
         }];
 
         // Should succeed (skip missing index) instead of error
-        let result = Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &[], 1);
+        let result = Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &[]);
         assert!(result.is_ok());
         assert!(indices.is_empty());
     }
@@ -1716,18 +1738,18 @@ mod tests {
         }
         if let Some(expected) = expected_error {
             let error =
-                Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups, 5)
+                Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups)
                     .unwrap_err();
             assert!(matches!(error, Error::InvalidInput { .. }));
             assert!(error.to_string().contains(expected), "{error}");
             return;
         }
 
-        Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups, 5).unwrap();
+        Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].uuid, merged_id);
-        assert_eq!(indices[0].dataset_version, 5);
+        assert_eq!(indices[0].dataset_version, 3);
         assert_eq!(indices[0].index_version, 2);
         assert_eq!(indices[0].base_id, None);
         assert_eq!(indices[0].index_details.as_deref(), Some(&details));
@@ -1771,12 +1793,11 @@ mod tests {
         let mut indices = vec![index];
         Transaction::handle_rewrite_indices(
             &mut indices,
-            &[replacement],
+            std::slice::from_ref(&replacement),
             &[RewriteGroup {
                 old_fragments: vec![Fragment::new(1), Fragment::new(2)],
                 new_fragments: vec![Fragment::new(3)],
             }],
-            4,
         )
         .unwrap();
         assert_eq!(indices[0].index_details, source_details);
@@ -1784,6 +1805,12 @@ mod tests {
         assert_eq!(indices[0].uuid, new_id);
         assert_eq!(indices[0].base_id, None);
         assert_eq!(indices[0].files, Some(vec![]));
+        assert_eq!(indices[0].dataset_version, 3);
+        Transaction::advance_rewritten_index_dataset_versions(
+            &mut indices,
+            std::slice::from_ref(&replacement),
+            4,
+        );
         assert_eq!(indices[0].dataset_version, 4);
         assert_eq!(
             indices[0].fragment_bitmap,
@@ -1809,7 +1836,14 @@ mod tests {
             new_index_files: index.files.clone(),
         };
         let mut indices = vec![index];
-        Transaction::handle_rewrite_indices(&mut indices, &[replacement], &[], 4).unwrap();
+        Transaction::handle_rewrite_indices(&mut indices, std::slice::from_ref(&replacement), &[])
+            .unwrap();
+        assert_eq!(indices[0].dataset_version, 3);
+        Transaction::advance_rewritten_index_dataset_versions(
+            &mut indices,
+            std::slice::from_ref(&replacement),
+            4,
+        );
         assert_eq!(indices[0].dataset_version, 4);
         assert_eq!(indices[0].base_id, Some(7));
     }
