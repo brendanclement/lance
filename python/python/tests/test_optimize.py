@@ -745,7 +745,9 @@ def start_recording(
     options = dict(
         target_rows_per_fragment=2_000,
         defer_index_remap=True,
-        excluded_fragment_ids=[2, 3],
+        # A partial rewrite relabels the trailing suffix, so leave the leading
+        # fragments untouched and record the move of fragments 2 and 3.
+        excluded_fragment_ids=[0, 1],
         num_threads=1,
     )
     if not srid_recording_enabled:
@@ -857,8 +859,17 @@ def test_raw_rewrite_without_recording_falls_back_to_scans_with_stable_row_ids(
         return
     dataset = lance.dataset(base_dir)
     history = frag_reuse_uuid(dataset)
+    lance.write_dataset(
+        pa.table({"i": range(4_000, 4_010)}),
+        base_dir,
+        mode="append",
+    )
+    dataset = lance.dataset(base_dir)
+    dataset.optimize.optimize_indices()
+    dataset = lance.dataset(base_dir)
+    before = rows_with_identity(dataset)
     covered = index_coverage(dataset)
-    rewritten = [2, 3]
+    rewritten = [fragment.fragment_id for fragment in dataset.get_fragments()][-2:]
     plan = Compaction.plan(
         dataset,
         options=dict(
@@ -883,7 +894,7 @@ def test_raw_rewrite_without_recording_falls_back_to_scans_with_stable_row_ids(
     assert frag_reuse_uuid(dataset) == history
     assert index_coverage(dataset) == covered - set(rewritten)
     assert_rows_keep_their_ids(before, dataset)
-    for value in [10, 2_400, 2_700, 3_999]:
+    for value in [10, 2_400, 2_700, 3_999, 4_005]:
         assert dataset.to_table(filter=f"i = {value}")["i"].to_pylist() == [value]
 
 

@@ -13,8 +13,9 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
-use lance_table::format::{IndexMetadata, Manifest, is_detached_version};
+use lance_table::format::{Fragment, IndexMetadata, Manifest, is_detached_version};
 use lance_table::system_index::frag_reuse::{
     FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion, is_frag_reuse_index_entry,
 };
@@ -511,6 +512,53 @@ fn decode_row_addrs(group: &FragReuseGroup) -> Result<RoaringTreemap> {
     })
 }
 
+fn all_source_row_addrs(fragments: &[Fragment]) -> Result<RoaringTreemap> {
+    let mut row_addrs = RoaringTreemap::new();
+    for fragment in fragments {
+        let fragment_id = u32::try_from(fragment.id).map_err(|_| {
+            Error::internal(format!(
+                "fragment {} is outside the row-address range",
+                fragment.id
+            ))
+        })?;
+        let physical_rows = fragment.physical_rows.ok_or_else(|| {
+            Error::internal(format!(
+                "fragment {} is missing physical_rows during fragment reuse validation",
+                fragment.id
+            ))
+        })?;
+        let physical_rows = u64::try_from(physical_rows).map_err(|_| {
+            Error::internal(format!(
+                "fragment {} physical_rows does not fit in a row address",
+                fragment.id
+            ))
+        })?;
+        let start = u64::from(RowAddress::first_row(fragment_id));
+        let end = start.checked_add(physical_rows).ok_or_else(|| {
+            Error::internal(format!(
+                "fragment {} row-address range overflows",
+                fragment.id
+            ))
+        })?;
+        row_addrs.insert_range(start..end);
+    }
+    Ok(row_addrs)
+}
+
+/// A partial compaction relabels an untouched fragment without rewriting its
+/// rows. Its deletion file moves to the new fragment, so every physical address
+/// moved, including addresses masked by that deletion file.
+fn is_metadata_only_relabel(source: &Fragment, destination: &Fragment) -> bool {
+    let mut source = source.clone();
+    source.id = destination.id;
+    if let (Some(source_deletion), Some(destination_deletion)) =
+        (&mut source.deletion_file, &destination.deletion_file)
+    {
+        source_deletion.base_id = destination_deletion.base_id;
+    }
+    source == *destination
+}
+
 /// Whether two versions record the same moves under the same stamp. Groups
 /// cover disjoint fragments, so their order carries no meaning; fragment order
 /// within a group decides where rows land and must match.
@@ -606,7 +654,7 @@ async fn validate_appended_version(
                 ),
             ));
         }
-        let destination_digests = group
+        let destinations = group
             .new_fragments
             .iter()
             .map(|new| {
@@ -614,7 +662,7 @@ async fn validate_appended_version(
                     .fragments
                     .iter()
                     .find(|fragment| fragment.id == new.id && fragment.physical_rows.is_some())
-                    .map(FragDigest::from)
+                    .cloned()
                     .ok_or_else(|| {
                         mismatch(
                             position,
@@ -627,6 +675,10 @@ async fn validate_appended_version(
                     })
             })
             .collect::<Result<Vec<_>>>()?;
+        let destination_digests = destinations
+            .iter()
+            .map(FragDigest::from)
+            .collect::<Vec<_>>();
         if recorded.new_frags != destination_digests {
             return Err(mismatch(
                 position,
@@ -636,13 +688,20 @@ async fn validate_appended_version(
                 ),
             ));
         }
-        let live_rows = live_source_row_addrs(base, &sources).await?;
-        if decode_row_addrs(recorded)? != live_rows {
+        let moved_rows = if let ([source], [destination]) =
+            (sources.as_slice(), destinations.as_slice())
+            && is_metadata_only_relabel(source, destination)
+        {
+            all_source_row_addrs(&sources)?
+        } else {
+            live_source_row_addrs(base, &sources).await?
+        };
+        if decode_row_addrs(recorded)? != moved_rows {
             return Err(mismatch(
                 position,
                 format!(
-                    "its moved rows are not the {} live rows of its sources",
-                    live_rows.len()
+                    "its moved rows are not the {} row addresses moved from its sources",
+                    moved_rows.len()
                 ),
             ));
         }
@@ -650,12 +709,12 @@ async fn validate_appended_version(
             .iter()
             .map(|digest| digest.physical_rows as u64)
             .sum::<u64>();
-        if written != live_rows.len() {
+        if written != moved_rows.len() {
             return Err(mismatch(
                 position,
                 format!(
-                    "its destinations hold {written} rows, but its sources hold {} live rows",
-                    live_rows.len()
+                    "its destinations hold {written} rows, but its sources moved {} rows",
+                    moved_rows.len()
                 ),
             ));
         }
@@ -896,16 +955,20 @@ mod tests {
     }
 
     /// A recording table with stable row ids. Deletions in fragment 0 make row
-    /// ids and addresses diverge. One recorded compaction rewrote fragments 0-1
-    /// and 3-4 as two groups, behind padding versions when the history is
-    /// external; fragments 6 and 7, one with a deletion, are left to rewrite.
-    /// Returns the rows as they were before any recorded move.
-    async fn recording_table(uri: &str, storage: Storage) -> (Dataset, HashMap<u64, (u64, i32)>) {
+    /// ids and addresses diverge. One recorded compaction rewrites two strict
+    /// suffix groups, behind padding versions when the history is external.
+    /// Appended fragments 6 and 7, one with a deletion, are left as the next
+    /// strict suffix to rewrite.
+    async fn recording_table_with_index(
+        uri: &str,
+        storage: Storage,
+        index_type: Option<IndexType>,
+    ) -> (Dataset, HashMap<u64, (u64, i32)>) {
         let mut dataset = gen_batch()
             .col("i", array::step::<Int32Type>())
             .into_dataset_with_params(
                 uri,
-                FragmentCount::from(8),
+                FragmentCount::from(4),
                 FragmentRowCount::from(10),
                 Some(WriteParams {
                     enable_stable_row_ids: true,
@@ -915,16 +978,42 @@ mod tests {
             )
             .await
             .unwrap();
-        dataset.delete("i IN (1, 2, 5, 61)").await.unwrap();
-        let before = rows_by_addr(&dataset).await;
+        dataset.delete("i IN (1, 2, 35)").await.unwrap();
+        let mut before = rows_by_addr(&dataset).await;
         if matches!(storage, Storage::External) {
             plant_padding_history(&mut dataset).await;
         }
-        // Fragment 2 is left out, so it splits the compaction into two tasks.
-        let options = compaction_of(&dataset, &[0, 1, 3, 4]);
+        if let Some(index_type) = index_type {
+            create_address_index(&mut dataset, index_type).await;
+        }
+        let options = CompactionOptions {
+            target_rows_per_fragment: 18,
+            ..compaction_of(&dataset, &[0, 1, 2, 3])
+        };
         compact_files(&mut dataset, options, None).await.unwrap();
         let recorded = history(&dataset).await;
         assert_eq!(recorded.last().unwrap().groups.len(), 2);
+
+        for batch in [
+            arrow_array::record_batch!(("i", Int32, [40, 41, 42, 43, 44, 45, 46, 47, 48, 49]))
+                .unwrap(),
+            arrow_array::record_batch!(("i", Int32, [50, 51, 52, 53, 54, 55, 56, 57, 58, 59]))
+                .unwrap(),
+        ] {
+            dataset
+                .append(
+                    arrow_array::RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        dataset.delete("i = 45").await.unwrap();
+        for (address, row) in rows_by_addr(&dataset).await {
+            if address >> 32 >= 6 {
+                before.insert(address, row);
+            }
+        }
         let details = frag_reuse_entry(&dataset)
             .await
             .index_details
@@ -941,15 +1030,21 @@ mod tests {
         (dataset, before)
     }
 
+    async fn recording_table(uri: &str, storage: Storage) -> (Dataset, HashMap<u64, (u64, i32)>) {
+        recording_table_with_index(uri, storage, None).await
+    }
+
     /// A real compaction of `fragment_ids` with its fragment ids reserved: the
     /// group a rewrite publishes and the record of its moves.
     async fn rewrite_of(
         dataset: &mut Dataset,
         fragment_ids: &[u64],
     ) -> (RewriteGroup, FragReuseGroup) {
-        let plan = plan_compaction(dataset, &compaction_of(dataset, fragment_ids))
-            .await
-            .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..compaction_of(dataset, fragment_ids)
+        };
+        let plan = plan_compaction(dataset, &options).await.unwrap();
         let tasks = plan.compaction_tasks().collect::<Vec<_>>();
         assert_eq!(tasks.len(), 1);
         let task = tasks[0].execute(dataset).await.unwrap();
@@ -1337,7 +1432,9 @@ mod tests {
         assert_same_history(&history(&published).await, &recorded);
         let coverage = coverage_of(&load_all_indices(&published).await.unwrap(), "i_idx");
         assert!(coverage.is_disjoint(&rewritten), "{coverage:?}");
-        assert_eq!(coverage, RoaringBitmap::from_iter([2, 5, 8, 9]));
+        // The index was built after the first recorded groups, so its stored
+        // old-fragment coverage translates to outputs 4 and 5.
+        assert_eq!(coverage, RoaringBitmap::from_iter([4, 5]));
         assert_rows_keep_their_ids(&before, &published).await;
         assert_answers_through(&published, "i_idx", "i >= 20 AND i < 50").await;
         assert_answers_through(&published, "i_idx", "i >= 55").await;
@@ -2011,7 +2108,7 @@ mod tests {
         dataset.delete("i IN (1, 2, 21, 33)").await.unwrap();
         create_zone_map(&mut dataset).await;
         let unrecorded = dataset.manifest.version;
-        let options = compaction_of(&dataset, &[0, 1]);
+        let options = compaction_of(&dataset, &[6, 7]);
         compact_files(&mut dataset, options, None).await.unwrap();
         if matches!(storage, Storage::External) {
             let current = frag_reuse_entry(&dataset).await;
@@ -2036,7 +2133,12 @@ mod tests {
         }
 
         let before = rows_by_addr(&dataset).await;
-        let (group, moves) = rewrite_of(&mut dataset, &[2, 3]).await;
+        let rewrite_ids = if after_restore {
+            &[6, 7][..]
+        } else {
+            &[5, 8][..]
+        };
+        let (group, moves) = rewrite_of(&mut dataset, rewrite_ids).await;
         let mut versions = if after_restore {
             vec![]
         } else {
@@ -2637,6 +2739,7 @@ mod tests {
         let builtin = match index_type {
             IndexType::ZoneMap => BuiltinIndexType::ZoneMap,
             IndexType::BTree => BuiltinIndexType::BTree,
+            IndexType::BloomFilter => BuiltinIndexType::BloomFilter,
             _ => unreachable!("{index_type:?}"),
         };
         dataset
@@ -2781,26 +2884,7 @@ mod tests {
         uri: &str,
         index_type: IndexType,
     ) -> (Dataset, HashMap<u64, (u64, i32)>) {
-        let mut dataset = gen_batch()
-            .col("i", array::step::<Int32Type>())
-            .into_dataset_with_params(
-                uri,
-                FragmentCount::from(8),
-                FragmentRowCount::from(10),
-                Some(WriteParams {
-                    enable_stable_row_ids: true,
-                    max_rows_per_file: 10,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-        dataset.delete("i IN (1, 2, 5, 61)").await.unwrap();
-        create_address_index(&mut dataset, index_type).await;
-        let before = rows_by_addr(&dataset).await;
-        let options = compaction_of(&dataset, &[0, 1, 3, 4]);
-        compact_files(&mut dataset, options, None).await.unwrap();
-        (dataset, before)
+        recording_table_with_index(uri, Storage::Inline, Some(index_type)).await
     }
 
     /// Catching up an index makes only the oldest prefix trimmable.
@@ -2866,41 +2950,14 @@ mod tests {
     ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
-        let mut dataset = gen_batch()
-            .col("i", array::step::<Int32Type>())
-            .into_dataset_with_params(
-                uri,
-                FragmentCount::from(8),
-                FragmentRowCount::from(10),
-                Some(WriteParams {
-                    enable_stable_row_ids: true,
-                    max_rows_per_file: 10,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-        dataset.delete("i IN (1, 2, 5, 61)").await.unwrap();
-        let params = match index_type {
-            IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
-            _ => ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
-        };
-        dataset
-            .create_index_builder(&["i"], index_type, &params)
-            .name("i_idx".into())
-            .await
-            .unwrap();
-        let index = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
-        assert!(index.results_are_row_addrs());
-        // Rows of fragments 0, 1 and 7 end up behind the unrecorded compaction;
-        // the others stay where they are or move only through recorded ones.
-        // A bloom filter answers only equality.
+        let (mut dataset, before) =
+            recording_table_with_index(uri, Storage::Inline, Some(index_type)).await;
         let (behind, elsewhere) = if index_type == IndexType::BloomFilter {
-            (["i = 15", "i = 73"], ["i = 25", "i = 45"])
+            (["i = 5", "i = 55"], ["i = 25", "i = 44"])
         } else {
             (
-                ["i < 20", "i >= 70"],
-                ["i >= 20 AND i < 50", "i >= 50 AND i < 70"],
+                ["i < 20", "i >= 50"],
+                ["i >= 20 AND i < 35", "i >= 35 AND i < 50"],
             )
         };
         let assert_answers = async |dataset: &Dataset| {
@@ -2911,36 +2968,49 @@ mod tests {
         let index_coverage = async |dataset: &Dataset| {
             coverage_of(&load_all_indices(dataset).await.unwrap(), "i_idx")
         };
-        let before = rows_by_addr(&dataset).await;
+        let recorded = history(&dataset).await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            index_coverage(&dataset).await,
+            RoaringBitmap::from_iter([4, 5])
+        );
 
-        // Recorded, one compaction each so the outputs' ids are known:
-        // fragments 0 and 1 become 8, and 3 and 4 become 9.
-        assert_eq!(compact_recorded(&mut dataset, &[0, 1]).await, 8);
-        assert_eq!(compact_recorded(&mut dataset, &[3, 4]).await, 9);
+        // Recorded strict suffix: pending fragments 6 and 7 become 8.
+        assert_eq!(compact_recorded(&mut dataset, &[6, 7]).await, 8);
         assert!(has_frag_reuse_flag(&dataset));
         let recorded = history(&dataset).await;
         assert_eq!(recorded.len(), 2);
         assert_eq!(
             index_coverage(&dataset).await,
-            RoaringBitmap::from_iter([2, 5, 6, 7, 8, 9])
+            RoaringBitmap::from_iter([4, 5])
         );
         assert_answers(&dataset).await;
 
-        // Unrecorded: 7 and the recorded output 8 become 10.
+        let batch =
+            arrow_array::record_batch!(("i", Int32, (1000..1010).collect::<Vec<i32>>())).unwrap();
+        dataset
+            .append(
+                arrow_array::RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let before_unrecorded = rows_by_addr(&dataset).await;
+        // Unrecorded: recorded output 8 and appended rows in 9 become 10.
         let options = CompactionOptions {
             target_rows_per_fragment: 1_000,
             defer_index_remap: false,
-            ..compaction_of(&dataset, &[7, 8])
+            ..compaction_of(&dataset, &[8, 9])
         };
         compact_files(&mut dataset, options, None).await.unwrap();
         let latest = Dataset::open(uri).await.unwrap();
         assert_same_history(&history(&latest).await, &recorded);
-        let coverage = RoaringBitmap::from_iter([2, 5, 6, 9]);
+        let coverage = RoaringBitmap::from_iter([4, 5]);
         assert_eq!(index_coverage(&latest).await, coverage);
-        assert_rows_keep_their_ids(&before, &latest).await;
+        assert_rows_keep_their_ids(&before_unrecorded, &latest).await;
         let off_the_unrecorded_move = before
             .iter()
-            .filter(|(addr, _)| ![0, 1, 7].contains(&(**addr >> 32)))
+            .filter(|(addr, _)| (0..=3).contains(&(**addr >> 32)))
             .map(|(addr, row)| (*addr, *row))
             .collect::<HashMap<_, _>>();
         assert_translations_hold(&off_the_unrecorded_move, uri).await;
@@ -2986,7 +3056,7 @@ mod tests {
         assert!(has_frag_reuse_flag(&latest));
         assert_answers(&latest).await;
         let before = rows_by_addr(&dataset).await;
-        compact_recorded(&mut dataset, &[2, 5]).await;
+        compact_recorded(&mut dataset, &[4, 5, u64::from(output)]).await;
         assert_eq!(history(&dataset).await.len(), 1);
         assert_translations_hold(&before, uri).await;
         assert_answers(&dataset).await;
@@ -3632,7 +3702,7 @@ mod tests {
             .commit_existing_index_segments("late", "i", vec![segment])
             .await
             .unwrap();
-        compact_recorded(&mut dataset, &[0, 1]).await;
+        compact_recorded(&mut dataset, &[0, 1, 2, 3]).await;
         let saved = dataset.load_indices_by_name("late").await.unwrap();
         dataset.drop_index("late").await.unwrap();
         let recorded = history(&dataset).await;
