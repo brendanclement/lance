@@ -658,8 +658,12 @@ with no effect do not commit another version; committed mutations otherwise
 count as ordinary versions and cleanup intervals.
 
 All operations that remove FRI transitions must revalidate the union of current
-pin and attached-consumer requirements, including the inclusive source-version
-stamp boundary. Pin changes never loosen other transaction preconditions.
+pin and attached-consumer requirements, using the representation-specific rules
+in [Ongoing Work Pins](ongoing_work_pins.md#retention-and-data-operations).
+Restore and Overwrite apply those rules to the resulting current history and
+may discard translation paths as described there; they must still preserve
+current pins and their source snapshots.
+Pin changes never loosen other transaction preconditions.
 
 ## Conflict Resolution
 

@@ -59,6 +59,9 @@ it is not a dataset version or the sequence number of a rewrite.
   ordered compaction and stable partition. Each legacy group can be interpreted
   as an ordered-compaction transition, forming one history with the new records.
 
+A version-1 history is called **tagged**. If it also contains legacy versions,
+it is called **mixed**.
+
 Adding a transition or a new mapping type does not itself require increasing
 `index_version`. Readers may skip unsupported mappings and fall back to scanning
 where a complete translation path is unavailable. Writers must reject operations
@@ -205,21 +208,26 @@ dataset version references them.
 ### Ongoing work retention
 
 [Ongoing-work pins](../../table/ongoing_work_pins.md) are additional history
-consumers before their jobs publish an index. A current active pin at source
-version V retains the applicable current-chain transitions stamped at or after
-V, inclusively; a rewrite stamps its transition with the immediately preceding
-dataset version. Retain the union of requirements from all pins and existing
-consumers. Validate that union at the final commit target of every operation
-that trims or replaces history, including work planned before registration.
+consumers before their jobs publish an index. Legacy-only histories use the
+inclusive source-version boundary. Tagged and mixed histories retain records
+reachable from pinned source fragments, including all downstream dependencies
+and whole legacy versions when any group is needed. Native tagged transitions
+do not carry a dataset-version stamp. The exact retention rules are defined in
+[Retention and data operations](../../table/ongoing_work_pins.md#retention-and-data-operations).
+Retain the union of requirements from all pins and existing consumers. Validate
+that union at the final commit target of every operation that trims or replaces
+history, including work planned before registration. Restore and Overwrite
+apply this check to the resulting current history; they may discard translation
+paths while preserving current pins and their source snapshots.
 
 Compaction must record the movements active pins need and recheck those pins
 before committing. Reject a result lacking required mappings so the caller can
-replan. Restore or
-Overwrite can discard a translation path while continuing to retain the source
-snapshot. A pin does not require mappings solely into a discarded intermediate
+replan. A pin does not require mappings solely into a discarded intermediate
 layout, establish index freshness, or authorize publication of an old result.
-Referenced external mapping files remain subject to ordinary retained-snapshot
-protection and its [maintenance concurrency limits](../../table/ongoing_work_pins.md#maintenance-concurrency-limits).
+Required records retain their external mapping files, including mappings added
+after registration. A metadata replacement does not release those files while
+retained snapshots or required history still reference them. Physical cleanup
+remains subject to the existing [maintenance concurrency limits](../../table/ongoing_work_pins.md#maintenance-concurrency-limits).
 
 ## Stable Row IDs
 

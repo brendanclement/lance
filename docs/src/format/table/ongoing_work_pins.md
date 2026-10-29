@@ -51,11 +51,13 @@ version. The sidecar's contents need not still exist. When both carriers are
 present, their IDs must agree exactly. Failure to read or consistently identify
 the source rejects acquisition; never fall back to version alone.
 
-If an active source manifest is missing or its identity disagrees with the
-record, report a protection/integrity failure and halt the affected destructive
-cleanup. The failure is not an implicit release. Explicit Release by an
-unambiguous ID remains allowed without reading that source, so an operator can
-end the pin. Readers do not need to validate pins to read unrelated data.
+If an active source manifest is missing, unreadable, or its identity disagrees
+with the record, report a protection/integrity failure and halt the affected
+destructive cleanup. Also refuse any FRI-trimming or fragment-rewrite commit
+that cannot establish the pinned fragment set required by its retention checks.
+The failure is not an implicit release. Explicit Release by an unambiguous ID
+remains allowed without reading that source, so an operator can end the pin.
+Readers do not need to validate pins to read unrelated data.
 
 ## Time
 
@@ -157,9 +159,10 @@ trigger the same cleanup.
 
 Resolve current pin membership when planning retention. Retain each active
 source manifest and the resources that normal snapshot retention preserves for
-that manifest. Reuse the existing retention machinery: an active pin adds a
-retained snapshot. Cleanup may still remove resources that no active pin or
-other retention rule requires. Report when pins prevented removal. Removing a
+that manifest, including base data, overlay files, FRI metadata, and referenced
+external mapping files. Reuse the existing retention machinery: an active pin
+adds a retained snapshot. Cleanup may still remove resources that no active pin
+or other retention rule requires. Report when pins prevented removal. Removing a
 pin does not remove protection supplied by another pin, snapshot, or consumer.
 
 Compaction must record the FRI row movements active pins need. Before committing
@@ -167,27 +170,56 @@ its result, compaction must recheck the active pins, including pins registered
 after planning began. If its result lacks required movement records, it must
 not commit; the caller can replan.
 
-History removal must retain the records needed by any current pin or attached
-consumer. Within the applicable current history chain, a source at version V
-retains transitions stamped at V or later. The boundary includes V because a
-transition is stamped with the version immediately before its rewrite commits.
-Retain referenced external mapping files through ordinary snapshot retention.
+History removal must retain the union of requirements from current pins and
+existing consumers, except for translation paths discarded by Restore or
+Overwrite as described below. An index catching up does not end an active pin's
+requirement. An error in an existing consumer check does not permit dropping
+pin-required history. If pin requirements cannot be established, refuse the trim.
+
+For legacy-only FRI (`index_version = 0`), a source at version V retains
+applicable current-chain records whose `dataset_version` is V or later. When
+publishing a new legacy record, a pin-aware writer must stamp its
+`dataset_version` with the version immediately preceding the publishing
+manifest, and restamp that new record on retry. This makes the retention
+boundary inclusive of V; it does not change stamps on existing records.
+
+For FRI `index_version = 1`, including histories that also contain legacy
+records, determine pin requirements from fragment references rather than
+version stamps. Initialize a set with the fragment IDs in all active pinned
+source snapshots. Retain each current-history record with a source fragment in
+that set, and add its destination fragment IDs to the set. Repeat until no
+additional records are selected. If a selected record is a legacy version,
+retain all its groups and add every group's destination IDs. Retain whole
+records and the downstream records they require. Add these pin requirements
+to the existing consumers' requirements; do not replace the existing consumer
+checks.
+
+Retain the external mapping files referenced by required history, including
+records added after registration. Physical cleanup may remove a mapping file
+only when no retained snapshot or required history references it, subject to
+the existing maintenance concurrency limits. Replacing FRI metadata does not
+by itself make its mapping files eligible for deletion.
+
+Pin retention does not change overlay/index correctness requirements or make
+an unsupported overlay or rewrite operation valid.
 
 Restore and Overwrite carry the current active list, fixed sources, timestamps,
 and sticky bit. They never import the target snapshot's historical pin list.
-Retain movement records needed to connect a pinned snapshot to the current
-table layout. After a restore, records needed only for a discarded intermediate
-layout may be removed if no other consumer requires them. Pins keep source
-files available, but do not guarantee that a job can translate or publish its
-results after a restore or overwrite; retention does not supply a missing
-mapping.
+Apply FRI retention to the resulting current history. Neither operation is
+required to reconstruct discarded translation paths. Within that history,
+retain movement records needed to connect a pinned snapshot to the current
+table layout. Records needed only for a discarded intermediate layout may be
+removed if no other consumer requires them. Pins keep source files available,
+but do not guarantee that a job can translate or publish its results after a
+restore or overwrite; retention does not supply a missing mapping.
 
 New branches and clones have empty pin lists and preserve the sticky bit when
 inherited. Detached snapshots cannot register or mutate authoritative pins.
 
 Other ordinary commits preserve the current list. All operations that rewrite
-or trim FRI revalidate its retention requirements at commit. Detailed directional
-rules are in [Transactions](transaction.md#ongoing-work-pin-transactions).
+or trim FRI revalidate the applicable retention requirements at commit, subject
+to the Restore and Overwrite rules above. Detailed directional rules are in
+[Transactions](transaction.md#ongoing-work-pin-transactions).
 
 Pins do not protect newly written, uncommitted output. Jobs need a separate
 staging and publication strategy for those files. Before releasing a pin, a job
